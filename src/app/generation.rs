@@ -191,13 +191,24 @@ impl ModelRuntime {
         } else {
             -1
         };
-        let qwen_im_end = if self.config.is_qwen2
-            || self.config.is_qwen3moe
-            || self.config.is_qwen3next
-            || self.config.is_deepseek2
-        {
+        let qwen_im_end =
+            if self.config.is_qwen2 || self.config.is_qwen3moe || self.config.is_qwen3next {
+                self.tokenizer
+                    .find_special_token("<|im_end|>")
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+        let deepseek_end_sentence = if self.config.is_deepseek2 {
             self.tokenizer
-                .find_special_token("<|im_end|>")
+                .find_special_token("<｜end▁of▁sentence｜>")
+                .unwrap_or(-1)
+        } else {
+            -1
+        };
+        let deepseek_assistant_tag = if self.config.is_deepseek2 {
+            self.tokenizer
+                .find_special_token("<｜Assistant｜>")
                 .unwrap_or(-1)
         } else {
             -1
@@ -311,9 +322,14 @@ impl ModelRuntime {
             if pos >= prompt_tokens.len().saturating_sub(1)
                 && next != self.tokenizer.eot_token
                 && next != self.tokenizer.eos_token
+                && next != deepseek_end_sentence
+                && next != deepseek_assistant_tag
             {
                 if let Some(decoded) = self.tokenizer.decode_token(next) {
-                    if decoded == "\n" {
+                    if self.config.is_deepseek2 && decoded == "</think>" {
+                        // DeepSeek chat templates commonly prefix assistant output with </think>.
+                        // Skip emitting it to stdout/output for plain-text generation mode.
+                    } else if decoded == "\n" {
                         pending_newline = true;
                     } else {
                         if pending_newline {
@@ -346,12 +362,15 @@ impl ModelRuntime {
                 if self.config.is_gemma3 && token == gemma3_end_turn {
                     break;
                 }
-                if (self.config.is_qwen2
-                    || self.config.is_qwen3moe
-                    || self.config.is_qwen3next
-                    || self.config.is_deepseek2)
+                if (self.config.is_qwen2 || self.config.is_qwen3moe || self.config.is_qwen3next)
                     && qwen_im_end >= 0
                     && token == qwen_im_end
+                {
+                    break;
+                }
+                if self.config.is_deepseek2
+                    && deepseek_end_sentence >= 0
+                    && token == deepseek_end_sentence
                 {
                     break;
                 }

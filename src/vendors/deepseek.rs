@@ -1,4 +1,4 @@
-use crate::engine::types::Config;
+use crate::engine::types::{Config, Tokenizer};
 
 pub(super) fn validate_deepseek2(config: &mut Config) -> Result<(), String> {
     if config.deepseek_q_lora_rank == 0 || config.deepseek_kv_lora_rank == 0 {
@@ -43,4 +43,43 @@ pub(super) fn print_deepseek2_debug(config: &Config) {
         config.expert_hidden_dim,
         config.shared_expert_hidden_dim
     );
+}
+
+pub(super) fn encode_deepseek_chat(
+    tokenizer: &mut Tokenizer,
+    prompt: &str,
+    system_prompt: &str,
+) -> Vec<i32> {
+    let mut tokens: Vec<i32> = Vec::with_capacity(8192);
+    let mut temp: Vec<i32> = Vec::with_capacity(8192);
+
+    if tokenizer.bos_token >= 0 {
+        tokens.push(tokenizer.bos_token);
+    }
+
+    let sys = system_prompt.trim();
+    if !sys.is_empty() {
+        tokenizer.bpe_encode(sys, &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+
+    if let Some(user_tok) = tokenizer.find_special_token("<｜User｜>") {
+        tokens.push(user_tok);
+    } else {
+        tokenizer.bpe_encode("<｜User｜>", &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+    tokenizer.bpe_encode(prompt, &mut temp);
+    tokens.extend_from_slice(&temp);
+
+    if let Some(assistant_tok) = tokenizer.find_special_token("<｜Assistant｜>") {
+        tokens.push(assistant_tok);
+    } else {
+        tokenizer.bpe_encode("<｜Assistant｜>", &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+    tokenizer.bpe_encode("</think>", &mut temp);
+    tokens.extend_from_slice(&temp);
+
+    tokens
 }

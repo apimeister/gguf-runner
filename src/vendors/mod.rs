@@ -297,7 +297,9 @@ pub(crate) fn encode_chat_prompt(
 ) -> Vec<i32> {
     if config.is_gemma3 {
         gemma::encode_chat_prompt(tokenizer, prompt, system_prompt)
-    } else if config.is_qwen3moe || config.is_qwen3next || config.is_deepseek2 {
+    } else if config.is_deepseek2 {
+        deepseek::encode_deepseek_chat(tokenizer, prompt, system_prompt)
+    } else if config.is_qwen3moe || config.is_qwen3next {
         qwen::encode_qwen3_chat(tokenizer, prompt, system_prompt)
     } else if config.is_qwen2 {
         qwen::encode_qwen2_chat(tokenizer, prompt, system_prompt)
