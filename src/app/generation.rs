@@ -191,14 +191,17 @@ impl ModelRuntime {
         } else {
             -1
         };
-        let qwen_im_end =
-            if self.config.is_qwen2 || self.config.is_qwen3moe || self.config.is_qwen3next {
-                self.tokenizer
-                    .find_special_token("<|im_end|>")
-                    .unwrap_or(-1)
-            } else {
-                -1
-            };
+        let qwen_im_end = if self.config.is_qwen2
+            || self.config.is_qwen3moe
+            || self.config.is_qwen3next
+            || self.config.is_deepseek2
+        {
+            self.tokenizer
+                .find_special_token("<|im_end|>")
+                .unwrap_or(-1)
+        } else {
+            -1
+        };
 
         while pos < max_tokens {
             if token < 0 || token as usize >= self.config.vocab_size {
@@ -343,7 +346,10 @@ impl ModelRuntime {
                 if self.config.is_gemma3 && token == gemma3_end_turn {
                     break;
                 }
-                if (self.config.is_qwen2 || self.config.is_qwen3moe || self.config.is_qwen3next)
+                if (self.config.is_qwen2
+                    || self.config.is_qwen3moe
+                    || self.config.is_qwen3next
+                    || self.config.is_deepseek2)
                     && qwen_im_end >= 0
                     && token == qwen_im_end
                 {

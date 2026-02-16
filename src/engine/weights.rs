@@ -136,6 +136,11 @@ pub(crate) fn init_weights_from_gguf(
     let ssm_v_heads = p.ssm_time_step_rank;
     let ssm_head_dim = p.ssm_state_size;
     let ssm_conv_dim = ssm_inner + 2 * ssm_k_heads * ssm_head_dim;
+    let deepseek_qk_head_dim = p.deepseek_qk_nope_head_dim + p.deepseek_qk_rope_head_dim;
+    let deepseek_q_dim = p.n_heads * deepseek_qk_head_dim;
+    let deepseek_v_dim = p.n_heads * p.deepseek_v_head_dim;
+    let deepseek_kv_a_rows = p.deepseek_kv_lora_rank + p.deepseek_qk_rope_head_dim;
+    let deepseek_k_nope_rows = p.n_heads * p.deepseek_qk_nope_head_dim;
 
     let token_embedding_table =
         load_tensor_float(gguf, "token_embd.weight", Some(p.vocab_size * p.dim))?;
@@ -152,6 +157,51 @@ pub(crate) fn init_weights_from_gguf(
     let mut w3 = vec![QuantizedTensor::default(); n_layers];
     let mut attn_qkv = if p.is_qwen3next {
         vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_wq_a = if p.is_deepseek2 {
+        vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_wq_b = if p.is_deepseek2 {
+        vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_wkv_a = if p.is_deepseek2 {
+        vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_wk_b = if p.is_deepseek2 {
+        vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_wv_b = if p.is_deepseek2 {
+        vec![QuantizedTensor::default(); n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_q_a_norm = if p.is_deepseek2 {
+        vec![0.0f32; n_layers * p.deepseek_q_lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_kv_a_norm = if p.is_deepseek2 {
+        vec![0.0f32; n_layers * p.deepseek_kv_lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_layer_is_moe = if p.is_deepseek2 {
+        vec![false; n_layers]
+    } else {
+        Vec::new()
+    };
+    let mut deepseek_shared_gate_present = if p.is_deepseek2 {
+        vec![false; n_layers]
     } else {
         Vec::new()
     };
@@ -180,27 +230,27 @@ pub(crate) fn init_weights_from_gguf(
     } else {
         Vec::new()
     };
-    let mut moe_gate_inp = if p.is_qwen3moe || p.is_qwen3next {
+    let mut moe_gate_inp = if p.is_qwen3moe || p.is_qwen3next || p.is_deepseek2 {
         vec![QuantizedTensor::default(); n_layers]
     } else {
         Vec::new()
     };
-    let mut moe_gate_exps = if p.is_qwen3moe || p.is_qwen3next {
+    let mut moe_gate_exps = if p.is_qwen3moe || p.is_qwen3next || p.is_deepseek2 {
         vec![QuantizedTensor::default(); n_layers]
     } else {
         Vec::new()
     };
-    let mut moe_up_exps = if p.is_qwen3moe || p.is_qwen3next {
+    let mut moe_up_exps = if p.is_qwen3moe || p.is_qwen3next || p.is_deepseek2 {
         vec![QuantizedTensor::default(); n_layers]
     } else {
         Vec::new()
     };
-    let mut moe_down_exps = if p.is_qwen3moe || p.is_qwen3next {
+    let mut moe_down_exps = if p.is_qwen3moe || p.is_qwen3next || p.is_deepseek2 {
         vec![QuantizedTensor::default(); n_layers]
     } else {
         Vec::new()
     };
-    let mut moe_shared_gate_inp = if p.is_qwen3next {
+    let mut moe_shared_gate_inp = if p.is_qwen3next || p.is_deepseek2 {
         vec![0.0f32; n_layers * p.dim]
     } else {
         Vec::new()
@@ -259,7 +309,129 @@ pub(crate) fn init_weights_from_gguf(
         };
         rms_ffn_weight[l * p.dim..(l + 1) * p.dim].copy_from_slice(&ffn_norm);
 
-        if p.is_qwen3next {
+        if p.is_deepseek2 {
+            deepseek_wq_a[l] = load_layer_tensor_quantized(
+                gguf,
+                l,
+                "attn_q_a.weight",
+                p.deepseek_q_lora_rank,
+                p.dim,
+            )?;
+            deepseek_wq_b[l] = load_layer_tensor_quantized(
+                gguf,
+                l,
+                "attn_q_b.weight",
+                deepseek_q_dim,
+                p.deepseek_q_lora_rank,
+            )?;
+            deepseek_wkv_a[l] = load_layer_tensor_quantized(
+                gguf,
+                l,
+                "attn_kv_a_mqa.weight",
+                deepseek_kv_a_rows,
+                p.dim,
+            )?;
+            deepseek_wk_b[l] = load_layer_tensor_quantized(
+                gguf,
+                l,
+                "attn_k_b.weight",
+                deepseek_k_nope_rows,
+                p.deepseek_kv_lora_rank,
+            )?;
+            deepseek_wv_b[l] = load_layer_tensor_quantized(
+                gguf,
+                l,
+                "attn_v_b.weight",
+                deepseek_v_dim,
+                p.deepseek_kv_lora_rank,
+            )?;
+            wo[l] =
+                load_layer_tensor_quantized(gguf, l, "attn_output.weight", p.dim, deepseek_v_dim)?;
+
+            let q_a_norm =
+                load_layer_tensor_float(gguf, l, "attn_q_a_norm.weight", p.deepseek_q_lora_rank)?;
+            deepseek_q_a_norm[l * p.deepseek_q_lora_rank..(l + 1) * p.deepseek_q_lora_rank]
+                .copy_from_slice(&q_a_norm);
+
+            let kv_a_norm =
+                load_layer_tensor_float(gguf, l, "attn_kv_a_norm.weight", p.deepseek_kv_lora_rank)?;
+            deepseek_kv_a_norm[l * p.deepseek_kv_lora_rank..(l + 1) * p.deepseek_kv_lora_rank]
+                .copy_from_slice(&kv_a_norm);
+
+            let has_moe =
+                find_gguf_tensor(gguf, &format!("blk.{l}.ffn_gate_exps.weight")).is_some();
+            deepseek_layer_is_moe[l] = has_moe;
+
+            if has_moe {
+                moe_gate_inp[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_gate_inp.weight",
+                    p.n_experts,
+                    p.dim,
+                )?;
+                moe_gate_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_gate_exps.weight",
+                    p.n_experts * p.expert_hidden_dim,
+                    p.dim,
+                )?;
+                moe_up_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_up_exps.weight",
+                    p.n_experts * p.expert_hidden_dim,
+                    p.dim,
+                )?;
+                moe_down_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_down_exps.weight",
+                    p.n_experts * p.dim,
+                    p.expert_hidden_dim,
+                )?;
+
+                let shared_hidden = if p.shared_expert_hidden_dim > 0 {
+                    p.shared_expert_hidden_dim
+                } else {
+                    p.expert_hidden_dim
+                };
+                w1[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_gate_shexp.weight",
+                    shared_hidden,
+                    p.dim,
+                )?;
+                w2[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_down_shexp.weight",
+                    p.dim,
+                    shared_hidden,
+                )?;
+                w3[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_up_shexp.weight",
+                    shared_hidden,
+                    p.dim,
+                )?;
+                if find_gguf_tensor(gguf, &format!("blk.{l}.ffn_gate_inp_shexp.weight")).is_some() {
+                    let shexp_gate =
+                        load_layer_tensor_float(gguf, l, "ffn_gate_inp_shexp.weight", p.dim)?;
+                    moe_shared_gate_inp[l * p.dim..(l + 1) * p.dim].copy_from_slice(&shexp_gate);
+                    deepseek_shared_gate_present[l] = true;
+                }
+            } else {
+                w1[l] =
+                    load_layer_tensor_quantized(gguf, l, "ffn_gate.weight", p.hidden_dim, p.dim)?;
+                w2[l] =
+                    load_layer_tensor_quantized(gguf, l, "ffn_down.weight", p.dim, p.hidden_dim)?;
+                w3[l] = load_layer_tensor_quantized(gguf, l, "ffn_up.weight", p.hidden_dim, p.dim)?;
+            }
+        } else if p.is_qwen3next {
             if find_gguf_tensor(gguf, &format!("blk.{l}.attn_qkv.weight")).is_some() {
                 attn_qkv[l] =
                     load_layer_tensor_quantized_auto_rows(gguf, l, "attn_qkv.weight", p.dim)?;
@@ -424,7 +596,7 @@ pub(crate) fn init_weights_from_gguf(
                 p.n_experts * p.dim,
                 p.expert_hidden_dim,
             )?;
-        } else if !p.is_qwen3next {
+        } else if !p.is_qwen3next && !p.is_deepseek2 {
             w1[l] = load_layer_tensor_quantized(gguf, l, "ffn_gate.weight", p.hidden_dim, p.dim)?;
             w2[l] = load_layer_tensor_quantized(gguf, l, "ffn_down.weight", p.dim, p.hidden_dim)?;
             w3[l] = load_layer_tensor_quantized(gguf, l, "ffn_up.weight", p.hidden_dim, p.dim)?;
@@ -498,6 +670,15 @@ pub(crate) fn init_weights_from_gguf(
         w2,
         w3,
         attn_qkv,
+        deepseek_wq_a,
+        deepseek_wq_b,
+        deepseek_wkv_a,
+        deepseek_wk_b,
+        deepseek_wv_b,
+        deepseek_q_a_norm,
+        deepseek_kv_a_norm,
+        deepseek_layer_is_moe,
+        deepseek_shared_gate_present,
         ssm_ba,
         ssm_conv1d,
         ssm_a,

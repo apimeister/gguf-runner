@@ -13,10 +13,10 @@ pub(crate) fn apply_context_size_overrides(
 ) {
     if context_size > 0 {
         config.seq_len = context_size;
-    } else if config.is_qwen3moe || config.is_qwen3next {
+    } else if config.is_qwen3moe || config.is_qwen3next || config.is_deepseek2 {
         if debug_mode {
             eprintln!(
-                "Using qwen3 native context length {} (model may require a large workspace)",
+                "Using model native context length {} (model may require a large workspace)",
                 config.seq_len
             );
         }

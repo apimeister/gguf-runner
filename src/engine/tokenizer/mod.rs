@@ -439,7 +439,7 @@ pub(crate) fn init_tokenizer_from_gguf(
     };
     tokenizer.merges = gguf.vocab_merges.clone();
     if tokenizer.bos_token < 0 {
-        if config.is_qwen2 || config.is_qwen3moe || config.is_qwen3next {
+        if config.is_qwen2 || config.is_qwen3moe || config.is_qwen3next || config.is_deepseek2 {
             tokenizer.bos_token = -1;
         } else {
             tokenizer.bos_token = tokenizer

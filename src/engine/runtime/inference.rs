@@ -164,6 +164,10 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     let ssm_k_heads = p.ssm_group_count;
     let ssm_v_heads = p.ssm_time_step_rank;
     let ssm_head_dim = p.ssm_state_size;
+    let deepseek_qk_head_dim = p.deepseek_qk_nope_head_dim + p.deepseek_qk_rope_head_dim;
+    let deepseek_qk_dim = p.n_heads.saturating_mul(deepseek_qk_head_dim);
+    let deepseek_v_dim = p.n_heads.saturating_mul(p.deepseek_v_head_dim);
+    let deepseek_k_nope_dim = p.n_heads.saturating_mul(p.deepseek_qk_nope_head_dim);
     let ssm_conv_dim = if p.is_qwen3next {
         ssm_inner + 2 * ssm_k_heads * ssm_head_dim
     } else {
@@ -184,12 +188,17 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     } else {
         0
     };
-    let max_dim = p.dim.max(q_dim);
+    let max_dim = p.dim.max(q_dim).max(deepseek_qk_dim);
     let ffn_dim = p
         .hidden_dim
         .max(p.expert_hidden_dim)
         .max(p.shared_expert_hidden_dim);
-    let scratch_dim = ffn_dim.max(ssm_conv_dim).max(ssm_inner).max(ssm_head_dim);
+    let scratch_dim = ffn_dim
+        .max(ssm_conv_dim)
+        .max(ssm_inner)
+        .max(ssm_head_dim)
+        .max(deepseek_v_dim)
+        .max(deepseek_k_nope_dim);
 
     let rope_dim = if p.rope_dim > 0 {
         p.rope_dim
@@ -326,6 +335,16 @@ pub(crate) fn transformer(
     let kv_dim = s.kv_dim;
     let q_dim = s.q_dim;
     let kv_mul = s.kv_mul;
+    let deepseek_qk_nope = p.deepseek_qk_nope_head_dim;
+    let deepseek_qk_rope = p.deepseek_qk_rope_head_dim;
+    let deepseek_qk_head = deepseek_qk_nope + deepseek_qk_rope;
+    let deepseek_qk_dim = p.n_heads * deepseek_qk_head;
+    let deepseek_v_head = p.deepseek_v_head_dim;
+    let deepseek_v_dim = p.n_heads * deepseek_v_head;
+    let deepseek_q_lora = p.deepseek_q_lora_rank;
+    let deepseek_kv_lora = p.deepseek_kv_lora_rank;
+    let deepseek_kv_a_rows = deepseek_kv_lora + deepseek_qk_rope;
+    let deepseek_k_nope_dim = p.n_heads * deepseek_qk_nope;
     let eps = if p.rms_norm_eps > 0.0 {
         p.rms_norm_eps
     } else {
@@ -361,7 +380,207 @@ pub(crate) fn transformer(
         }
 
         let is_qwen3next_ssm_layer = p.is_qwen3next && w.attn_qkv[l].rows > 0;
-        if is_qwen3next_ssm_layer {
+        if p.is_deepseek2 {
+            let attn_prof = prof_start();
+            if deepseek_qk_head == 0
+                || deepseek_qk_dim == 0
+                || deepseek_v_head == 0
+                || deepseek_v_dim == 0
+                || deepseek_q_lora == 0
+                || deepseek_kv_lora == 0
+                || deepseek_kv_a_rows == 0
+                || deepseek_k_nope_dim == 0
+            {
+                return Err("invalid deepseek2 MLA configuration".to_string());
+            }
+
+            matmul_quantized(
+                &mut s.hb[..deepseek_q_lora],
+                &s.xb[..dim],
+                &w.deepseek_wq_a[l],
+                mapped,
+            )?;
+            rmsnorm_inplace(
+                &mut s.hb[..deepseek_q_lora],
+                &w.deepseek_q_a_norm[l * deepseek_q_lora..(l + 1) * deepseek_q_lora],
+                deepseek_q_lora,
+                eps,
+            );
+            matmul_quantized(
+                &mut s.q[..deepseek_qk_dim],
+                &s.hb[..deepseek_q_lora],
+                &w.deepseek_wq_b[l],
+                mapped,
+            )?;
+
+            matmul_quantized(
+                &mut s.hb[..deepseek_kv_a_rows],
+                &s.xb[..dim],
+                &w.deepseek_wkv_a[l],
+                mapped,
+            )?;
+            rmsnorm_inplace(
+                &mut s.hb[..deepseek_kv_lora],
+                &w.deepseek_kv_a_norm[l * deepseek_kv_lora..(l + 1) * deepseek_kv_lora],
+                deepseek_kv_lora,
+                eps,
+            );
+            matmul_quantized(
+                &mut s.hb2[..deepseek_k_nope_dim],
+                &s.hb[..deepseek_kv_lora],
+                &w.deepseek_wk_b[l],
+                mapped,
+            )?;
+
+            let rope_src = &s.hb[deepseek_kv_lora..deepseek_kv_a_rows];
+            for h in 0..p.n_heads {
+                let dst = h * deepseek_qk_head;
+                let src = h * deepseek_qk_nope;
+                s.k[dst..dst + deepseek_qk_nope]
+                    .copy_from_slice(&s.hb2[src..src + deepseek_qk_nope]);
+                s.k[dst + deepseek_qk_nope..dst + deepseek_qk_head].copy_from_slice(rope_src);
+            }
+
+            let rope_half = deepseek_qk_rope / 2;
+            if deepseek_qk_rope == 0 || rope_half == 0 {
+                return Err("invalid deepseek2 rope dimension".to_string());
+            }
+            if s.rope_cache_pos != pos as isize || s.rope_cache_is_swa != 0 {
+                for i in 0..rope_half {
+                    let val = pos as f32 * s.rope_freqs[i];
+                    s.rope_cos[i] = val.cos();
+                    s.rope_sin[i] = val.sin();
+                }
+                s.rope_cache_pos = pos as isize;
+                s.rope_cache_is_swa = 0;
+            }
+
+            for h in 0..p.n_heads {
+                let q_base = h * deepseek_qk_head + deepseek_qk_nope;
+                let k_base = h * deepseek_qk_head + deepseek_qk_nope;
+                for i in 0..rope_half {
+                    let c = s.rope_cos[i];
+                    let s1 = s.rope_sin[i];
+                    let q0 = s.q[q_base + i];
+                    let q1 = s.q[q_base + i + rope_half];
+                    s.q[q_base + i] = q0 * c - q1 * s1;
+                    s.q[q_base + i + rope_half] = q0 * s1 + q1 * c;
+
+                    let k0 = s.k[k_base + i];
+                    let k1 = s.k[k_base + i + rope_half];
+                    s.k[k_base + i] = k0 * c - k1 * s1;
+                    s.k[k_base + i + rope_half] = k0 * s1 + k1 * c;
+                }
+            }
+
+            matmul_quantized(
+                &mut s.hb2[..deepseek_v_dim],
+                &s.hb[..deepseek_kv_lora],
+                &w.deepseek_wv_b[l],
+                mapped,
+            )?;
+
+            for h in (0..p.n_heads).rev() {
+                let src = h * deepseek_v_head;
+                let dst = h * deepseek_qk_head;
+                s.v[dst..dst + deepseek_v_head].copy_from_slice(&s.hb2[src..src + deepseek_v_head]);
+                s.v[dst + deepseek_v_head..dst + deepseek_qk_head].fill(0.0);
+            }
+
+            let layer_row_base = l * p.seq_len;
+            let row_index = layer_row_base + pos;
+            let row_elem_offset = row_index * kv_dim;
+
+            match s.kv_cache_format {
+                KvCacheFormat::Q8 => {
+                    quantize_row_q8(
+                        &s.k[..kv_dim],
+                        &mut s.key_cache_q8[row_elem_offset..row_elem_offset + kv_dim],
+                        &mut s.key_cache_scale[row_index],
+                    );
+                    quantize_row_q8(
+                        &s.v[..kv_dim],
+                        &mut s.value_cache_q8[row_elem_offset..row_elem_offset + kv_dim],
+                        &mut s.value_cache_scale[row_index],
+                    );
+                }
+                KvCacheFormat::Q4 => {
+                    quantize_row_q4(
+                        &s.k[..kv_dim],
+                        &mut s.key_cache_q4,
+                        row_elem_offset,
+                        &mut s.key_cache_scale[row_index],
+                    );
+                    quantize_row_q4(
+                        &s.v[..kv_dim],
+                        &mut s.value_cache_q4,
+                        row_elem_offset,
+                        &mut s.value_cache_scale[row_index],
+                    );
+                }
+            }
+
+            let attn_scale_score = 1.0 / (deepseek_qk_head as f32).sqrt();
+            let kv_format = s.kv_cache_format;
+            let key_cache_q8 = &s.key_cache_q8;
+            let value_cache_q8 = &s.value_cache_q8;
+            let key_cache_q4 = &s.key_cache_q4;
+            let value_cache_q4 = &s.value_cache_q4;
+            let key_scales = &s.key_cache_scale;
+            let value_scales = &s.value_cache_scale;
+            let att_all = &mut s.att[..p.n_heads * p.seq_len];
+            s.xb[..deepseek_qk_dim].fill(0.0);
+
+            for h in 0..p.n_heads {
+                let hs = h * deepseek_qk_head;
+                let q_head = &s.q[hs..hs + deepseek_qk_head];
+                let kv_head_offset = h * deepseek_qk_head;
+                let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
+                let att_head = &mut att_head_full[..=pos];
+
+                for (t, slot) in att_head.iter_mut().enumerate() {
+                    let t_row = layer_row_base + t;
+                    let row_offset = t_row * kv_dim + kv_head_offset;
+                    let score = match kv_format {
+                        KvCacheFormat::Q8 => {
+                            dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
+                        }
+                        KvCacheFormat::Q4 => {
+                            dot_q4_row(q_head, key_cache_q4, row_offset, key_scales[t_row])
+                        }
+                    };
+                    *slot = score * attn_scale_score;
+                }
+
+                softmax(att_head, pos + 1);
+
+                let xb_head = &mut s.xb[hs..hs + deepseek_qk_head];
+                xb_head.fill(0.0);
+                for (t, &a) in att_head.iter().enumerate() {
+                    let t_row = layer_row_base + t;
+                    let row_offset = t_row * kv_dim + kv_head_offset;
+                    match kv_format {
+                        KvCacheFormat::Q8 => {
+                            axpy_q8_row(xb_head, a, value_cache_q8, row_offset, value_scales[t_row])
+                        }
+                        KvCacheFormat::Q4 => {
+                            axpy_q4_row(xb_head, a, value_cache_q4, row_offset, value_scales[t_row])
+                        }
+                    }
+                }
+            }
+
+            for h in 0..p.n_heads {
+                let src = h * deepseek_qk_head;
+                let dst = h * deepseek_v_head;
+                s.hb[dst..dst + deepseek_v_head].copy_from_slice(&s.xb[src..src + deepseek_v_head]);
+            }
+            matmul_quantized(&mut s.xb2[..dim], &s.hb[..deepseek_v_dim], &w.wo[l], mapped)?;
+            for v in &mut s.xb2[..dim] {
+                *v = finite_or_zero(*v);
+            }
+            prof_end(&PROF_ATTN_NS, attn_prof);
+        } else if is_qwen3next_ssm_layer {
             qwen3next_linear_attention_autoregressive(l, p, s, w, mapped, eps)?;
         } else {
             let attn_prof = prof_start();
@@ -742,7 +961,12 @@ pub(crate) fn transformer(
             );
         }
 
-        if p.is_qwen3moe || p.is_qwen3next {
+        let use_moe = if p.is_deepseek2 {
+            w.deepseek_layer_is_moe[l]
+        } else {
+            p.is_qwen3moe || p.is_qwen3next
+        };
+        if use_moe {
             let moe_prof = prof_start();
             let expert_hidden = p.expert_hidden_dim;
             s.xb2[..dim].copy_from_slice(&s.xb[..dim]);
@@ -821,6 +1045,36 @@ pub(crate) fn transformer(
                 let shared_gate = &w.moe_shared_gate_inp[l * dim..(l + 1) * dim];
                 let gate_logit = dot_f32_simd(&s.xb2[..dim], shared_gate);
                 let gate = 1.0 / (1.0 + (-gate_logit).exp());
+
+                matmul_quantized(&mut s.hb[..shared_hidden], &s.xb2[..dim], &w.w1[l], mapped)?;
+                matmul_quantized(&mut s.hb2[..shared_hidden], &s.xb2[..dim], &w.w3[l], mapped)?;
+                for i in 0..shared_hidden {
+                    let v = s.hb[i];
+                    s.hb[i] = (v * (1.0 / (1.0 + (-v).exp()))) * s.hb2[i];
+                }
+                matmul_quantized(
+                    &mut s.moe_tmp[..dim],
+                    &s.hb[..shared_hidden],
+                    &w.w2[l],
+                    mapped,
+                )?;
+                for i in 0..dim {
+                    s.xb[i] += gate * s.moe_tmp[i];
+                }
+            } else if p.is_deepseek2 {
+                let shared_hidden = if p.shared_expert_hidden_dim > 0 {
+                    p.shared_expert_hidden_dim
+                } else {
+                    p.expert_hidden_dim
+                };
+                let gate = if w.deepseek_shared_gate_present[l] && !w.moe_shared_gate_inp.is_empty()
+                {
+                    let shared_gate = &w.moe_shared_gate_inp[l * dim..(l + 1) * dim];
+                    let gate_logit = dot_f32_simd(&s.xb2[..dim], shared_gate);
+                    1.0 / (1.0 + (-gate_logit).exp())
+                } else {
+                    1.0
+                };
 
                 matmul_quantized(&mut s.hb[..shared_hidden], &s.xb2[..dim], &w.w1[l], mapped)?;
                 matmul_quantized(&mut s.hb2[..shared_hidden], &s.xb2[..dim], &w.w3[l], mapped)?;

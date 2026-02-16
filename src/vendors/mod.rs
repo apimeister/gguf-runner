@@ -1,3 +1,4 @@
+mod deepseek;
 mod gemma;
 mod llama;
 mod qwen;
@@ -12,6 +13,7 @@ enum ModelFamily {
     Qwen2,
     Qwen3Moe,
     Qwen3Next,
+    DeepSeek2,
 }
 
 struct ModelIdentity {
@@ -93,18 +95,27 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
                 identity.key_prefix
             );
         }
+    } else if arch == "deepseek2" || arch.starts_with("deepseek") {
+        identity.family = ModelFamily::DeepSeek2;
+        identity.key_prefix = arch.to_string();
+        let probe = format!("{}.embedding_length", identity.key_prefix);
+        if get_gguf_int_from_map(&gguf.kv, &probe, 0) == 0
+            && get_gguf_int_from_map(&gguf.kv, "deepseek2.embedding_length", 0) != 0
+        {
+            identity.key_prefix = "deepseek2".to_string();
+        }
+        if debug_mode {
+            eprintln!(
+                "Detected DeepSeek architecture, using {}.* keys",
+                identity.key_prefix
+            );
+        }
     }
 
     identity
 }
 
 pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Result<Config, String> {
-    let arch = get_gguf_string_from_map(&gguf.kv, "general.architecture").unwrap_or("llama");
-    if arch.starts_with("deepseek") {
-        return Err(format!(
-            "unsupported GGUF architecture '{arch}': DeepSeek models are not implemented yet in this runtime (supported: llama, gemma, qwen2, qwen3moe, qwen3next)"
-        ));
-    }
     let identity = detect_model_identity(gguf, debug_mode);
     let key_prefix = identity.key_prefix;
 
@@ -130,6 +141,12 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     let key_ssm_state_size = format!("{key_prefix}.ssm.state_size");
     let key_ssm_time_step_rank = format!("{key_prefix}.ssm.time_step_rank");
     let key_ssm_group_count = format!("{key_prefix}.ssm.group_count");
+    let key_q_lora_rank = format!("{key_prefix}.attention.q_lora_rank");
+    let key_kv_lora_rank = format!("{key_prefix}.attention.kv_lora_rank");
+    let key_key_mla = format!("{key_prefix}.attention.key_length_mla");
+    let key_value_mla = format!("{key_prefix}.attention.value_length_mla");
+    let key_leading_dense = format!("{key_prefix}.leading_dense_block_count");
+    let key_expert_weights_scale = format!("{key_prefix}.expert_weights_scale");
 
     let mut config = Config {
         dim: get_gguf_int_from_map(&gguf.kv, &key_dim, 4096) as usize,
@@ -155,6 +172,7 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         is_qwen2: identity.family == ModelFamily::Qwen2,
         is_qwen3moe: identity.family == ModelFamily::Qwen3Moe,
         is_qwen3next: identity.family == ModelFamily::Qwen3Next,
+        is_deepseek2: identity.family == ModelFamily::DeepSeek2,
         final_logit_softcapping: get_gguf_float_from_map(&gguf.kv, &key_softcap, 0.0),
         rms_norm_eps: get_gguf_float_from_map(&gguf.kv, &key_rms_eps, 1e-6),
         rope_theta_swa: get_gguf_float_from_map(&gguf.kv, &key_rope_swa, 10_000.0),
@@ -164,15 +182,30 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         ssm_state_size: get_gguf_int_from_map(&gguf.kv, &key_ssm_state_size, 0) as usize,
         ssm_time_step_rank: get_gguf_int_from_map(&gguf.kv, &key_ssm_time_step_rank, 0) as usize,
         ssm_group_count: get_gguf_int_from_map(&gguf.kv, &key_ssm_group_count, 0) as usize,
+        deepseek_leading_dense_block_count: get_gguf_int_from_map(&gguf.kv, &key_leading_dense, 0)
+            as usize,
+        deepseek_q_lora_rank: get_gguf_int_from_map(&gguf.kv, &key_q_lora_rank, 0) as usize,
+        deepseek_kv_lora_rank: get_gguf_int_from_map(&gguf.kv, &key_kv_lora_rank, 0) as usize,
+        deepseek_qk_nope_head_dim: 0,
+        deepseek_qk_rope_head_dim: 0,
+        deepseek_v_head_dim: get_gguf_int_from_map(&gguf.kv, &key_value_mla, 0) as usize,
     };
 
-    if config.is_qwen3moe || config.is_qwen3next {
+    if config.is_qwen3moe || config.is_qwen3next || config.is_deepseek2 {
         qwen::finalize_moe_config(&mut config)?;
         if config.is_qwen3moe {
             qwen::apply_qwen3moe_defaults(&mut config);
         }
         if config.is_qwen3next {
             qwen::validate_qwen3next(&mut config)?;
+        }
+        if config.is_deepseek2 {
+            config.moe_norm_topk_prob = true;
+            config.moe_routed_scaling_factor =
+                get_gguf_float_from_map(&gguf.kv, &key_expert_weights_scale, 1.0);
+            if config.shared_expert_hidden_dim == 0 {
+                config.shared_expert_hidden_dim = config.expert_hidden_dim;
+            }
         }
     }
 
@@ -194,6 +227,25 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         get_gguf_int_from_map(&gguf.kv, &key_rope_dim, config.head_dim as i64) as usize;
     if config.rope_dim == 0 || config.rope_dim > config.head_dim || (config.rope_dim & 1) != 0 {
         config.rope_dim = config.head_dim;
+    }
+
+    if config.is_deepseek2 {
+        let mla_key_dim = get_gguf_int_from_map(&gguf.kv, &key_key_mla, 0) as usize;
+        if mla_key_dim == 0 {
+            return Err(format!(
+                "deepseek2 model is missing {key_key_mla}; cannot derive MLA key head dimension"
+            ));
+        }
+        if config.rope_dim == 0 || config.rope_dim >= mla_key_dim {
+            return Err(format!(
+                "deepseek2 invalid rope dimension {} for MLA key head dimension {}",
+                config.rope_dim, mla_key_dim
+            ));
+        }
+        config.head_dim = mla_key_dim;
+        config.deepseek_qk_rope_head_dim = config.rope_dim;
+        config.deepseek_qk_nope_head_dim = mla_key_dim - config.rope_dim;
+        deepseek::validate_deepseek2(&mut config)?;
     }
 
     if !gguf.vocab_tokens.is_empty() && config.vocab_size != gguf.vocab_tokens.len() {
@@ -229,6 +281,8 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
             qwen::print_qwen3moe_debug(&config);
         } else if config.is_qwen3next {
             qwen::print_qwen3next_debug(&config);
+        } else if config.is_deepseek2 {
+            deepseek::print_deepseek2_debug(&config);
         }
     }
 
@@ -243,7 +297,7 @@ pub(crate) fn encode_chat_prompt(
 ) -> Vec<i32> {
     if config.is_gemma3 {
         gemma::encode_chat_prompt(tokenizer, prompt, system_prompt)
-    } else if config.is_qwen3moe || config.is_qwen3next {
+    } else if config.is_qwen3moe || config.is_qwen3next || config.is_deepseek2 {
         qwen::encode_qwen3_chat(tokenizer, prompt, system_prompt)
     } else if config.is_qwen2 {
         qwen::encode_qwen2_chat(tokenizer, prompt, system_prompt)

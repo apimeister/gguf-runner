@@ -43,6 +43,7 @@ src/
     llama.rs
     gemma.rs
     qwen.rs
+    deepseek.rs
 ```
 
 ## Module Responsibilities
@@ -149,7 +150,7 @@ src/
 ### `src/engine/weights.rs`
 
 - Loads and validates model tensors from GGUF into `TransformerWeights`.
-- Handles per-family tensor layout differences and optional tensors.
+- Handles per-family tensor layout differences and optional tensors, including DeepSeek-MLA tensors.
 - Exposes `init_weights_from_gguf(...)`.
 
 ### `src/engine/kernels/*`
@@ -165,6 +166,7 @@ src/
 - `runtime/inference.rs`:
   - `malloc_run_state(...)`
   - `transformer(...)`
+  - includes dedicated DeepSeek2 MLA attention path (`attn_q_a/q_b`, `attn_kv_a_mqa`, `attn_k_b`, `attn_v_b`) plus mixed dense/MoE FFN handling
   - quantized KV cache storage for attention state:
     - default Q8 cache
     - automatic Q4 fallback when Q8 allocation fails
@@ -198,10 +200,9 @@ src/
 - Vendor/model-family specific config parsing and prompt templating.
 - `vendors/mod.rs`:
   - Detects model family from GGUF metadata.
-  - Rejects unsupported DeepSeek architectures (`deepseek*`) with a clear config error.
-  - Builds `Config` from family-specific key conventions.
+  - Builds `Config` from family-specific key conventions (including DeepSeek2 MLA metadata).
   - Routes chat prompt encoding to family-specific implementation.
-- `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`:
+- `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`, `vendors/deepseek.rs`:
   - Family-specific defaults, validations, and prompt rendering (including Qwen MoE routing defaults/scaling).
 
 ## Runtime Data Flow
