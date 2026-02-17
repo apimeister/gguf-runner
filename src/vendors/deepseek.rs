@@ -66,9 +66,10 @@ pub(super) fn encode_deepseek_chat(
         tokens.push(tokenizer.bos_token);
     }
 
-    let sys = system_prompt.trim();
-    if !sys.is_empty() {
-        tokenizer.bpe_encode(sys, &mut temp);
+    if !system_prompt.is_empty() {
+        tokenizer.bpe_encode(system_prompt, &mut temp);
+        tokens.extend_from_slice(&temp);
+        tokenizer.bpe_encode("\n\n", &mut temp);
         tokens.extend_from_slice(&temp);
     }
 
@@ -98,8 +99,5 @@ pub(super) fn encode_deepseek_chat(
         tokenizer.bpe_encode("<｜Assistant｜>", &mut temp);
         tokens.extend_from_slice(&temp);
     }
-    tokenizer.bpe_encode("</think>", &mut temp);
-    tokens.extend_from_slice(&temp);
-
     tokens
 }

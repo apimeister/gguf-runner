@@ -1,3 +1,4 @@
+use crate::engine::io::{fp16_to_fp32, read_u16_le};
 use crate::engine::kernels::{
     accum, dot_f32_simd, finite_or_zero, l2_norm, matmul_f32_embeddings, matmul_quantized,
     matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma,
@@ -9,7 +10,10 @@ use crate::engine::switches::{
     kv_cache_mode, layer_debug_enabled, layer_debug_pos, par_attn_min_heads,
     KvCacheMode as SwitchKvCacheMode,
 };
-use crate::engine::types::{Config, KvCacheFormat, RunState, TransformerWeights};
+use crate::engine::types::{
+    ensure_model_range, Config, KvCacheFormat, QuantizedTensor, RunState, TransformerWeights,
+    GGML_TYPE_Q8_0,
+};
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
 fn alloc_f32(len: usize, label: &str) -> Result<Vec<f32>, String> {
@@ -150,6 +154,81 @@ fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scale: 
         let v = dequant_q4_at(cache, row_offset + i) as f32;
         dst[i] += scaled * v;
     }
+}
+
+fn deepseek_matmul_k_b_q8_0_layout(
+    out: &mut [f32],
+    x: &[f32],
+    wkb: &QuantizedTensor,
+    n_heads: usize,
+    qk_nope_head_dim: usize,
+    kv_lora_rank: usize,
+    mapped: &[u8],
+) -> Result<(), String> {
+    if wkb.ttype.0 != GGML_TYPE_Q8_0 {
+        return Err(format!(
+            "deepseek2 unsupported blk.*.attn_k_b.weight type {} (expected Q8_0)",
+            wkb.ttype.0
+        ));
+    }
+    if qk_nope_head_dim == 0 || kv_lora_rank == 0 || n_heads == 0 {
+        return Err("deepseek2 invalid attn_k_b dimensions".to_string());
+    }
+    if (qk_nope_head_dim & 31) != 0 {
+        return Err(format!(
+            "deepseek2 unsupported qk_nope_head_dim {} (must be multiple of 32 for Q8_0 layout)",
+            qk_nope_head_dim
+        ));
+    }
+    let expected_rows = n_heads.saturating_mul(qk_nope_head_dim);
+    let expected_cols = kv_lora_rank;
+    if wkb.rows != expected_rows || wkb.cols != expected_cols {
+        return Err(format!(
+            "deepseek2 attn_k_b tensor shape mismatch: got rows={}, cols={}, expected rows={}, cols={}",
+            wkb.rows, wkb.cols, expected_rows, expected_cols
+        ));
+    }
+    if out.len() < expected_rows || x.len() < kv_lora_rank {
+        return Err("deepseek2 attn_k_b buffers are too small".to_string());
+    }
+
+    let blocks_per_col = qk_nope_head_dim / 32;
+    let q8_block_bytes = 34usize; // fp16 scale + 32 i8 values
+    let head_bytes = kv_lora_rank
+        .checked_mul(blocks_per_col)
+        .and_then(|v| v.checked_mul(q8_block_bytes))
+        .ok_or_else(|| "overflow while computing deepseek2 attn_k_b stride".to_string())?;
+    let total_bytes = n_heads
+        .checked_mul(head_bytes)
+        .ok_or_else(|| "overflow while computing deepseek2 attn_k_b size".to_string())?;
+
+    ensure_model_range(wkb.data_offset, total_bytes)?;
+    if wkb.data_offset + total_bytes > mapped.len() {
+        return Err("deepseek2 attn_k_b tensor exceeds mapped file bounds".to_string());
+    }
+
+    for h in 0..n_heads {
+        let out_head = &mut out[h * qk_nope_head_dim..(h + 1) * qk_nope_head_dim];
+        out_head.fill(0.0);
+        let head_base = wkb.data_offset + h * head_bytes;
+        for (k, &xk) in x[..kv_lora_rank].iter().enumerate() {
+            if xk == 0.0 {
+                continue;
+            }
+            let col_base = head_base + k * blocks_per_col * q8_block_bytes;
+            for b in 0..blocks_per_col {
+                let off = col_base + b * q8_block_bytes;
+                let d = fp16_to_fp32(read_u16_le(mapped, off));
+                let scale = xk * d;
+                let q = &mapped[off + 2..off + 2 + 32];
+                let out_base = b * 32;
+                for j in 0..32 {
+                    out_head[out_base + j] += scale * (q[j] as i8 as f32);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
@@ -425,10 +504,13 @@ pub(crate) fn transformer(
                 deepseek_kv_lora,
                 eps,
             );
-            matmul_quantized(
+            deepseek_matmul_k_b_q8_0_layout(
                 &mut s.hb2[..deepseek_k_nope_dim],
                 &s.hb[..deepseek_kv_lora],
                 &w.deepseek_wk_b[l],
+                p.n_heads,
+                deepseek_qk_nope,
+                deepseek_kv_lora,
                 mapped,
             )?;
 
