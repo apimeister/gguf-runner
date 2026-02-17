@@ -152,6 +152,17 @@ fn axpy_q4_row(dst: &mut [f32], a: f32, cache: &[u8], row_offset: usize, scale: 
     }
 }
 
+#[inline]
+fn prob_entropy(probs: &[f32]) -> f32 {
+    let mut out = 0.0f32;
+    for &p in probs {
+        if p > 0.0 {
+            out -= p * p.ln();
+        }
+    }
+    finite_or_zero(out)
+}
+
 pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     let head_size = if p.head_dim > 0 {
         p.head_dim
@@ -538,6 +549,12 @@ pub(crate) fn transformer(
                     mapped,
                 )?;
             }
+            let mut ds_trace_kv_comp_l2 = 0.0f32;
+            let mut ds_trace_kv_rope_l2 = 0.0f32;
+            if do_layer_debug {
+                ds_trace_kv_comp_l2 = l2_norm(&s.hb[..deepseek_kv_lora]);
+                ds_trace_kv_rope_l2 = l2_norm(&s.hb[deepseek_kv_lora..deepseek_kv_a_rows]);
+            }
             s.hb[..deepseek_q_abs_dim].fill(0.0);
 
             let mut attn_scale_score = 1.0 / (deepseek_qk_head as f32).sqrt();
@@ -556,6 +573,19 @@ pub(crate) fn transformer(
                 }
             }
             let att_all = &mut s.att[..p.n_heads * p.seq_len];
+            let mut ds_trace_q_rope_l2 = 0.0f32;
+            let mut ds_trace_q_nope_l2 = 0.0f32;
+            let mut ds_trace_q_abs_l2 = 0.0f32;
+            let mut ds_trace_head0_premax = 0.0f32;
+            let mut ds_trace_head0_entropy = 0.0f32;
+            let mut ds_trace_head0_top_idx = 0usize;
+            let mut ds_trace_head0_top_prob = 0.0f32;
+            let mut ds_trace_ctx0_l2 = 0.0f32;
+            if do_layer_debug {
+                ds_trace_q_rope_l2 = l2_norm(&s.q[..deepseek_qk_rope]);
+                ds_trace_q_nope_l2 = l2_norm(&s.q[deepseek_qk_rope..deepseek_qk_head]);
+                ds_trace_q_abs_l2 = l2_norm(&s.hb2[..deepseek_kv_lora]);
+            }
 
             for h in 0..p.n_heads {
                 let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
@@ -571,8 +601,28 @@ pub(crate) fn transformer(
                         + dot_f32_simd(q_pe, &key_row[deepseek_kv_lora..deepseek_mla_k_dim]);
                     *slot = finite_or_zero(score * attn_scale_score);
                 }
+                if do_layer_debug && h == 0 {
+                    let mut premax = f32::NEG_INFINITY;
+                    for &v in att_head.iter() {
+                        premax = premax.max(v);
+                    }
+                    ds_trace_head0_premax = finite_or_zero(premax);
+                }
 
                 softmax(att_head, pos + 1);
+                if do_layer_debug && h == 0 {
+                    ds_trace_head0_entropy = prob_entropy(att_head);
+                    let mut best_idx = 0usize;
+                    let mut best_prob = f32::NEG_INFINITY;
+                    for (i, &v) in att_head.iter().enumerate() {
+                        if v > best_prob {
+                            best_prob = v;
+                            best_idx = i;
+                        }
+                    }
+                    ds_trace_head0_top_idx = best_idx;
+                    ds_trace_head0_top_prob = finite_or_zero(best_prob);
+                }
 
                 let ctx_head = &mut s.hb[h * deepseek_kv_lora..(h + 1) * deepseek_kv_lora];
                 for (t, &a) in att_head.iter().enumerate() {
@@ -584,6 +634,25 @@ pub(crate) fn transformer(
                         ctx_head[i] += a * value_row[i];
                     }
                 }
+                if do_layer_debug && h == 0 {
+                    ds_trace_ctx0_l2 = l2_norm(ctx_head);
+                }
+            }
+            if do_layer_debug {
+                eprintln!(
+                    "[DSTRACE pos={pos} l={l}] q_rope_l2={:.4} q_nope_l2={:.4} q_abs_l2={:.4} kv_comp_l2={:.4} kv_rope_l2={:.4} attn0_premax={:.4} attn0_entropy={:.4} attn0_top={} attn0_p={:.4} ctx0_l2={:.4} attn_scale={:.6}",
+                    ds_trace_q_rope_l2,
+                    ds_trace_q_nope_l2,
+                    ds_trace_q_abs_l2,
+                    ds_trace_kv_comp_l2,
+                    ds_trace_kv_rope_l2,
+                    ds_trace_head0_premax,
+                    ds_trace_head0_entropy,
+                    ds_trace_head0_top_idx,
+                    ds_trace_head0_top_prob,
+                    ds_trace_ctx0_l2,
+                    attn_scale_score,
+                );
             }
 
             for h in 0..p.n_heads {
@@ -1058,6 +1127,29 @@ pub(crate) fn transformer(
                     &mut s.moe_topk_weights,
                 )
             };
+            if do_layer_debug {
+                let show = n_selected.min(4);
+                let mut preview = String::new();
+                for j in 0..show {
+                    if j > 0 {
+                        preview.push_str(", ");
+                    }
+                    preview.push_str(&format!(
+                        "{}:{:.4}",
+                        s.moe_topk_indices[j], s.moe_topk_weights[j]
+                    ));
+                }
+                let mut max_logit = f32::NEG_INFINITY;
+                for &v in &s.moe_logits[..p.n_experts] {
+                    max_logit = max_logit.max(v);
+                }
+                eprintln!(
+                    "[DSTRACE pos={pos} l={l}] moe_n_selected={} moe_logit_max={:.4} moe_topk=[{}]",
+                    n_selected,
+                    finite_or_zero(max_logit),
+                    preview
+                );
+            }
             s.xb[..dim].fill(0.0);
 
             for j in 0..n_selected {

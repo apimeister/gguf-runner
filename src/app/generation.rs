@@ -240,12 +240,18 @@ impl ModelRuntime {
         let profiling_mode = self.settings.profiling_mode;
         let show_tokens = self.settings.show_tokens;
         let debug_mode = self.settings.debug_mode;
+        let effective_system_prompt =
+            if self.config.is_deepseek2 && system_prompt == "You are a helpful assistant." {
+                ""
+            } else {
+                system_prompt
+            };
 
         let mut prompt_tokens: Vec<i32> = crate::vendors::encode_chat_prompt(
             &mut self.tokenizer,
             &self.config,
             prompt,
-            system_prompt,
+            effective_system_prompt,
         );
 
         if prompt_tokens.is_empty() {
