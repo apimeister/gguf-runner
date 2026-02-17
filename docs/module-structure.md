@@ -203,7 +203,7 @@ src/
 - Vendor/model-family specific config parsing and prompt templating.
 - `vendors/mod.rs`:
   - Detects model family from GGUF metadata.
-  - Builds `Config` from family-specific key conventions (including DeepSeek2 MLA metadata, DeepSeek expert gating metadata, and RoPE scaling metadata).
+  - Builds `Config` from family-specific key conventions (including DeepSeek2 MLA metadata, DeepSeek expert gating metadata/normalization/group defaults, and RoPE scaling metadata).
   - Routes chat prompt encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`, `vendors/deepseek.rs`:
   - Family-specific defaults, validations, and prompt rendering (including Qwen MoE routing defaults/scaling).

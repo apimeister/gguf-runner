@@ -3,7 +3,10 @@ mod gemma;
 mod llama;
 mod qwen;
 
-use crate::engine::io::{get_gguf_float_from_map, get_gguf_int_from_map, get_gguf_string_from_map};
+use crate::engine::io::{
+    get_gguf_bool_from_map, get_gguf_float_from_map, get_gguf_int_from_map,
+    get_gguf_string_from_map,
+};
 use crate::engine::types::{Config, GGUFFile, Tokenizer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +144,9 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     let key_expert_ffn = format!("{key_prefix}.expert_feed_forward_length");
     let key_expert_shared_ffn = format!("{key_prefix}.expert_shared_feed_forward_length");
     let key_expert_gating_func = format!("{key_prefix}.expert_gating_func");
+    let key_expert_weights_norm = format!("{key_prefix}.expert_weights_norm");
+    let key_expert_group_count = format!("{key_prefix}.expert_group_count");
+    let key_expert_topk_group = format!("{key_prefix}.expert_topk_group");
     let key_ssm_conv_kernel = format!("{key_prefix}.ssm.conv_kernel");
     let key_ssm_inner_size = format!("{key_prefix}.ssm.inner_size");
     let key_ssm_state_size = format!("{key_prefix}.ssm.state_size");
@@ -211,9 +217,20 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
             qwen::validate_qwen3next(&mut config)?;
         }
         if config.is_deepseek2 {
-            config.moe_norm_topk_prob = true;
+            config.moe_norm_topk_prob =
+                get_gguf_bool_from_map(&gguf.kv, &key_expert_weights_norm, true);
             config.moe_routed_scaling_factor =
                 get_gguf_float_from_map(&gguf.kv, &key_expert_weights_scale, 1.0);
+            let n_group = get_gguf_int_from_map(&gguf.kv, &key_expert_group_count, 0) as usize;
+            let topk_group = get_gguf_int_from_map(&gguf.kv, &key_expert_topk_group, 0) as usize;
+            if n_group > 0 && topk_group > 0 {
+                config.moe_n_group = n_group;
+                config.moe_topk_group = topk_group.min(n_group);
+            } else if config.n_experts >= 64 {
+                // DeepSeek-V3 family defaults when group metadata is absent in GGUF.
+                config.moe_n_group = 8;
+                config.moe_topk_group = 4;
+            }
             if config.shared_expert_hidden_dim == 0 {
                 config.shared_expert_hidden_dim = config.expert_hidden_dim;
             }

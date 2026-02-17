@@ -165,10 +165,7 @@ fn read_gguf_scalar(r: &mut File, value_type: u32) -> io::Result<GgufValue> {
         GGUF_TYPE_INT64 => Ok(GgufValue::Int(read_i64(r)?)),
         GGUF_TYPE_FLOAT32 => Ok(GgufValue::F32(read_f32(r)?)),
         GGUF_TYPE_FLOAT64 => Ok(GgufValue::F64(read_f64(r)?)),
-        GGUF_TYPE_BOOL => {
-            let _ = read_bool(r)?;
-            Ok(GgufValue::Bool(()))
-        }
+        GGUF_TYPE_BOOL => Ok(GgufValue::Bool(read_bool(r)?)),
         GGUF_TYPE_STRING => Ok(GgufValue::Str(read_gguf_string(r)?)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -437,6 +434,17 @@ pub(crate) fn get_gguf_string_from_map<'a>(
     match kv.get(key) {
         Some(GgufValue::Str(s)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+pub(crate) fn get_gguf_bool_from_map(
+    kv: &HashMap<String, GgufValue>,
+    key: &str,
+    default_val: bool,
+) -> bool {
+    match kv.get(key) {
+        Some(GgufValue::Bool(v)) => *v,
+        _ => default_val,
     }
 }
 

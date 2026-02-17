@@ -464,7 +464,7 @@ pub(crate) enum GgufValue {
     Int(i64),
     F32(f32),
     F64(f64),
-    Bool(()),
+    Bool(bool),
     Str(String),
 }
 

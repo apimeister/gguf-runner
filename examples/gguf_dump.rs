@@ -149,7 +149,7 @@ fn format_gguf_value(v: &GgufValue) -> String {
         GgufValue::Int(x) => x.to_string(),
         GgufValue::F32(x) => x.to_string(),
         GgufValue::F64(x) => x.to_string(),
-        GgufValue::Bool(()) => "<bool>".to_string(),
+        GgufValue::Bool(x) => x.to_string(),
         GgufValue::Str(s) => format!("{s:?}"),
     }
 }
