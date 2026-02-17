@@ -38,7 +38,7 @@ pub(super) fn validate_deepseek2(config: &mut Config) -> Result<(), String> {
 
 pub(super) fn print_deepseek2_debug(config: &Config) {
     eprintln!(
-        "DeepSeek2: q_lora_rank={}, kv_lora_rank={}, qk_nope_head_dim={}, qk_rope_head_dim={}, v_head_dim={}, leading_dense_blocks={}, experts={}, experts_used={}, expert_hidden_dim={}, shared_expert_hidden_dim={}, expert_gating_func={}",
+        "DeepSeek2: q_lora_rank={}, kv_lora_rank={}, qk_nope_head_dim={}, qk_rope_head_dim={}, v_head_dim={}, leading_dense_blocks={}, experts={}, experts_used={}, expert_hidden_dim={}, shared_expert_hidden_dim={}, expert_gating_func={}, moe_norm_topk_prob={}, moe_scale={}, moe_n_group={}, moe_topk_group={}",
         config.deepseek_q_lora_rank,
         config.deepseek_kv_lora_rank,
         config.deepseek_qk_nope_head_dim,
@@ -49,7 +49,11 @@ pub(super) fn print_deepseek2_debug(config: &Config) {
         config.n_experts_used,
         config.expert_hidden_dim,
         config.shared_expert_hidden_dim,
-        config.deepseek_expert_gating_func
+        config.deepseek_expert_gating_func,
+        config.moe_norm_topk_prob,
+        config.moe_routed_scaling_factor,
+        config.moe_n_group,
+        config.moe_topk_group
     );
 }
 

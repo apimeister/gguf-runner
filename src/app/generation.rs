@@ -183,6 +183,12 @@ impl ModelRuntime {
         }
 
         let mut config = crate::vendors::build_config_from_gguf(&gguf, debug_mode)?;
+        if debug_mode && config.is_deepseek2 && cli.temperature == 0.0 && cli.repeat_penalty == 1.0
+        {
+            eprintln!(
+                "Note: DeepSeek greedy decoding (temperature=0, repeat_penalty=1) may loop; consider --repeat-penalty 1.05..1.15"
+            );
+        }
         let mut tokenizer =
             crate::engine::tokenizer::init_tokenizer_from_gguf(&gguf, &mut config, debug_mode)?;
         tokenizer.use_sentencepiece = config.is_gemma3;
