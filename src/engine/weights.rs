@@ -140,7 +140,7 @@ pub(crate) fn init_weights_from_gguf(
     let deepseek_q_dim = p.n_heads * deepseek_qk_head_dim;
     let deepseek_v_dim = p.n_heads * p.deepseek_v_head_dim;
     let deepseek_kv_a_rows = p.deepseek_kv_lora_rank + p.deepseek_qk_rope_head_dim;
-    let deepseek_k_nope_rows = p.n_heads * p.deepseek_qk_nope_head_dim;
+    let deepseek_k_absorb_rows = p.n_heads * p.deepseek_kv_lora_rank;
 
     let token_embedding_table =
         load_tensor_float(gguf, "token_embd.weight", Some(p.vocab_size * p.dim))?;
@@ -335,8 +335,8 @@ pub(crate) fn init_weights_from_gguf(
                 gguf,
                 l,
                 "attn_k_b.weight",
-                deepseek_k_nope_rows,
-                p.deepseek_kv_lora_rank,
+                deepseek_k_absorb_rows,
+                p.deepseek_qk_nope_head_dim,
             )?;
             deepseek_wv_b[l] = load_layer_tensor_quantized(
                 gguf,

@@ -637,6 +637,8 @@ pub(crate) struct RunState {
     pub(crate) value_cache_q4: Vec<u8>,
     pub(crate) key_cache_scale: Vec<f32>,
     pub(crate) value_cache_scale: Vec<f32>,
+    pub(crate) deepseek_key_cache: Vec<f32>,
+    pub(crate) deepseek_value_cache: Vec<f32>,
     pub(crate) rope_freqs: Vec<f32>,
     pub(crate) rope_freqs_swa: Vec<f32>,
     pub(crate) rope_cos: Vec<f32>,

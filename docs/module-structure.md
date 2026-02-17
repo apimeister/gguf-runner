@@ -166,7 +166,7 @@ src/
 - `runtime/inference.rs`:
   - `malloc_run_state(...)`
   - `transformer(...)`
-  - includes dedicated DeepSeek2 MLA attention path (`attn_q_a/q_b`, `attn_kv_a_mqa`, `attn_k_b`, `attn_v_b`) plus mixed dense/MoE FFN handling
+  - includes dedicated DeepSeek2 MLA attention path (`attn_q_a/q_b`, `attn_kv_a_mqa`, `attn_k_b`, `attn_v_b`) using absorbed queries + compressed MLA K/V cache, plus mixed dense/MoE FFN handling
   - quantized KV cache storage for attention state:
     - default Q8 cache
     - automatic Q4 fallback when Q8 allocation fails

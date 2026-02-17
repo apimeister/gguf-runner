@@ -33,8 +33,6 @@ pub(super) fn validate_deepseek2(config: &mut Config) -> Result<(), String> {
         ));
     }
 
-    // DeepSeek-MLA materializes per-head K/V projections in this runtime path.
-    config.n_kv_heads = config.n_heads;
     Ok(())
 }
 
