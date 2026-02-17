@@ -503,13 +503,14 @@ pub(crate) fn transformer(
 
             for h in 0..p.n_heads {
                 let q_base = h * deepseek_qk_head;
+                let q_rope_base = q_base + deepseek_qk_nope;
                 for i in 0..rope_half {
                     let c = s.rope_cos[i];
                     let s1 = s.rope_sin[i];
-                    let q0 = s.q[q_base + i];
-                    let q1 = s.q[q_base + i + rope_half];
-                    s.q[q_base + i] = q0 * c - q1 * s1;
-                    s.q[q_base + i + rope_half] = q0 * s1 + q1 * c;
+                    let q0 = s.q[q_rope_base + i];
+                    let q1 = s.q[q_rope_base + i + rope_half];
+                    s.q[q_rope_base + i] = q0 * c - q1 * s1;
+                    s.q[q_rope_base + i + rope_half] = q0 * s1 + q1 * c;
                 }
             }
 
@@ -537,7 +538,7 @@ pub(crate) fn transformer(
 
             for h in 0..p.n_heads {
                 let q_head_base = h * deepseek_qk_head;
-                let q_nope = &s.q[q_head_base + deepseek_qk_rope..q_head_base + deepseek_qk_head];
+                let q_nope = &s.q[q_head_base..q_head_base + deepseek_qk_nope];
                 let q_abs = &mut s.hb2[h * deepseek_kv_lora..(h + 1) * deepseek_kv_lora];
                 let row_start = h * deepseek_kv_lora;
                 matmul_quantized_rows(
@@ -582,8 +583,8 @@ pub(crate) fn transformer(
             let mut ds_trace_head0_top_prob = 0.0f32;
             let mut ds_trace_ctx0_l2 = 0.0f32;
             if do_layer_debug {
-                ds_trace_q_rope_l2 = l2_norm(&s.q[..deepseek_qk_rope]);
-                ds_trace_q_nope_l2 = l2_norm(&s.q[deepseek_qk_rope..deepseek_qk_head]);
+                ds_trace_q_nope_l2 = l2_norm(&s.q[..deepseek_qk_nope]);
+                ds_trace_q_rope_l2 = l2_norm(&s.q[deepseek_qk_nope..deepseek_qk_head]);
                 ds_trace_q_abs_l2 = l2_norm(&s.hb2[..deepseek_kv_lora]);
             }
 
@@ -591,7 +592,8 @@ pub(crate) fn transformer(
                 let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
                 let att_head = &mut att_head_full[..=pos];
                 let q_abs = &s.hb2[h * deepseek_kv_lora..(h + 1) * deepseek_kv_lora];
-                let q_pe = &s.q[h * deepseek_qk_head..h * deepseek_qk_head + deepseek_qk_rope];
+                let q_pe =
+                    &s.q[h * deepseek_qk_head + deepseek_qk_nope..(h + 1) * deepseek_qk_head];
 
                 for (t, slot) in att_head.iter_mut().enumerate() {
                     let t_row = layer_row_base + t;
