@@ -167,6 +167,7 @@ src/
   - `malloc_run_state(...)`
   - `transformer(...)`
   - includes dedicated DeepSeek2 MLA attention path (`attn_q_a/q_b`, `attn_kv_a_mqa`, `attn_k_b`, `attn_v_b`) using absorbed queries + compressed MLA K/V cache, plus mixed dense/MoE FFN handling
+  - DeepSeek2 MLA query layout follows model-native split order (`q_rope` then `q_nope`) for RoPE and absorb-projection paths
   - DeepSeek2 MoE routing supports model-declared gating mode (including sigmoid routing) and per-layer expert routing bias application
   - quantized KV cache storage for attention state:
     - default Q8 cache
