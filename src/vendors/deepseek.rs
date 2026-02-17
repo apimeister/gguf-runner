@@ -97,5 +97,17 @@ pub(super) fn encode_deepseek_chat(
         tokenizer.bpe_encode("<｜Assistant｜>", &mut temp);
         tokens.extend_from_slice(&temp);
     }
+
+    // DeepSeek-V3 chat templates commonly append </think> before assistant output
+    // when "thinking" mode is disabled.
+    if let Some(close_think_tok) =
+        find_special_token_any(tokenizer, &["</think>", "<|/think|>", "<｜/think｜>"])
+    {
+        tokens.push(close_think_tok);
+    } else {
+        tokenizer.bpe_encode("</think>", &mut temp);
+        tokens.extend_from_slice(&temp);
+    }
+
     tokens
 }

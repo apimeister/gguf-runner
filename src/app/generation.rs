@@ -36,6 +36,101 @@ fn stop_token_debug_desc(tokenizer: &Tokenizer, token: i32) -> String {
     format!("id={token}, text=\"{decoded}\"")
 }
 
+fn deepseek_partial_marker_len(text: &str, markers: &[&str]) -> usize {
+    let max_marker_len = markers.iter().map(|m| m.len()).max().unwrap_or(0);
+    let tail_start = text.len().saturating_sub(max_marker_len.saturating_sub(1));
+    let tail = &text[tail_start..];
+    let mut best = 0usize;
+    for marker in markers {
+        let prefix_max = marker.len().saturating_sub(1).min(tail.len());
+        for prefix_len in 1..=prefix_max {
+            if tail.ends_with(&marker[..prefix_len]) {
+                best = best.max(prefix_len);
+            }
+        }
+    }
+    best
+}
+
+fn deepseek_strip_think_fragment(
+    carry: &mut String,
+    in_think: &mut bool,
+    fragment: &str,
+) -> String {
+    const THINK_OPEN: &str = "<think>";
+    const THINK_CLOSE: &str = "</think>";
+
+    let mut text = String::new();
+    text.push_str(carry);
+    text.push_str(fragment);
+    carry.clear();
+
+    let mut out = String::new();
+    let mut idx = 0usize;
+    loop {
+        if *in_think {
+            if let Some(rel) = text[idx..].find(THINK_CLOSE) {
+                idx += rel + THINK_CLOSE.len();
+                *in_think = false;
+                continue;
+            }
+            let remaining = &text[idx..];
+            let partial_len = deepseek_partial_marker_len(remaining, &[THINK_CLOSE]);
+            if partial_len > 0 {
+                carry.push_str(&remaining[remaining.len() - partial_len..]);
+            }
+            return out;
+        }
+
+        let open_rel = text[idx..].find(THINK_OPEN);
+        let close_rel = text[idx..].find(THINK_CLOSE);
+        match (open_rel, close_rel) {
+            (Some(open), Some(close)) if close < open => {
+                out.push_str(&text[idx..idx + close]);
+                idx += close + THINK_CLOSE.len();
+            }
+            (Some(open), _) => {
+                out.push_str(&text[idx..idx + open]);
+                idx += open + THINK_OPEN.len();
+                *in_think = true;
+            }
+            (None, Some(close)) => {
+                out.push_str(&text[idx..idx + close]);
+                idx += close + THINK_CLOSE.len();
+            }
+            (None, None) => {
+                let remaining = &text[idx..];
+                let partial_len =
+                    deepseek_partial_marker_len(remaining, &[THINK_OPEN, THINK_CLOSE]);
+                if partial_len > 0 {
+                    let emit_len = remaining.len() - partial_len;
+                    out.push_str(&remaining[..emit_len]);
+                    carry.push_str(&remaining[emit_len..]);
+                } else {
+                    out.push_str(remaining);
+                }
+                return out;
+            }
+        }
+    }
+}
+
+fn deepseek_flush_filtered_tail(carry: &mut String, in_think: bool) -> String {
+    const THINK_OPEN: &str = "<think>";
+    const THINK_CLOSE: &str = "</think>";
+
+    if in_think {
+        carry.clear();
+        return String::new();
+    }
+
+    let partial_len = deepseek_partial_marker_len(carry, &[THINK_OPEN, THINK_CLOSE]);
+    let emit_len = carry.len().saturating_sub(partial_len);
+    let result = carry[..emit_len].to_string();
+    carry.clear();
+    result
+}
+
 pub(crate) struct GenerationSettings {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
@@ -201,6 +296,8 @@ impl ModelRuntime {
         };
         let mut pending_newline = false;
         let mut output = String::new();
+        let mut deepseek_in_think = false;
+        let mut deepseek_think_carry = String::new();
 
         let gemma3_end_turn = if self.config.is_gemma3 {
             self.tokenizer
@@ -364,10 +461,18 @@ impl ModelRuntime {
                 && next != deepseek_user_tag
             {
                 if let Some(decoded) = self.tokenizer.decode_token(next) {
-                    if self.config.is_deepseek2 && decoded == "</think>" {
-                        // DeepSeek chat templates commonly prefix assistant output with </think>.
-                        // Skip emitting it to stdout/output for plain-text generation mode.
-                    } else if decoded == "\n" {
+                    let filtered = if self.config.is_deepseek2 {
+                        deepseek_strip_think_fragment(
+                            &mut deepseek_think_carry,
+                            &mut deepseek_in_think,
+                            &decoded,
+                        )
+                    } else {
+                        decoded
+                    };
+                    if filtered.is_empty() {
+                        // no-op
+                    } else if filtered == "\n" {
                         pending_newline = true;
                     } else {
                         if pending_newline {
@@ -377,9 +482,9 @@ impl ModelRuntime {
                             }
                             pending_newline = false;
                         }
-                        output.push_str(&decoded);
+                        output.push_str(&filtered);
                         if stream_stdout {
-                            print!("{decoded}");
+                            print!("{filtered}");
                             let _ = io::stdout().flush();
                         }
                     }
@@ -464,6 +569,23 @@ impl ModelRuntime {
                         );
                     }
                     break;
+                }
+            }
+        }
+
+        if self.config.is_deepseek2 {
+            let tail = deepseek_flush_filtered_tail(&mut deepseek_think_carry, deepseek_in_think);
+            if !tail.is_empty() {
+                if pending_newline {
+                    output.push('\n');
+                    if stream_stdout {
+                        println!();
+                    }
+                }
+                output.push_str(&tail);
+                if stream_stdout {
+                    print!("{tail}");
+                    let _ = io::stdout().flush();
                 }
             }
         }
