@@ -547,6 +547,7 @@ pub(crate) struct Config {
     pub(crate) deepseek_qk_nope_head_dim: usize,
     pub(crate) deepseek_qk_rope_head_dim: usize,
     pub(crate) deepseek_v_head_dim: usize,
+    pub(crate) deepseek_expert_gating_func: i32,
 }
 
 #[derive(Clone, Default)]
@@ -578,6 +579,7 @@ pub(crate) struct TransformerWeights {
     pub(crate) deepseek_kv_a_norm: Vec<f32>,
     pub(crate) deepseek_layer_is_moe: Vec<bool>,
     pub(crate) deepseek_shared_gate_present: Vec<bool>,
+    pub(crate) deepseek_exp_probs_bias: Vec<f32>,
     pub(crate) ssm_ba: Vec<QuantizedTensor>,
     pub(crate) ssm_conv1d: Vec<Vec<f32>>,
     pub(crate) ssm_a: Vec<f32>,

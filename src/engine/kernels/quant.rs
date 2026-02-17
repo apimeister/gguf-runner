@@ -3225,3 +3225,141 @@ pub(crate) fn select_topk_softmax(
 
     count
 }
+
+pub(crate) fn select_topk_sigmoid(
+    logits: &[f32],
+    k: usize,
+    n_group: usize,
+    topk_group: usize,
+    normalize_topk: bool,
+    scale: f32,
+    scores_scratch: &mut Vec<f32>,
+    selected_group_scratch: &mut Vec<bool>,
+    group_scores_scratch: &mut Vec<f32>,
+    rank_scratch: &mut Vec<usize>,
+    out_indices: &mut [usize],
+    out_weights: &mut [f32],
+) -> usize {
+    let top_k = k.max(1).min(logits.len());
+    if scores_scratch.len() < logits.len() {
+        scores_scratch.resize(logits.len(), 0.0);
+    }
+    let scores = &mut scores_scratch[..logits.len()];
+    for (i, &v) in logits.iter().enumerate() {
+        scores[i] = 1.0 / (1.0 + (-v).exp());
+    }
+
+    let use_grouped = n_group > 1 && topk_group < n_group && logits.len() % n_group == 0;
+    let group_size = if use_grouped {
+        logits.len() / n_group
+    } else {
+        logits.len()
+    };
+
+    let selected_group_len = n_group.max(1);
+    if selected_group_scratch.len() < selected_group_len {
+        selected_group_scratch.resize(selected_group_len, true);
+    }
+    let selected_group = &mut selected_group_scratch[..selected_group_len];
+    selected_group.fill(true);
+
+    if use_grouped {
+        if group_scores_scratch.len() < n_group {
+            group_scores_scratch.resize(n_group, 0.0);
+        }
+        let group_scores = &mut group_scores_scratch[..n_group];
+        for g in 0..n_group {
+            let start = g * group_size;
+            let end = start + group_size;
+            let mut best1 = f32::NEG_INFINITY;
+            let mut best2 = f32::NEG_INFINITY;
+            for &s in &scores[start..end] {
+                if s > best1 {
+                    best2 = best1;
+                    best1 = s;
+                } else if s > best2 {
+                    best2 = s;
+                }
+            }
+            group_scores[g] = best1 + if best2.is_finite() { best2 } else { 0.0 };
+        }
+
+        selected_group.fill(false);
+        if rank_scratch.len() < n_group {
+            rank_scratch.resize(n_group, 0);
+        }
+        let rank = &mut rank_scratch[..n_group];
+        for (i, r) in rank.iter_mut().enumerate() {
+            *r = i;
+        }
+        rank.sort_by(|&a, &b| {
+            group_scores[b]
+                .partial_cmp(&group_scores[a])
+                .unwrap_or(Ordering::Equal)
+        });
+        for &g in rank.iter().take(topk_group.max(1).min(n_group)) {
+            selected_group[g] = true;
+        }
+    }
+
+    for i in 0..top_k {
+        out_weights[i] = f32::NEG_INFINITY;
+        out_indices[i] = 0;
+    }
+    let mut count = 0usize;
+
+    for (idx, &v) in scores.iter().enumerate() {
+        if use_grouped {
+            let g = idx / group_size;
+            if !selected_group[g] {
+                continue;
+            }
+        }
+        if count < top_k {
+            let mut ins = count;
+            while ins > 0 && v > out_weights[ins - 1] {
+                out_weights[ins] = out_weights[ins - 1];
+                out_indices[ins] = out_indices[ins - 1];
+                ins -= 1;
+            }
+            out_weights[ins] = v;
+            out_indices[ins] = idx;
+            count += 1;
+            continue;
+        }
+
+        if v <= out_weights[top_k - 1] {
+            continue;
+        }
+
+        out_weights[top_k - 1] = v;
+        out_indices[top_k - 1] = idx;
+        let mut pos = top_k - 1;
+        while pos > 0 && out_weights[pos] > out_weights[pos - 1] {
+            out_weights.swap(pos, pos - 1);
+            out_indices.swap(pos, pos - 1);
+            pos -= 1;
+        }
+    }
+
+    if count == 0 {
+        return 0;
+    }
+
+    if top_k > 1 && normalize_topk {
+        let mut sum_selected = 0.0f32;
+        for i in 0..count {
+            sum_selected += out_weights[i];
+        }
+        let inv = 1.0 / sum_selected.max(f32::MIN_POSITIVE);
+        for i in 0..count {
+            out_weights[i] *= inv;
+        }
+    }
+
+    for i in 0..count {
+        out_weights[i] *= scale;
+    }
+
+    count
+}

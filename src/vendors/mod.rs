@@ -140,6 +140,7 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     let key_expert_used_count = format!("{key_prefix}.expert_used_count");
     let key_expert_ffn = format!("{key_prefix}.expert_feed_forward_length");
     let key_expert_shared_ffn = format!("{key_prefix}.expert_shared_feed_forward_length");
+    let key_expert_gating_func = format!("{key_prefix}.expert_gating_func");
     let key_ssm_conv_kernel = format!("{key_prefix}.ssm.conv_kernel");
     let key_ssm_inner_size = format!("{key_prefix}.ssm.inner_size");
     let key_ssm_state_size = format!("{key_prefix}.ssm.state_size");
@@ -197,6 +198,8 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         deepseek_qk_nope_head_dim: 0,
         deepseek_qk_rope_head_dim: 0,
         deepseek_v_head_dim: get_gguf_int_from_map(&gguf.kv, &key_value_mla, 0) as usize,
+        deepseek_expert_gating_func: get_gguf_int_from_map(&gguf.kv, &key_expert_gating_func, 0)
+            as i32,
     };
 
     if config.is_qwen3moe || config.is_qwen3next || config.is_deepseek2 {

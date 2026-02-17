@@ -1,8 +1,8 @@
 use crate::engine::kernels::{
     accum, dot_f32_simd, finite_or_zero, l2_norm, matmul_f32_embeddings, matmul_quantized,
     matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma,
-    rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, scale_slice_inplace, select_topk_softmax,
-    sigmoidf, softmax,
+    rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, scale_slice_inplace, select_topk_sigmoid,
+    select_topk_softmax, sigmoidf, softmax,
 };
 use crate::engine::profiling::{prof_end, prof_start, PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS};
 use crate::engine::switches::{
@@ -457,10 +457,6 @@ pub(crate) fn transformer(
             let layer_row_base = l * p.seq_len;
             let row_index = layer_row_base + pos;
             let v_row_off = row_index * deepseek_kv_lora;
-            // Preserve the raw compressed KV vector for value mixing; only the score path
-            // uses the normalized variant.
-            s.deepseek_value_cache[v_row_off..v_row_off + deepseek_kv_lora]
-                .copy_from_slice(&s.hb[..deepseek_kv_lora]);
             rmsnorm_inplace(
                 &mut s.hb[..deepseek_kv_lora],
                 &w.deepseek_kv_a_norm[l * deepseek_kv_lora..(l + 1) * deepseek_kv_lora],
@@ -513,6 +509,8 @@ pub(crate) fn transformer(
                 k_row[deepseek_kv_lora..deepseek_mla_k_dim]
                     .copy_from_slice(&s.hb[deepseek_kv_lora..deepseek_kv_a_rows]);
             }
+            s.deepseek_value_cache[v_row_off..v_row_off + deepseek_kv_lora]
+                .copy_from_slice(&s.hb[..deepseek_kv_lora]);
 
             for h in 0..p.n_heads {
                 let q_nope = &s.q[h * deepseek_qk_head..h * deepseek_qk_head + deepseek_qk_nope];
@@ -993,20 +991,60 @@ pub(crate) fn transformer(
                 &w.moe_gate_inp[l],
                 mapped,
             )?;
-            let n_selected = select_topk_softmax(
-                &s.moe_logits[..p.n_experts],
-                p.n_experts_used,
-                p.moe_n_group,
-                p.moe_topk_group,
-                p.moe_norm_topk_prob,
-                p.moe_routed_scaling_factor,
-                &mut s.moe_scores,
-                &mut s.moe_selected_group,
-                &mut s.moe_group_scores,
-                &mut s.moe_group_rank,
-                &mut s.moe_topk_indices,
-                &mut s.moe_topk_weights,
-            );
+            let n_selected = if p.is_deepseek2 {
+                if !w.deepseek_exp_probs_bias.is_empty() {
+                    let bias = &w.deepseek_exp_probs_bias[l * p.n_experts..(l + 1) * p.n_experts];
+                    for i in 0..p.n_experts {
+                        s.moe_logits[i] += bias[i];
+                    }
+                }
+                if p.deepseek_expert_gating_func == 2 {
+                    select_topk_sigmoid(
+                        &s.moe_logits[..p.n_experts],
+                        p.n_experts_used,
+                        p.moe_n_group,
+                        p.moe_topk_group,
+                        p.moe_norm_topk_prob,
+                        p.moe_routed_scaling_factor,
+                        &mut s.moe_scores,
+                        &mut s.moe_selected_group,
+                        &mut s.moe_group_scores,
+                        &mut s.moe_group_rank,
+                        &mut s.moe_topk_indices,
+                        &mut s.moe_topk_weights,
+                    )
+                } else {
+                    select_topk_softmax(
+                        &s.moe_logits[..p.n_experts],
+                        p.n_experts_used,
+                        p.moe_n_group,
+                        p.moe_topk_group,
+                        p.moe_norm_topk_prob,
+                        p.moe_routed_scaling_factor,
+                        &mut s.moe_scores,
+                        &mut s.moe_selected_group,
+                        &mut s.moe_group_scores,
+                        &mut s.moe_group_rank,
+                        &mut s.moe_topk_indices,
+                        &mut s.moe_topk_weights,
+                    )
+                }
+            } else {
+                select_topk_softmax(
+                    &s.moe_logits[..p.n_experts],
+                    p.n_experts_used,
+                    p.moe_n_group,
+                    p.moe_topk_group,
+                    p.moe_norm_topk_prob,
+                    p.moe_routed_scaling_factor,
+                    &mut s.moe_scores,
+                    &mut s.moe_selected_group,
+                    &mut s.moe_group_scores,
+                    &mut s.moe_group_rank,
+                    &mut s.moe_topk_indices,
+                    &mut s.moe_topk_weights,
+                )
+            };
             s.xb[..dim].fill(0.0);
 
             for j in 0..n_selected {

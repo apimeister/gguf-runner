@@ -205,6 +205,11 @@ pub(crate) fn init_weights_from_gguf(
     } else {
         Vec::new()
     };
+    let mut deepseek_exp_probs_bias = if p.is_deepseek2 {
+        vec![0.0f32; n_layers * p.n_experts]
+    } else {
+        Vec::new()
+    };
     let mut ssm_ba = if p.is_qwen3next {
         vec![QuantizedTensor::default(); n_layers]
     } else {
@@ -391,6 +396,13 @@ pub(crate) fn init_weights_from_gguf(
                     p.n_experts * p.dim,
                     p.expert_hidden_dim,
                 )?;
+                if !deepseek_exp_probs_bias.is_empty()
+                    && find_gguf_tensor(gguf, &format!("blk.{l}.exp_probs_b.bias")).is_some()
+                {
+                    let bias = load_layer_tensor_float(gguf, l, "exp_probs_b.bias", p.n_experts)?;
+                    deepseek_exp_probs_bias[l * p.n_experts..(l + 1) * p.n_experts]
+                        .copy_from_slice(&bias);
+                }
 
                 let shared_hidden = if p.shared_expert_hidden_dim > 0 {
                     p.shared_expert_hidden_dim
@@ -679,6 +691,7 @@ pub(crate) fn init_weights_from_gguf(
         deepseek_kv_a_norm,
         deepseek_layer_is_moe,
         deepseek_shared_gate_present,
+        deepseek_exp_probs_bias,
         ssm_ba,
         ssm_conv1d,
         ssm_a,

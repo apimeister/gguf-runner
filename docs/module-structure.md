@@ -150,7 +150,7 @@ src/
 ### `src/engine/weights.rs`
 
 - Loads and validates model tensors from GGUF into `TransformerWeights`.
-- Handles per-family tensor layout differences and optional tensors, including DeepSeek-MLA tensors.
+- Handles per-family tensor layout differences and optional tensors, including DeepSeek-MLA tensors and DeepSeek MoE expert-bias tensors (`exp_probs_b.bias`).
 - Exposes `init_weights_from_gguf(...)`.
 
 ### `src/engine/kernels/*`
@@ -167,6 +167,7 @@ src/
   - `malloc_run_state(...)`
   - `transformer(...)`
   - includes dedicated DeepSeek2 MLA attention path (`attn_q_a/q_b`, `attn_kv_a_mqa`, `attn_k_b`, `attn_v_b`) using absorbed queries + compressed MLA K/V cache, plus mixed dense/MoE FFN handling
+  - DeepSeek2 MoE routing supports model-declared gating mode (including sigmoid routing) and per-layer expert routing bias application
   - quantized KV cache storage for attention state:
     - default Q8 cache
     - automatic Q4 fallback when Q8 allocation fails
@@ -200,7 +201,7 @@ src/
 - Vendor/model-family specific config parsing and prompt templating.
 - `vendors/mod.rs`:
   - Detects model family from GGUF metadata.
-  - Builds `Config` from family-specific key conventions (including DeepSeek2 MLA metadata and RoPE scaling metadata).
+  - Builds `Config` from family-specific key conventions (including DeepSeek2 MLA metadata, DeepSeek expert gating metadata, and RoPE scaling metadata).
   - Routes chat prompt encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen.rs`, `vendors/deepseek.rs`:
   - Family-specific defaults, validations, and prompt rendering (including Qwen MoE routing defaults/scaling).
