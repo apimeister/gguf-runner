@@ -468,9 +468,21 @@ pub(crate) fn transformer(
             if deepseek_qk_rope == 0 || rope_half == 0 {
                 return Err("invalid deepseek2 rope dimension".to_string());
             }
+            let use_yarn_scaled_rope = !p.rope_scaling_yarn
+                || p.rope_orig_ctx == 0
+                || pos >= p.rope_orig_ctx
+                || p.rope_freq_scale <= 0.0
+                || p.rope_freq_scale == 1.0;
             if s.rope_cache_pos != pos as isize || s.rope_cache_is_swa != 0 {
                 for i in 0..rope_half {
-                    let val = pos as f32 * s.rope_freqs[i];
+                    let freq = if use_yarn_scaled_rope {
+                        s.rope_freqs[i]
+                    } else {
+                        // For YaRN models, keep native RoPE frequencies within original
+                        // training context and only apply extrapolation scaling afterwards.
+                        s.rope_freqs[i] / p.rope_freq_scale
+                    };
+                    let val = pos as f32 * freq;
                     s.rope_cos[i] = val.cos();
                     s.rope_sin[i] = val.sin();
                 }
@@ -530,6 +542,7 @@ pub(crate) fn transformer(
 
             let mut attn_scale_score = 1.0 / (deepseek_qk_head as f32).sqrt();
             if p.rope_scaling_yarn
+                && (p.rope_orig_ctx == 0 || pos >= p.rope_orig_ctx)
                 && p.rope_freq_scale > 0.0
                 && p.rope_freq_scale != 1.0
                 && p.rope_yarn_log_multiplier != 0.0
