@@ -27,6 +27,15 @@ fn find_special_token_any(tokenizer: &Tokenizer, candidates: &[&str]) -> i32 {
     -1
 }
 
+fn stop_token_debug_desc(tokenizer: &Tokenizer, token: i32) -> String {
+    let decoded = tokenizer
+        .decode_token(token)
+        .unwrap_or_else(|| "<decode:none>".to_string())
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("id={token}, text=\"{decoded}\"")
+}
+
 pub(crate) struct GenerationSettings {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
@@ -215,7 +224,6 @@ impl ModelRuntime {
                     "<｜end▁of▁sentence｜>",
                     "<|end▁of▁sentence|>",
                     "<|end_of_sentence|>",
-                    "<|im_end|>",
                 ],
             )
         } else {
@@ -389,27 +397,58 @@ impl ModelRuntime {
                 let is_global_end =
                     token == self.tokenizer.eos_token || token == self.tokenizer.eot_token;
                 if !self.config.is_deepseek2 && is_global_end {
+                    if debug_mode {
+                        eprintln!(
+                            "[STOP] global_eos {}",
+                            stop_token_debug_desc(&self.tokenizer, token)
+                        );
+                    }
                     break;
                 }
                 if self.config.is_gemma3 && token == gemma3_end_turn {
+                    if debug_mode {
+                        eprintln!(
+                            "[STOP] gemma_end_turn {}",
+                            stop_token_debug_desc(&self.tokenizer, token)
+                        );
+                    }
                     break;
                 }
                 if (self.config.is_qwen2 || self.config.is_qwen3moe || self.config.is_qwen3next)
                     && qwen_im_end >= 0
                     && token == qwen_im_end
                 {
+                    if debug_mode {
+                        eprintln!(
+                            "[STOP] qwen_im_end {}",
+                            stop_token_debug_desc(&self.tokenizer, token)
+                        );
+                    }
                     break;
                 }
                 if self.config.is_deepseek2
                     && deepseek_end_sentence >= 0
                     && token == deepseek_end_sentence
                 {
+                    if debug_mode {
+                        eprintln!(
+                            "[STOP] deepseek_end_sentence {}",
+                            stop_token_debug_desc(&self.tokenizer, token)
+                        );
+                    }
                     break;
                 }
                 if self.config.is_deepseek2
+                    && deepseek_end_sentence < 0
                     && ((deepseek_user_tag >= 0 && token == deepseek_user_tag)
                         || (deepseek_assistant_tag >= 0 && token == deepseek_assistant_tag))
                 {
+                    if debug_mode {
+                        eprintln!(
+                            "[STOP] deepseek_role_turn {}",
+                            stop_token_debug_desc(&self.tokenizer, token)
+                        );
+                    }
                     break;
                 }
                 if self.config.is_deepseek2
@@ -418,6 +457,12 @@ impl ModelRuntime {
                     && deepseek_assistant_tag < 0
                     && is_global_end
                 {
+                    if debug_mode {
+                        eprintln!(
+                            "[STOP] deepseek_global_fallback {}",
+                            stop_token_debug_desc(&self.tokenizer, token)
+                        );
+                    }
                     break;
                 }
             }
