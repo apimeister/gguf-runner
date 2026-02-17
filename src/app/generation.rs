@@ -250,6 +250,7 @@ impl ModelRuntime {
         } else {
             -1
         };
+        let deepseek_min_completion_tokens = 32usize;
 
         while pos < max_tokens {
             if token < 0 || token as usize >= self.config.vocab_size {
@@ -394,6 +395,7 @@ impl ModelRuntime {
             }
 
             if pos >= prompt_tokens.len().saturating_sub(1) {
+                let generated_tokens = pos + 1 - prompt_tokens.len();
                 let is_global_end =
                     token == self.tokenizer.eos_token || token == self.tokenizer.eot_token;
                 if !self.config.is_deepseek2 && is_global_end {
@@ -430,26 +432,40 @@ impl ModelRuntime {
                     && deepseek_end_sentence >= 0
                     && token == deepseek_end_sentence
                 {
-                    if debug_mode {
+                    if generated_tokens >= deepseek_min_completion_tokens {
+                        if debug_mode {
+                            eprintln!(
+                                "[STOP] deepseek_end_sentence {}",
+                                stop_token_debug_desc(&self.tokenizer, token)
+                            );
+                        }
+                        break;
+                    } else if debug_mode {
                         eprintln!(
-                            "[STOP] deepseek_end_sentence {}",
+                            "[STOP-IGNORED] deepseek_end_sentence early (generated={generated_tokens}) {}",
                             stop_token_debug_desc(&self.tokenizer, token)
                         );
                     }
-                    break;
                 }
                 if self.config.is_deepseek2
                     && deepseek_end_sentence < 0
                     && ((deepseek_user_tag >= 0 && token == deepseek_user_tag)
                         || (deepseek_assistant_tag >= 0 && token == deepseek_assistant_tag))
                 {
-                    if debug_mode {
+                    if generated_tokens >= deepseek_min_completion_tokens {
+                        if debug_mode {
+                            eprintln!(
+                                "[STOP] deepseek_role_turn {}",
+                                stop_token_debug_desc(&self.tokenizer, token)
+                            );
+                        }
+                        break;
+                    } else if debug_mode {
                         eprintln!(
-                            "[STOP] deepseek_role_turn {}",
+                            "[STOP-IGNORED] deepseek_role_turn early (generated={generated_tokens}) {}",
                             stop_token_debug_desc(&self.tokenizer, token)
                         );
                     }
-                    break;
                 }
                 if self.config.is_deepseek2
                     && deepseek_end_sentence < 0
@@ -457,13 +473,20 @@ impl ModelRuntime {
                     && deepseek_assistant_tag < 0
                     && is_global_end
                 {
-                    if debug_mode {
+                    if generated_tokens >= deepseek_min_completion_tokens {
+                        if debug_mode {
+                            eprintln!(
+                                "[STOP] deepseek_global_fallback {}",
+                                stop_token_debug_desc(&self.tokenizer, token)
+                            );
+                        }
+                        break;
+                    } else if debug_mode {
                         eprintln!(
-                            "[STOP] deepseek_global_fallback {}",
+                            "[STOP-IGNORED] deepseek_global_fallback early (generated={generated_tokens}) {}",
                             stop_token_debug_desc(&self.tokenizer, token)
                         );
                     }
-                    break;
                 }
             }
         }
