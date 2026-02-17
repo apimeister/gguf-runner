@@ -127,6 +127,10 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     let key_vocab = format!("{key_prefix}.vocab_size");
     let key_ctx = format!("{key_prefix}.context_length");
     let key_rope = format!("{key_prefix}.rope.freq_base");
+    let key_rope_scaling_factor = format!("{key_prefix}.rope.scaling.factor");
+    let key_rope_scaling_type = format!("{key_prefix}.rope.scaling.type");
+    let key_rope_scaling_orig_ctx = format!("{key_prefix}.rope.scaling.original_context_length");
+    let key_rope_scaling_yarn_log_mul = format!("{key_prefix}.rope.scaling.yarn_log_multiplier");
     let key_rope_dim = format!("{key_prefix}.rope.dimension_count");
     let key_head_dim = format!("{key_prefix}.attention.key_length");
     let key_rms_eps = format!("{key_prefix}.attention.layer_norm_rms_epsilon");
@@ -166,8 +170,12 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         vocab_size: get_gguf_int_from_map(&gguf.kv, &key_vocab, 32000) as usize,
         seq_len: get_gguf_int_from_map(&gguf.kv, &key_ctx, 2048) as usize,
         rope_theta: 0.0,
+        rope_freq_scale: 1.0,
         head_dim: 0,
         rope_dim: 0,
+        rope_scaling_yarn: false,
+        rope_orig_ctx: 0,
+        rope_yarn_log_multiplier: 0.0,
         is_gemma3: identity.family == ModelFamily::Gemma,
         is_qwen2: identity.family == ModelFamily::Qwen2,
         is_qwen3moe: identity.family == ModelFamily::Qwen3Moe,
@@ -217,7 +225,24 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     } else {
         llama::default_rope_theta()
     };
+    let rope_scaling_factor = get_gguf_float_from_map(&gguf.kv, &key_rope_scaling_factor, 0.0);
+    let rope_scaling_type =
+        get_gguf_string_from_map(&gguf.kv, &key_rope_scaling_type).unwrap_or_default();
     config.rope_theta = get_gguf_float_from_map(&gguf.kv, &key_rope, default_rope_theta);
+    config.rope_freq_scale = if rope_scaling_factor > 0.0 {
+        1.0 / rope_scaling_factor
+    } else {
+        1.0
+    };
+    config.rope_scaling_yarn = rope_scaling_type.eq_ignore_ascii_case("yarn");
+    config.rope_orig_ctx =
+        get_gguf_int_from_map(&gguf.kv, &key_rope_scaling_orig_ctx, config.seq_len as i64) as usize;
+    config.rope_yarn_log_multiplier =
+        get_gguf_float_from_map(&gguf.kv, &key_rope_scaling_yarn_log_mul, 0.0);
+    if config.rope_yarn_log_multiplier != 0.0 {
+        // DeepSeek exports frequently store this value scaled by 0.1.
+        config.rope_yarn_log_multiplier /= 0.1;
+    }
     config.head_dim = get_gguf_int_from_map(
         &gguf.kv,
         &key_head_dim,
@@ -272,8 +297,14 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
             config.seq_len
         );
         eprintln!(
-            "RoPE theta: {}, head_dim: {}, rope_dim: {}",
-            config.rope_theta, config.head_dim, config.rope_dim
+            "RoPE theta: {}, freq_scale: {}, head_dim: {}, rope_dim: {}, scaling_yarn: {}, rope_orig_ctx: {}, yarn_log_multiplier: {}",
+            config.rope_theta,
+            config.rope_freq_scale,
+            config.head_dim,
+            config.rope_dim,
+            config.rope_scaling_yarn,
+            config.rope_orig_ctx,
+            config.rope_yarn_log_multiplier
         );
         if config.is_gemma3 {
             gemma::print_config_debug(&config);

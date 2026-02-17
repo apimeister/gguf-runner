@@ -211,7 +211,7 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     let rope_size = rope_dim / 2;
     let mut rope_freqs = vec![0.0f32; rope_size];
     for (i, freq) in rope_freqs.iter_mut().enumerate() {
-        *freq = 1.0 / p.rope_theta.powf((i * 2) as f32 / rope_dim as f32);
+        *freq = p.rope_freq_scale / p.rope_theta.powf((i * 2) as f32 / rope_dim as f32);
     }
 
     let swa_theta = if p.rope_theta_swa > 0.0 {
@@ -221,7 +221,7 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     };
     let mut rope_freqs_swa = vec![0.0f32; rope_size];
     for (i, freq) in rope_freqs_swa.iter_mut().enumerate() {
-        *freq = 1.0 / swa_theta.powf((i * 2) as f32 / rope_dim as f32);
+        *freq = p.rope_freq_scale / swa_theta.powf((i * 2) as f32 / rope_dim as f32);
     }
 
     let att_len = p
@@ -527,7 +527,20 @@ pub(crate) fn transformer(
             }
             s.hb[..deepseek_q_abs_dim].fill(0.0);
 
-            let attn_scale_score = 1.0 / (deepseek_qk_head as f32).sqrt();
+            let mut attn_scale_score = 1.0 / (deepseek_qk_head as f32).sqrt();
+            if p.rope_scaling_yarn
+                && p.rope_freq_scale > 0.0
+                && p.rope_freq_scale != 1.0
+                && p.rope_yarn_log_multiplier != 0.0
+            {
+                let factor = 1.0 / p.rope_freq_scale;
+                if factor.is_finite() && factor > 0.0 {
+                    let mscale = 1.0 + 0.1 * p.rope_yarn_log_multiplier * factor.ln();
+                    if mscale.is_finite() && mscale > 0.0 {
+                        attn_scale_score *= mscale * mscale;
+                    }
+                }
+            }
             let att_all = &mut s.att[..p.n_heads * p.seq_len];
 
             for h in 0..p.n_heads {
