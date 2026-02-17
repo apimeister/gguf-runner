@@ -1,5 +1,14 @@
 use crate::engine::types::{Config, Tokenizer};
 
+fn find_special_token_any(tokenizer: &Tokenizer, candidates: &[&str]) -> Option<i32> {
+    for candidate in candidates {
+        if let Some(tok) = tokenizer.find_special_token(candidate) {
+            return Some(tok);
+        }
+    }
+    None
+}
+
 pub(super) fn validate_deepseek2(config: &mut Config) -> Result<(), String> {
     if config.deepseek_q_lora_rank == 0 || config.deepseek_kv_lora_rank == 0 {
         return Err(
@@ -63,7 +72,10 @@ pub(super) fn encode_deepseek_chat(
         tokens.extend_from_slice(&temp);
     }
 
-    if let Some(user_tok) = tokenizer.find_special_token("<｜User｜>") {
+    if let Some(user_tok) = find_special_token_any(
+        tokenizer,
+        &["<｜User｜>", "<|User|>", "<｜user｜>", "<|user|>"],
+    ) {
         tokens.push(user_tok);
     } else {
         tokenizer.bpe_encode("<｜User｜>", &mut temp);
@@ -72,7 +84,15 @@ pub(super) fn encode_deepseek_chat(
     tokenizer.bpe_encode(prompt, &mut temp);
     tokens.extend_from_slice(&temp);
 
-    if let Some(assistant_tok) = tokenizer.find_special_token("<｜Assistant｜>") {
+    if let Some(assistant_tok) = find_special_token_any(
+        tokenizer,
+        &[
+            "<｜Assistant｜>",
+            "<|Assistant|>",
+            "<｜assistant｜>",
+            "<|assistant|>",
+        ],
+    ) {
         tokens.push(assistant_tok);
     } else {
         tokenizer.bpe_encode("<｜Assistant｜>", &mut temp);

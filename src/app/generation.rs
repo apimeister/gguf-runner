@@ -18,6 +18,15 @@ fn time_in_ms() -> i64 {
     (now.as_secs() * 1000 + (now.subsec_nanos() as u64 / 1_000_000)) as i64
 }
 
+fn find_special_token_any(tokenizer: &Tokenizer, candidates: &[&str]) -> i32 {
+    for candidate in candidates {
+        if let Some(tok) = tokenizer.find_special_token(candidate) {
+            return tok;
+        }
+    }
+    -1
+}
+
 pub(crate) struct GenerationSettings {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
@@ -200,16 +209,36 @@ impl ModelRuntime {
                 -1
             };
         let deepseek_end_sentence = if self.config.is_deepseek2 {
-            self.tokenizer
-                .find_special_token("<｜end▁of▁sentence｜>")
-                .unwrap_or(-1)
+            find_special_token_any(
+                &self.tokenizer,
+                &[
+                    "<｜end▁of▁sentence｜>",
+                    "<|end▁of▁sentence|>",
+                    "<|end_of_sentence|>",
+                    "<|im_end|>",
+                ],
+            )
         } else {
             -1
         };
         let deepseek_assistant_tag = if self.config.is_deepseek2 {
-            self.tokenizer
-                .find_special_token("<｜Assistant｜>")
-                .unwrap_or(-1)
+            find_special_token_any(
+                &self.tokenizer,
+                &[
+                    "<｜Assistant｜>",
+                    "<|Assistant|>",
+                    "<｜assistant｜>",
+                    "<|assistant|>",
+                ],
+            )
+        } else {
+            -1
+        };
+        let deepseek_user_tag = if self.config.is_deepseek2 {
+            find_special_token_any(
+                &self.tokenizer,
+                &["<｜User｜>", "<|User|>", "<｜user｜>", "<|user|>"],
+            )
         } else {
             -1
         };
@@ -324,6 +353,7 @@ impl ModelRuntime {
                 && next != self.tokenizer.eos_token
                 && next != deepseek_end_sentence
                 && next != deepseek_assistant_tag
+                && next != deepseek_user_tag
             {
                 if let Some(decoded) = self.tokenizer.decode_token(next) {
                     if self.config.is_deepseek2 && decoded == "</think>" {
@@ -356,7 +386,9 @@ impl ModelRuntime {
             }
 
             if pos >= prompt_tokens.len().saturating_sub(1) {
-                if token == self.tokenizer.eos_token || token == self.tokenizer.eot_token {
+                let is_global_end =
+                    token == self.tokenizer.eos_token || token == self.tokenizer.eot_token;
+                if !self.config.is_deepseek2 && is_global_end {
                     break;
                 }
                 if self.config.is_gemma3 && token == gemma3_end_turn {
@@ -371,6 +403,20 @@ impl ModelRuntime {
                 if self.config.is_deepseek2
                     && deepseek_end_sentence >= 0
                     && token == deepseek_end_sentence
+                {
+                    break;
+                }
+                if self.config.is_deepseek2
+                    && ((deepseek_user_tag >= 0 && token == deepseek_user_tag)
+                        || (deepseek_assistant_tag >= 0 && token == deepseek_assistant_tag))
+                {
+                    break;
+                }
+                if self.config.is_deepseek2
+                    && deepseek_end_sentence < 0
+                    && deepseek_user_tag < 0
+                    && deepseek_assistant_tag < 0
+                    && is_global_end
                 {
                     break;
                 }
