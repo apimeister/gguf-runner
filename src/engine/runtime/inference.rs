@@ -454,6 +454,9 @@ pub(crate) fn transformer(
                 &w.deepseek_wkv_a[l],
                 mapped,
             )?;
+            // Preserve the raw compressed KV vector for value mixing; only the score path
+            // uses the normalized variant.
+            s.hb2[..deepseek_kv_lora].copy_from_slice(&s.hb[..deepseek_kv_lora]);
             rmsnorm_inplace(
                 &mut s.hb[..deepseek_kv_lora],
                 &w.deepseek_kv_a_norm[l * deepseek_kv_lora..(l + 1) * deepseek_kv_lora],
@@ -510,7 +513,7 @@ pub(crate) fn transformer(
                     .copy_from_slice(&s.hb[deepseek_kv_lora..deepseek_kv_a_rows]);
             }
             s.deepseek_value_cache[v_row_off..v_row_off + deepseek_kv_lora]
-                .copy_from_slice(&s.hb[..deepseek_kv_lora]);
+                .copy_from_slice(&s.hb2[..deepseek_kv_lora]);
 
             for h in 0..p.n_heads {
                 let q_nope = &s.q[h * deepseek_qk_head..h * deepseek_qk_head + deepseek_qk_nope];
