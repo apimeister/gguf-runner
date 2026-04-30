@@ -28,6 +28,13 @@ src/
   engine/
     mod.rs
     types.rs
+    distributed/
+      mod.rs
+      coordinator.rs
+      placement.rs
+      protocol.rs
+      transport.rs
+      worker.rs
     io/
       mod.rs
       gguf.rs
@@ -77,6 +84,9 @@ src/
 - Application orchestration entrypoint (`run()`).
 - Executes end-to-end run pipeline:
   - parse CLI options
+  - route distributed metadata commands before standard generation flow:
+    - `distributed-plan`: parse cluster config, inspect GGUF MoE metadata, and print a placement summary
+    - `distributed-worker`: validate worker bootstrap metadata and assigned expert placement
   - map CLI tuning flags into `engine::switches::RuntimeSwitchConfig`
   - initialize runtime switches via `engine::switches::init_runtime_config(...)`
   - initialize profiling
@@ -276,7 +286,38 @@ src/
 ### `src/engine/mod.rs`
 
 - Aggregates engine submodules:
-  - `io`, `kernels`, `profiling`, `runtime`, `switches`, `tokenizer`, `types`, `vision`, `weights`.
+  - `distributed`, `io`, `kernels`, `profiling`, `runtime`, `switches`, `tokenizer`, `types`, `vision`, `weights`.
+
+### `src/engine/distributed/mod.rs`
+
+- Distributed MoE module root.
+- Re-exports cluster config and placement planning domain types for app-level orchestration.
+
+### `src/engine/distributed/placement.rs`
+
+- Metadata-driven routed-MoE inventory and placement planning.
+- Defines cluster config domain types, validates coordinator/worker roles, and builds the initial expert-to-node assignment summary.
+
+### `src/engine/distributed/protocol.rs`
+
+- Distributed wire format definitions and activation encoding helpers.
+- Defines fixed frame kinds, hello/ready and expert-batch payload schemas, and fp16/bf16 activation pack/unpack helpers.
+
+### `src/engine/distributed/transport.rs`
+
+- Persistent connection management and framed transport I/O.
+- Owns the binary frame header format, read/write timeouts, and exact-length payload transport.
+
+### `src/engine/distributed/coordinator.rs`
+
+- Coordinator-side distributed expert execution.
+- Defines the generic routed-expert executor trait used by `engine::runtime::inference`.
+- Owns local routed-expert execution helpers plus the distributed coordinator client that partitions experts by host, issues remote batches, and accumulates results.
+
+### `src/engine/distributed/worker.rs`
+
+- Worker-side expert serving logic.
+- Owns the TCP listener loop, worker handshake validation, assigned-expert enforcement, and remote expert batch execution against GGUF-backed expert tensors.
 
 ### `src/engine/types.rs`
 

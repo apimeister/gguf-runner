@@ -2,7 +2,7 @@ use crate::engine::io::{find_gguf_tensor, find_gguf_tensor_names_with_any_prefix
 use crate::engine::kernels::{dequantize_tensor, get_block_size, get_type_size};
 use crate::engine::types::{
     Config, GGML_TYPE_F32, GGUFFile, GgmlType, Gguftensor, MultimodalBackend, MultimodalWeights,
-    QuantizedTensor, TransformerWeights,
+    QuantizedTensor, TransformerWeights, WorkerExpertWeights,
 };
 use std::collections::BTreeMap;
 
@@ -750,5 +750,48 @@ pub(crate) fn init_weights_from_gguf(
         ffn_post_norm,
         attn_post_norm_bias,
         ffn_post_norm_bias,
+    })
+}
+
+pub(crate) fn init_worker_expert_weights_from_gguf(
+    gguf: &GGUFFile,
+    p: &Config,
+) -> Result<WorkerExpertWeights, String> {
+    if p.n_experts == 0 || p.expert_hidden_dim == 0 {
+        return Err("worker expert loading requires a routed-MoE model".to_string());
+    }
+
+    let mut moe_gate_exps = vec![QuantizedTensor::default(); p.n_layers];
+    let mut moe_up_exps = vec![QuantizedTensor::default(); p.n_layers];
+    let mut moe_down_exps = vec![QuantizedTensor::default(); p.n_layers];
+
+    for l in 0..p.n_layers {
+        moe_gate_exps[l] = load_layer_tensor_quantized(
+            gguf,
+            l,
+            "ffn_gate_exps.weight",
+            p.n_experts * p.expert_hidden_dim,
+            p.dim,
+        )?;
+        moe_up_exps[l] = load_layer_tensor_quantized(
+            gguf,
+            l,
+            "ffn_up_exps.weight",
+            p.n_experts * p.expert_hidden_dim,
+            p.dim,
+        )?;
+        moe_down_exps[l] = load_layer_tensor_quantized(
+            gguf,
+            l,
+            "ffn_down_exps.weight",
+            p.n_experts * p.dim,
+            p.expert_hidden_dim,
+        )?;
+    }
+
+    Ok(WorkerExpertWeights {
+        moe_gate_exps,
+        moe_up_exps,
+        moe_down_exps,
     })
 }

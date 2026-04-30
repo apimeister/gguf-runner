@@ -5,7 +5,9 @@ use crate::engine::types::Config;
 
 pub(crate) use inference::{
     malloc_run_state, transformer, transformer_with_embedding,
-    transformer_with_embedding_without_logits, transformer_without_logits,
+    transformer_with_embedding_with_moe_executor, transformer_with_embedding_without_logits,
+    transformer_with_embedding_without_logits_with_moe_executor, transformer_with_moe_executor,
+    transformer_without_logits, transformer_without_logits_with_moe_executor,
 };
 pub(crate) use parallel::configure_rayon_threads;
 

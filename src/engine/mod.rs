@@ -1,3 +1,4 @@
+pub(crate) mod distributed;
 pub(crate) mod io;
 pub(crate) mod kernels;
 pub(crate) mod multimodal;

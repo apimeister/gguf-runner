@@ -146,6 +146,13 @@ pub(crate) enum CliOperationMode {
     Repl,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliDistributedMode {
+    None,
+    Plan,
+    Worker,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ToolPromptSpec {
     pub(crate) name: String,
@@ -565,6 +572,32 @@ struct Cli {
     )]
     show_features: bool,
 
+    #[arg(
+        long = "distributed-plan",
+        help = "Inspect distributed MoE placement for the model and cluster, then exit"
+    )]
+    distributed_plan: bool,
+
+    #[arg(
+        long = "distributed-worker",
+        help = "Validate worker bootstrap metadata for the model and cluster, then exit"
+    )]
+    distributed_worker: bool,
+
+    #[arg(
+        long = "cluster",
+        value_name = "cluster.toml",
+        help = "Cluster configuration for distributed MoE planning/worker bootstrap"
+    )]
+    cluster: Option<String>,
+
+    #[arg(
+        long = "node-id",
+        value_name = "id",
+        help = "Node id inside --cluster used by distributed worker bootstrap"
+    )]
+    node_id: Option<String>,
+
     #[arg(long = "image", value_name = "path")]
     images: Vec<String>,
 
@@ -873,6 +906,9 @@ pub(crate) struct CliOptions {
     pub(crate) threads: Option<usize>,
     pub(crate) system_prompt: String,
     pub(crate) mode: CliOperationMode,
+    pub(crate) distributed_mode: CliDistributedMode,
+    pub(crate) cluster: Option<String>,
+    pub(crate) node_id: Option<String>,
     pub(crate) tools_enabled: bool,
     pub(crate) tool_root: Option<String>,
     pub(crate) tool_enablement: AgentToolEnablement,
@@ -924,6 +960,25 @@ impl CliOptions {
     pub(crate) fn parse() -> Result<Self, String> {
         let cli = Cli::try_parse().map_err(|e| e.to_string())?;
         let mode = cli.mode;
+        if cli.distributed_plan && cli.distributed_worker {
+            return Err(
+                "conflicting flags: choose only one of --distributed-plan or --distributed-worker"
+                    .to_string(),
+            );
+        }
+        let distributed_mode = if cli.distributed_plan {
+            CliDistributedMode::Plan
+        } else if cli.distributed_worker {
+            CliDistributedMode::Worker
+        } else {
+            CliDistributedMode::None
+        };
+        if distributed_mode != CliDistributedMode::None && cli.cluster.is_none() {
+            return Err("distributed commands require --cluster <cluster.toml>".to_string());
+        }
+        if distributed_mode == CliDistributedMode::Worker && cli.node_id.is_none() {
+            return Err("--distributed-worker requires --node-id <id>".to_string());
+        }
         let mut allowed_tools = match cli.allowed_tools.as_deref() {
             Some(raw) => parse_allowed_tools(raw)?,
             None => {
@@ -946,6 +1001,7 @@ impl CliOptions {
         }
         let requested_tools_enabled = !allowed_tools.is_empty();
         if !cli.show_features
+            && distributed_mode == CliDistributedMode::None
             && !cli.rag_build
             && matches!(mode, CliOperationMode::Oneshot)
             && cli.prompt.trim().is_empty()
@@ -991,6 +1047,9 @@ impl CliOptions {
             threads: cli.threads,
             system_prompt: cli.system_prompt,
             mode,
+            distributed_mode,
+            cluster: cli.cluster,
+            node_id: cli.node_id,
             tools_enabled,
             tool_root: cli.tool_root,
             tool_enablement,

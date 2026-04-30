@@ -63,6 +63,11 @@ Supported tensor data paths include:
       - currently unavailable in no-external-dependency mode
   - current runtime returns explicit "not implemented yet" errors for native image/video/audio embedding execution paths
 - autoregressive generation loop
+- experimental distributed routed-MoE execution:
+  - `--distributed-plan` for metadata-based cluster planning
+  - `--distributed-worker` for remote expert-serving workers
+  - coordinator generation path enabled by passing `--cluster <cluster.toml>`
+  - persistent TCP transport with explicit protocol framing and fail-fast validation
 - quantized KV cache for attention state:
   - default TurboQuant-style `turbo` KV cache mode:
     - head-wise signed-Hadamard rotation before scalar quantization
@@ -92,6 +97,12 @@ Supported tensor data paths include:
 ## CLI + Environment Configuration
 
 User-facing CLI options are defined in `src/cli.rs`.
+
+Distributed CLI options:
+- `--cluster <cluster.toml>`
+- `--distributed-plan`
+- `--distributed-worker`
+- `--node-id <id>`
 
 Agent config file (optional):
 - `~/.gguf-runner/config.toml`

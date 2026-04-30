@@ -2,6 +2,9 @@ use crate::app::events::{
     RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress, emit_runtime_event,
 };
 use crate::cli::CliOptions;
+use crate::engine::distributed::{
+    ActivationDtype, DistributedMoeCoordinator, build_moe_placement_plan,
+};
 use crate::engine::io::{get_gguf_string_from_map, parse_gguf_file};
 use crate::engine::kernels::{TopKSampler, argmax, sample, softmax};
 use crate::engine::multimodal::{
@@ -1399,6 +1402,7 @@ pub(crate) struct ModelRuntime {
     vision_encoder: Option<VisionEncoder>,
     document_encoder: Option<DocumentEncoder>,
     rag_index: Option<RagIndex>,
+    distributed_moe: Option<DistributedMoeCoordinator>,
     kv_cache_format_logged: bool,
 }
 
@@ -2378,6 +2382,20 @@ impl ModelRuntime {
         }
 
         let weights = crate::engine::weights::init_weights_from_gguf(&gguf, &config, debug_mode)?;
+        let distributed_moe = if cli.cluster.is_some() {
+            let cluster_path = cli
+                .cluster
+                .as_deref()
+                .ok_or("distributed cluster path missing".to_string())?;
+            let cluster = super::load_cluster_config(cluster_path)?;
+            let plan = build_moe_placement_plan(&gguf, &config, &cluster)?;
+            Some(DistributedMoeCoordinator::connect(
+                plan,
+                ActivationDtype::Bf16,
+            )?)
+        } else {
+            None
+        };
         if debug_mode && config.is_gemma3 && config.dim > 0 {
             let sample_rows = config.vocab_size.min(2048);
             if sample_rows > 0 {
@@ -2447,6 +2465,7 @@ impl ModelRuntime {
             vision_encoder,
             document_encoder,
             rag_index,
+            distributed_moe,
             kv_cache_format_logged: false,
         })
     }
@@ -3321,43 +3340,99 @@ impl ModelRuntime {
             let prof_t0 = prof_start();
             let needs_logits = pos >= prompt_tokens.len().saturating_sub(1);
             if let Some(embedding) = prefill_injected_embeddings.get(&pos) {
-                if needs_logits {
-                    crate::engine::runtime::transformer_with_embedding(
-                        embedding,
-                        pos,
-                        &self.config,
-                        &mut state,
-                        &self.weights,
-                        self.gguf.mapped.as_slice(),
-                    )?;
-                } else {
-                    crate::engine::runtime::transformer_with_embedding_without_logits(
-                        embedding,
-                        pos,
-                        &self.config,
-                        &mut state,
-                        &self.weights,
-                        self.gguf.mapped.as_slice(),
-                    )?;
+                match self.distributed_moe.as_mut() {
+                    Some(executor) => {
+                        if needs_logits {
+                            crate::engine::runtime::transformer_with_embedding_with_moe_executor(
+                                embedding,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                                executor,
+                            )?;
+                        } else {
+                            crate::engine::runtime::transformer_with_embedding_without_logits_with_moe_executor(
+                                embedding,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                                executor,
+                            )?;
+                        }
+                    }
+                    None => {
+                        if needs_logits {
+                            crate::engine::runtime::transformer_with_embedding(
+                                embedding,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                            )?;
+                        } else {
+                            crate::engine::runtime::transformer_with_embedding_without_logits(
+                                embedding,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                            )?;
+                        }
+                    }
                 }
-            } else if needs_logits {
-                crate::engine::runtime::transformer(
-                    token as usize,
-                    pos,
-                    &self.config,
-                    &mut state,
-                    &self.weights,
-                    self.gguf.mapped.as_slice(),
-                )?;
             } else {
-                crate::engine::runtime::transformer_without_logits(
-                    token as usize,
-                    pos,
-                    &self.config,
-                    &mut state,
-                    &self.weights,
-                    self.gguf.mapped.as_slice(),
-                )?;
+                match self.distributed_moe.as_mut() {
+                    Some(executor) => {
+                        if needs_logits {
+                            crate::engine::runtime::transformer_with_moe_executor(
+                                token as usize,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                                executor,
+                            )?;
+                        } else {
+                            crate::engine::runtime::transformer_without_logits_with_moe_executor(
+                                token as usize,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                                executor,
+                            )?;
+                        }
+                    }
+                    None => {
+                        if needs_logits {
+                            crate::engine::runtime::transformer(
+                                token as usize,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                            )?;
+                        } else {
+                            crate::engine::runtime::transformer_without_logits(
+                                token as usize,
+                                pos,
+                                &self.config,
+                                &mut state,
+                                &self.weights,
+                                self.gguf.mapped.as_slice(),
+                            )?;
+                        }
+                    }
+                }
             }
             prof_end(&PROF_TRANSFORMER_NS, prof_t0);
             if profiling_mode {

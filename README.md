@@ -84,6 +84,8 @@ gguf-runner \
 
 More model download examples:
 - `docs/downloading-models.md`
+- Distributed cluster usage:
+  - `docs/distributed-cluster-usage.md`
 
 ## Working Models
 
@@ -103,6 +105,19 @@ Known-good status from `docs/performance.md` (text benchmarks) and local model/m
 | `Qwen3.5-0.8B-Q4_K_M.gguf` | ✅ | ✅ |
 | `Qwen3.5-2B-Q4_K_M.gguf` | ✅ | ✅ |
 | `Qwen3.5-35B-A3B-UD-Q4_K_M.gguf` | ✅ | ✅ |
+
+## Distributed MoE Cluster Mode
+
+`gguf-runner` now includes an experimental distributed routed-MoE mode for multi-host execution.
+
+- `--distributed-plan` prints a metadata-based expert placement summary for a `cluster.toml`
+- `--distributed-worker` starts a worker process bound to one cluster node id
+- normal generation with `--cluster <cluster.toml>` runs the coordinator path
+
+Start here:
+
+- [docs/distributed-cluster-usage.md](./docs/distributed-cluster-usage.md)
+- [docs/distributed-moe-plan.md](./docs/distributed-moe-plan.md)
 
 ## What You Need
 

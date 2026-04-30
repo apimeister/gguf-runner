@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::engine::distributed::{MoeExpertExecutor, compute_local_selected_experts};
 use crate::engine::kernels::{
     accum, dot_f32_simd, get_row_size, l2_norm, layernorm_inplace, matmul_f32_embeddings,
     matmul_quantized, matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm,
@@ -14,9 +15,7 @@ use crate::engine::switches::{
 use crate::engine::types::{
     Config, GGML_TYPE_BF16, KvCacheFormat, QuantizedTensor, RunState, TransformerWeights,
 };
-use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
-};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -1568,12 +1567,6 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         .max(p.expert_hidden_dim)
         .max(p.shared_expert_hidden_dim);
     let scratch_dim = ffn_dim.max(ssm_conv_dim).max(ssm_inner).max(ssm_head_dim);
-    let moe_contrib_len = p
-        .n_experts_used
-        .max(1)
-        .checked_mul(p.dim)
-        .ok_or_else(|| "overflow while computing MoE contribution scratch size".to_string())?;
-
     let rope_dim = if p.rope_dim > 0 {
         p.rope_dim
     } else {
@@ -1663,7 +1656,6 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         hb: vec![0.0; scratch_dim],
         hb2: vec![0.0; scratch_dim],
         moe_tmp: vec![0.0; p.dim],
-        moe_contribs: alloc_f32(moe_contrib_len, "MoE contribution scratch")?,
         moe_logits: vec![0.0; p.n_experts],
         moe_topk_indices: vec![0usize; p.n_experts_used.max(1)],
         moe_topk_weights: vec![0.0f32; p.n_experts_used.max(1)],
@@ -1737,7 +1729,16 @@ pub(crate) fn transformer(
     w: &TransformerWeights,
     mapped: &[u8],
 ) -> Result<(), String> {
-    transformer_inner(TransformerInput::Token(token), pos, true, p, s, w, mapped)
+    transformer_inner(
+        TransformerInput::Token(token),
+        pos,
+        true,
+        p,
+        s,
+        w,
+        mapped,
+        None,
+    )
 }
 
 pub(crate) fn transformer_without_logits(
@@ -1748,7 +1749,16 @@ pub(crate) fn transformer_without_logits(
     w: &TransformerWeights,
     mapped: &[u8],
 ) -> Result<(), String> {
-    transformer_inner(TransformerInput::Token(token), pos, false, p, s, w, mapped)
+    transformer_inner(
+        TransformerInput::Token(token),
+        pos,
+        false,
+        p,
+        s,
+        w,
+        mapped,
+        None,
+    )
 }
 
 pub(crate) fn transformer_with_embedding(
@@ -1767,6 +1777,7 @@ pub(crate) fn transformer_with_embedding(
         s,
         w,
         mapped,
+        None,
     )
 }
 
@@ -1786,6 +1797,91 @@ pub(crate) fn transformer_with_embedding_without_logits(
         s,
         w,
         mapped,
+        None,
+    )
+}
+
+pub(crate) fn transformer_with_moe_executor(
+    token: usize,
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    moe_executor: &mut dyn MoeExpertExecutor,
+) -> Result<(), String> {
+    transformer_inner(
+        TransformerInput::Token(token),
+        pos,
+        true,
+        p,
+        s,
+        w,
+        mapped,
+        Some(moe_executor),
+    )
+}
+
+pub(crate) fn transformer_without_logits_with_moe_executor(
+    token: usize,
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    moe_executor: &mut dyn MoeExpertExecutor,
+) -> Result<(), String> {
+    transformer_inner(
+        TransformerInput::Token(token),
+        pos,
+        false,
+        p,
+        s,
+        w,
+        mapped,
+        Some(moe_executor),
+    )
+}
+
+pub(crate) fn transformer_with_embedding_with_moe_executor(
+    embedding: &[f32],
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    moe_executor: &mut dyn MoeExpertExecutor,
+) -> Result<(), String> {
+    transformer_inner(
+        TransformerInput::Embedding(embedding),
+        pos,
+        true,
+        p,
+        s,
+        w,
+        mapped,
+        Some(moe_executor),
+    )
+}
+
+pub(crate) fn transformer_with_embedding_without_logits_with_moe_executor(
+    embedding: &[f32],
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    moe_executor: &mut dyn MoeExpertExecutor,
+) -> Result<(), String> {
+    transformer_inner(
+        TransformerInput::Embedding(embedding),
+        pos,
+        false,
+        p,
+        s,
+        w,
+        mapped,
+        Some(moe_executor),
     )
 }
 
@@ -1795,6 +1891,7 @@ enum TransformerInput<'a> {
     Embedding(&'a [f32]),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transformer_inner(
     input: TransformerInput<'_>,
     pos: usize,
@@ -1803,6 +1900,7 @@ fn transformer_inner(
     s: &mut RunState,
     w: &TransformerWeights,
     mapped: &[u8],
+    mut moe_executor: Option<&mut dyn MoeExpertExecutor>,
 ) -> Result<(), String> {
     let dim = p.dim;
     let hidden_dim = p.hidden_dim;
@@ -2797,7 +2895,6 @@ fn transformer_inner(
 
         if p.is_qwen3moe || (p.is_qwen3next && p.n_experts > 0) {
             let moe_prof = prof_start();
-            let expert_hidden = p.expert_hidden_dim;
             let disable_routed = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_ROUTED_EXPERTS");
             let disable_shared = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_SHARED_EXPERT");
             let force_serial_routed =
@@ -2834,106 +2931,27 @@ fn transformer_inner(
                     }
                 }
 
-                if routed_selected.len() >= 2 && !force_serial_routed {
-                    let xb2 = &s.xb2[..dim];
-                    let gate_exps = &w.moe_gate_exps[l];
-                    let up_exps = &w.moe_up_exps[l];
-                    let down_exps = &w.moe_down_exps[l];
-                    let contribs_len = routed_selected.len() * dim;
-                    let contribs = &mut s.moe_contribs[..contribs_len];
-
-                    let per_expert = contribs
-                        .par_chunks_mut(dim)
-                        .zip(routed_selected.par_iter())
-                        .map_init(
-                            || (vec![0.0f32; expert_hidden], vec![0.0f32; expert_hidden]),
-                            |(hb_local, hb2_local),
-                             (contrib, &(expert_idx, route_weight))|
-                             -> Result<(), String> {
-                                let row_start_ffn = expert_idx * expert_hidden;
-                                matmul_quantized_rows(
-                                    &mut hb_local[..expert_hidden],
-                                    xb2,
-                                    gate_exps,
-                                    row_start_ffn,
-                                    expert_hidden,
-                                    mapped,
-                                )?;
-                                matmul_quantized_rows(
-                                    &mut hb2_local[..expert_hidden],
-                                    xb2,
-                                    up_exps,
-                                    row_start_ffn,
-                                    expert_hidden,
-                                    mapped,
-                                )?;
-                                silu_and_mul_inplace(
-                                    &mut hb_local[..expert_hidden],
-                                    &hb2_local[..expert_hidden],
-                                );
-
-                                let row_start_down = expert_idx * dim;
-                                matmul_quantized_rows(
-                                    contrib,
-                                    &hb_local[..expert_hidden],
-                                    down_exps,
-                                    row_start_down,
-                                    dim,
-                                    mapped,
-                                )?;
-                                for v in contrib {
-                                    *v *= route_weight;
-                                }
-                                Ok(())
-                            },
-                        )
-                        .collect::<Vec<_>>();
-
-                    for item in per_expert {
-                        item?;
-                    }
-
-                    s.xb[..dim].fill(0.0);
-                    for contrib in contribs.chunks(dim) {
-                        crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], 1.0, contrib);
-                    }
+                if let Some(executor) = moe_executor.as_deref_mut() {
+                    executor.compute_selected_experts(
+                        l,
+                        &s.xb2[..dim],
+                        &routed_selected,
+                        &mut s.xb[..dim],
+                        p,
+                        w,
+                        mapped,
+                    )?;
                 } else {
-                    for &(expert_idx, route_weight) in &routed_selected {
-                        let row_start_ffn = expert_idx * expert_hidden;
-                        matmul_quantized_rows(
-                            &mut s.hb[..expert_hidden],
-                            &s.xb2[..dim],
-                            &w.moe_gate_exps[l],
-                            row_start_ffn,
-                            expert_hidden,
-                            mapped,
-                        )?;
-                        matmul_quantized_rows(
-                            &mut s.hb2[..expert_hidden],
-                            &s.xb2[..dim],
-                            &w.moe_up_exps[l],
-                            row_start_ffn,
-                            expert_hidden,
-                            mapped,
-                        )?;
-
-                        silu_and_mul_inplace(&mut s.hb[..expert_hidden], &s.hb2[..expert_hidden]);
-
-                        let row_start_down = expert_idx * dim;
-                        matmul_quantized_rows(
-                            &mut s.moe_tmp[..dim],
-                            &s.hb[..expert_hidden],
-                            &w.moe_down_exps[l],
-                            row_start_down,
-                            dim,
-                            mapped,
-                        )?;
-                        crate::engine::kernels::axpy_inplace(
-                            &mut s.xb[..dim],
-                            route_weight,
-                            &s.moe_tmp[..dim],
-                        );
-                    }
+                    compute_local_selected_experts(
+                        l,
+                        &s.xb2[..dim],
+                        &routed_selected,
+                        &mut s.xb[..dim],
+                        p,
+                        w,
+                        mapped,
+                        !force_serial_routed,
+                    )?;
                 }
             }
 
