@@ -1574,11 +1574,21 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
 
 /// Zero any NaN/Inf elements in `x` in-place.
 /// aarch64: 4-wide NEON bitmask (no branches, no exp).
+/// Zero any NaN/Inf elements in `x` in-place.
+/// x86_64: AVX-2 (8-wide) or AVX-512 (16-wide) with bitmask detection.
+/// aarch64: 4-wide NEON bitmask (no branches, no exp).
+/// Other: scalar fallback using `is_finite()`.
 pub(crate) fn sanitize_finite_inplace(x: &mut [f32]) {
     debug_assert!(
         !x.is_empty(),
         "sanitize_finite_inplace: input must not be empty"
     );
+    #[cfg(target_arch = "x86_64")]
+    if x.len() >= 8 {
+        return unsafe {
+            sanitize_finite_x86_64(x);
+        };
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -1608,6 +1618,114 @@ pub(crate) fn sanitize_finite_inplace(x: &mut [f32]) {
         if !v.is_finite() {
             *v = 0.0;
         }
+    }
+}
+
+// ─── x86_64 SIMD paths for sanitize_finite_inplace ───
+
+/// Dispatch sanitize_finite_inplace on x86_64: AVX-512 (16-wide) or AVX-2 (8-wide).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sanitize_finite_x86_64(x: &mut [f32]) {
+    use crate::engine::switches::use_x86_avx512f;
+    use std::arch::x86_64::*;
+
+    if use_x86_avx512f() {
+        sanitize_finite_avx512(x);
+    } else {
+        sanitize_finite_avx2(x);
+    }
+}
+
+/// AVX-2 (8-wide) NaN/Inf sanitization.
+/// Detects NaN/Inf via exponent mask (0x7F800000), replaces with 0.0.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sanitize_finite_avx2(x: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let n = x.len();
+    let ptr = x.as_mut_ptr();
+
+    // Bits to extract exponent: 0x7F800000
+    let exp_mask = _mm256_set1_epi32(0x7F800000i32);
+    // All-ones mask for NaN/Inf check
+    let exp_check = _mm256_set1_epi32(0x7F800000i32);
+    // Zero vector (replacement value)
+    let zero = _mm256_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 8 <= n {
+        // Load 8 elements (2×4) and extract bits
+        let v0 = _mm256_loadu_ps(ptr.add(i));
+        let bits0 = _mm256_castps_si256(v0);
+        let is_naninf0 = _mm256_cmpeq_epi32(_mm256_and_si256(bits0, exp_mask), exp_check);
+
+        let v1 = _mm256_loadu_ps(ptr.add(i + 4));
+        let bits1 = _mm256_castps_si256(v1);
+        let is_naninf1 = _mm256_cmpeq_epi32(_mm256_and_si256(bits1, exp_mask), exp_check);
+
+        // Blend: if is_naninf, use zero; otherwise use original
+        let v0_clean = _mm256_blendv_ps(v0, zero, _mm256_castsi256_ps(is_naninf0));
+        let v1_clean = _mm256_blendv_ps(v1, zero, _mm256_castsi256_ps(is_naninf1));
+
+        _mm256_storeu_ps(ptr.add(i), v0_clean);
+        _mm256_storeu_ps(ptr.add(i + 4), v1_clean);
+        i += 8;
+    }
+
+    // Scalar tail
+    while i < n {
+        if !ptr.add(i).read().is_finite() {
+            ptr.add(i).write(0.0);
+        }
+        i += 1;
+    }
+}
+
+/// AVX-512 (16-wide) NaN/Inf sanitization.
+/// Detects NaN/Inf via exponent mask (0x7F800000), replaces with 0.0.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sanitize_finite_avx512(x: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let n = x.len();
+    let ptr = x.as_mut_ptr();
+
+    // Bits to extract exponent: 0x7F800000
+    let exp_mask = _mm512_set1_epi32(0x7F800000i32);
+    // All-ones mask for NaN/Inf check
+    let exp_check = _mm512_set1_epi32(0x7F800000i32);
+    // Zero vector (replacement value)
+    let zero = _mm512_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 16 <= n {
+        // Load 16 elements (2×8) and extract bits
+        let v0 = _mm512_loadu_ps(ptr.add(i));
+        let bits0 = _mm512_castps_si512(v0);
+        let is_naninf0 = _mm512_cmpeq_epi32(_mm512_and_si512(bits0, exp_mask), exp_check);
+
+        let v1 = _mm512_loadu_ps(ptr.add(i + 8));
+        let bits1 = _mm512_castps_si512(v1);
+        let is_naninf1 = _mm512_cmpeq_epi32(_mm512_and_si512(bits1, exp_mask), exp_check);
+
+        // Blend: if is_naninf, use zero; otherwise use original
+        let v0_clean = _mm512_blendv_ps(v0, zero, _mm512_castsi512_ps(is_naninf0));
+        let v1_clean = _mm512_blendv_ps(v1, zero, _mm512_castsi512_ps(is_naninf1));
+
+        _mm512_storeu_ps(ptr.add(i), v0_clean);
+        _mm512_storeu_ps(ptr.add(i + 8), v1_clean);
+        i += 16;
+    }
+
+    // Scalar tail
+    while i < n {
+        if !ptr.add(i).read().is_finite() {
+            ptr.add(i).write(0.0);
+        }
+        i += 1;
     }
 }
 
