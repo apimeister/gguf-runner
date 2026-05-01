@@ -1046,7 +1046,10 @@ impl CliOptions {
                 "--distributed-worker requires --distributed-bind-address <host:port>".to_string(),
             );
         }
-        if distributed_enabled && cli.distributed_worker_nodes.is_empty() {
+        if distributed_mode != CliDistributedMode::Worker
+            && distributed_enabled
+            && cli.distributed_worker_nodes.is_empty()
+        {
             return Err(
                 "distributed mode requires at least one --distributed-worker-node 'host:port'"
                     .to_string(),

@@ -1,4 +1,3 @@
-use crate::engine::distributed::placement::{ClusterConfig, ClusterNodeRole};
 use crate::engine::distributed::protocol::{
     DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame, ReadyFrame,
     decode_error_frame, decode_expert_batch_request, decode_hello_frame,
@@ -190,34 +189,14 @@ fn build_worker_runtime(
 pub(crate) fn run_worker_server(
     gguf: GGUFFile,
     config: Config,
-    cluster: ClusterConfig,
     bind_address: &str,
 ) -> Result<(), String> {
     let runtime = build_worker_runtime(gguf, config, bind_address)?;
-    let node_index = cluster
-        .node
-        .iter()
-        .position(|node| node.address == bind_address)
-        .ok_or_else(|| {
-            format!(
-                "worker bind address '{}' was not found in distributed config",
-                bind_address
-            )
-        })?;
-    let node = &cluster.node[node_index];
-    if node.role != ClusterNodeRole::Worker {
-        return Err(format!(
-            "node '{}' has role '{}' but worker mode requires a worker node",
-            node.id,
-            node.role.as_str()
-        ));
-    }
-
-    let listener = TcpListener::bind(&node.address)
-        .map_err(|e| format!("failed to bind worker listener '{}': {e}", node.address))?;
+    let listener = TcpListener::bind(bind_address)
+        .map_err(|e| format!("failed to bind worker listener '{}': {e}", bind_address))?;
     println!(
         "Distributed worker listening on {} cpu={} mem_bytes={}",
-        node.address, runtime.resources.logical_cpu_count, runtime.resources.memory_bytes
+        bind_address, runtime.resources.logical_cpu_count, runtime.resources.memory_bytes
     );
 
     for stream in listener.incoming() {

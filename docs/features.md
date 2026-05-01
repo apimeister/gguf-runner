@@ -109,6 +109,8 @@ Distributed CLI options:
 - `--distributed-transport-dtype <bf16|fp16|q8>`
 
 Distributed resource notes:
+- worker mode only needs `--distributed-bind-address` plus `--distributed-coordinator-address`
+- the coordinator is the only side that needs the full `--distributed-worker-node` list
 - placement uses discovered node memory and CPU from the coordinator discovery pass
 
 Agent config file (optional):

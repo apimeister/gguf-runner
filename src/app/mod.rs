@@ -361,32 +361,17 @@ fn run_distributed_worker_mode(cli: &CliOptions) -> Result<(), String> {
     let bind_address = cli.distributed_bind_address.as_deref().ok_or(
         "--distributed-worker requires --distributed-bind-address <host:port>".to_string(),
     )?;
-    let cluster = build_cluster_config_from_cli(cli)?;
-    let node_index = cluster
-        .node
-        .iter()
-        .position(|node| node.role == ClusterNodeRole::Worker && node.address == bind_address)
-        .ok_or_else(|| {
-            format!(
-                "worker bind address '{}' was not found in distributed config",
-                bind_address
-            )
-        })?;
-    let node = &cluster.node[node_index];
-    if node.role != ClusterNodeRole::Worker {
-        return Err(format!(
-            "node '{}' has role '{}' but --distributed-worker requires a worker node",
-            node.address,
-            node.role.as_str()
-        ));
-    }
+    let _coordinator_address = cli
+        .distributed_coordinator_address
+        .as_deref()
+        .ok_or("distributed coordinator address is missing".to_string())?;
 
     println!("Distributed worker bootstrap");
-    println!("bind: {}", node.address);
+    println!("bind: {}", bind_address);
     println!("resource discovery: assignment and placement are provided by the coordinator");
     let gguf = parse_gguf_file(&cli.model, cli.debug)?;
     let config = crate::vendors::build_config_from_gguf(&gguf, cli.debug)?;
-    crate::engine::distributed::worker::run_worker_server(gguf, config, cluster, bind_address)
+    crate::engine::distributed::worker::run_worker_server(gguf, config, bind_address)
 }
 
 fn run_oneshot_mode(

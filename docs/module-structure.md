@@ -85,7 +85,7 @@ src/
 - Executes end-to-end run pipeline:
   - parse CLI options
   - route distributed worker bootstrap before standard generation flow:
-    - `distributed-worker`: validate distributed CLI/env node metadata, match the worker by bind address, print placement summary, and start the worker loop
+    - `distributed-worker`: validate worker bootstrap flags, bind the worker listener, and start the worker loop
   - map CLI tuning flags into `engine::switches::RuntimeSwitchConfig`
   - initialize runtime switches via `engine::switches::init_runtime_config(...)`
   - initialize profiling

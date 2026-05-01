@@ -8,9 +8,9 @@ This is the shortest path to run distributed routed-MoE mode.
 - put the same routed-MoE `.gguf` on coordinator and workers
 - choose one coordinator address and one address per worker
 
-## Shared Flags
+## Coordinator Flags
 
-Use the same node list everywhere:
+Only the coordinator needs the worker list:
 
 ```text
 --distributed-coordinator-address 192.168.10.10:7000
@@ -32,10 +32,7 @@ gguf-runner \
   --distributed-worker \
   --distributed-bind-address 192.168.10.11:7000 \
   --distributed-coordinator-address 192.168.10.10:7000 \
-  --distributed-transport-dtype bf16 \
-  --distributed-worker-node '192.168.10.11:7000' \
-  --distributed-worker-node '192.168.10.12:7000' \
-  --distributed-worker-node '192.168.10.13:7000'
+  --distributed-transport-dtype bf16
 ```
 
 Repeat on `worker-b`, `worker-c`, changing only `--distributed-bind-address`.
@@ -73,6 +70,6 @@ gguf-runner \
 
 ## Troubleshooting
 
-- worker won’t start: check `--distributed-bind-address` and make sure it appears in the worker list
+- worker won’t start: check `--distributed-bind-address` and that the port is free on that host
 - coordinator won’t start: make sure workers are already listening and reachable
 - startup mismatch: verify all nodes use the same model file and node declarations
