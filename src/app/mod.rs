@@ -7,7 +7,7 @@ use crate::cli::CliDistributedMode;
 use crate::cli::CliOperationMode;
 use crate::cli::CliOptions;
 use crate::engine::distributed::{
-    ClusterConfig, ClusterNodeRole, MoePlacementPlan, build_moe_placement_plan,
+    ClusterConfig, ClusterNodeConfig, ClusterNodeRole, MoePlacementPlan,
 };
 use crate::engine::io::parse_gguf_file;
 use crate::engine::profiling::{print_profile_report, profiling_reset, set_profiling_enabled};
@@ -205,7 +205,6 @@ pub(crate) fn run() -> Result<(), String> {
     }
 
     match cli.distributed_mode {
-        CliDistributedMode::Plan => return run_distributed_plan_mode(&cli),
         CliDistributedMode::Worker => return run_distributed_worker_mode(&cli),
         CliDistributedMode::None => {}
     }
@@ -279,16 +278,40 @@ pub(crate) fn run() -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn load_cluster_config(path: &str) -> Result<ClusterConfig, String> {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read cluster config '{}': {e}", path))?;
-    let cluster: ClusterConfig =
-        toml::from_str(&raw).map_err(|e| format!("invalid cluster TOML '{}': {e}", path))?;
+pub(super) fn build_cluster_config_from_cli(cli: &CliOptions) -> Result<ClusterConfig, String> {
+    let coordinator_address = cli
+        .distributed_coordinator_address
+        .as_deref()
+        .ok_or("distributed coordinator address is missing".to_string())?;
+    let mut node = Vec::with_capacity(cli.distributed_worker_nodes.len() + 1);
+    node.push(ClusterNodeConfig {
+        id: cli.distributed_coordinator_id.clone(),
+        address: coordinator_address.to_string(),
+        role: ClusterNodeRole::Coordinator,
+        logical_cpu_count: None,
+        discovered_memory_bytes: None,
+    });
+    for worker in &cli.distributed_worker_nodes {
+        node.push(ClusterNodeConfig {
+            id: worker.address.clone(),
+            address: worker.address.clone(),
+            role: ClusterNodeRole::Worker,
+            logical_cpu_count: None,
+            discovered_memory_bytes: None,
+        });
+    }
+    let cluster = ClusterConfig { node };
     cluster.validate()?;
+    let mut seen = std::collections::BTreeSet::new();
+    for node in &cluster.node {
+        if !seen.insert(node.id.as_str()) {
+            return Err(format!("duplicate distributed node id '{}'", node.id));
+        }
+    }
     Ok(cluster)
 }
 
-fn print_placement_plan(plan: &MoePlacementPlan) {
+pub(super) fn print_placement_plan(plan: &MoePlacementPlan) {
     let inventory = &plan.inventory;
     println!("Distributed MoE placement plan");
     println!("coordinator: {}", plan.coordinator_node_id);
@@ -299,6 +322,10 @@ fn print_placement_plan(plan: &MoePlacementPlan) {
         inventory.n_experts_used,
         inventory.dim,
         inventory.expert_hidden_dim
+    );
+    println!(
+        "checkpoint_bytes: total={} non_expert_baseline={}",
+        inventory.checkpoint_bytes, inventory.non_expert_checkpoint_bytes
     );
     println!(
         "bytes/expert/layer: gate={} up={} down={} total={}",
@@ -315,73 +342,51 @@ fn print_placement_plan(plan: &MoePlacementPlan) {
     println!("Per-node summary:");
     for node in &plan.nodes {
         println!(
-            "- {} [{}] addr={} memory_gb={} assigned_experts={} assigned_bytes={}",
+            "- {} [{}] addr={} cpu={} capacity_bytes={} reserved_bytes={} assigned_experts={} assigned_bytes={} remaining_bytes={}",
             node.node_id,
             node.role.as_str(),
             node.address,
-            node.memory_gb,
+            node.logical_cpu_count,
+            node.capacity_bytes,
+            node.reserved_bytes,
             node.assigned_expert_count,
-            node.assigned_bytes
+            node.assigned_bytes,
+            node.capacity_bytes
+                .saturating_sub(node.reserved_bytes.saturating_add(node.assigned_bytes))
         );
     }
 }
 
-fn run_distributed_plan_mode(cli: &CliOptions) -> Result<(), String> {
-    let cluster_path = cli
-        .cluster
-        .as_deref()
-        .ok_or("--distributed-plan requires --cluster <cluster.toml>".to_string())?;
-    let cluster = load_cluster_config(cluster_path)?;
-    let gguf = parse_gguf_file(&cli.model, cli.debug)?;
-    let config = crate::vendors::build_config_from_gguf(&gguf, cli.debug)?;
-    let plan = build_moe_placement_plan(&gguf, &config, &cluster)?;
-    print_placement_plan(&plan);
-    Ok(())
-}
-
 fn run_distributed_worker_mode(cli: &CliOptions) -> Result<(), String> {
-    let cluster_path = cli
-        .cluster
-        .as_deref()
-        .ok_or("--distributed-worker requires --cluster <cluster.toml>".to_string())?;
-    let node_id = cli
-        .node_id
-        .as_deref()
-        .ok_or("--distributed-worker requires --node-id <id>".to_string())?;
-    let cluster = load_cluster_config(cluster_path)?;
+    let bind_address = cli.distributed_bind_address.as_deref().ok_or(
+        "--distributed-worker requires --distributed-bind-address <host:port>".to_string(),
+    )?;
+    let cluster = build_cluster_config_from_cli(cli)?;
     let node_index = cluster
-        .node_index_by_id(node_id)
-        .ok_or_else(|| format!("node id '{}' was not found in cluster config", node_id))?;
+        .node
+        .iter()
+        .position(|node| node.role == ClusterNodeRole::Worker && node.address == bind_address)
+        .ok_or_else(|| {
+            format!(
+                "worker bind address '{}' was not found in distributed config",
+                bind_address
+            )
+        })?;
     let node = &cluster.node[node_index];
     if node.role != ClusterNodeRole::Worker {
         return Err(format!(
             "node '{}' has role '{}' but --distributed-worker requires a worker node",
-            node.id,
+            node.address,
             node.role.as_str()
         ));
     }
 
+    println!("Distributed worker bootstrap");
+    println!("bind: {}", node.address);
+    println!("resource discovery: assignment and placement are provided by the coordinator");
     let gguf = parse_gguf_file(&cli.model, cli.debug)?;
     let config = crate::vendors::build_config_from_gguf(&gguf, cli.debug)?;
-    let plan = build_moe_placement_plan(&gguf, &config, &cluster)?;
-    let assigned = plan
-        .assigned_experts_for_node(node_index)
-        .collect::<Vec<_>>();
-    let layer_count = assigned
-        .iter()
-        .map(|(layer, _)| *layer)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-
-    println!("Distributed worker bootstrap");
-    println!("node: {} ({})", node.id, node.address);
-    println!(
-        "assigned experts: {} across {} layers",
-        assigned.len(),
-        layer_count
-    );
-    println!("assigned bytes: {}", plan.nodes[node_index].assigned_bytes);
-    crate::engine::distributed::worker::run_worker_server(gguf, config, plan, node_id)
+    crate::engine::distributed::worker::run_worker_server(gguf, config, cluster, bind_address)
 }
 
 fn run_oneshot_mode(

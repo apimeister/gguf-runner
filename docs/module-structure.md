@@ -84,9 +84,8 @@ src/
 - Application orchestration entrypoint (`run()`).
 - Executes end-to-end run pipeline:
   - parse CLI options
-  - route distributed metadata commands before standard generation flow:
-    - `distributed-plan`: parse cluster config, inspect GGUF MoE metadata, and print a placement summary
-    - `distributed-worker`: validate worker bootstrap metadata and assigned expert placement
+  - route distributed worker bootstrap before standard generation flow:
+    - `distributed-worker`: validate distributed CLI/env node metadata, match the worker by bind address, print placement summary, and start the worker loop
   - map CLI tuning flags into `engine::switches::RuntimeSwitchConfig`
   - initialize runtime switches via `engine::switches::init_runtime_config(...)`
   - initialize profiling
@@ -296,12 +295,17 @@ src/
 ### `src/engine/distributed/placement.rs`
 
 - Metadata-driven routed-MoE inventory and placement planning.
-- Defines cluster config domain types, validates coordinator/worker roles, and builds the initial expert-to-node assignment summary.
+- Defines distributed node config domain types, validates coordinator/worker roles, and builds a memory-aware expert-to-node assignment summary with coordinator-local expert windows and capacity-weighted worker balancing.
 
 ### `src/engine/distributed/protocol.rs`
 
 - Distributed wire format definitions and activation encoding helpers.
-- Defines fixed frame kinds, hello/ready and expert-batch payload schemas, and fp16/bf16 activation pack/unpack helpers.
+- Defines fixed frame kinds, discovery/hello/ready and expert-batch payload schemas, and fp16/bf16 activation pack/unpack helpers.
+
+### `src/engine/distributed/resources.rs`
+
+- Local node resource discovery helpers.
+- Detects logical CPU count and total system memory for coordinator/worker discovery.
 
 ### `src/engine/distributed/transport.rs`
 
@@ -312,12 +316,12 @@ src/
 
 - Coordinator-side distributed expert execution.
 - Defines the generic routed-expert executor trait used by `engine::runtime::inference`.
-- Owns local routed-expert execution helpers plus the distributed coordinator client that partitions experts by host, issues remote batches, and accumulates results.
+- Owns cluster resource discovery, local routed-expert execution helpers, and the distributed coordinator client that partitions experts by host, issues remote batches, accumulates results, prefers coordinator-owned sliced local experts when present, and tracks per-worker distributed profiling summaries.
 
 ### `src/engine/distributed/worker.rs`
 
 - Worker-side expert serving logic.
-- Owns the TCP listener loop, worker handshake validation, assigned-expert enforcement, and remote expert batch execution against GGUF-backed expert tensors.
+- Owns the TCP listener loop, bind-address-based worker identity, discovery responses, assignment-on-HELLO validation, row-sliced expert tensor loading, and remote expert batch execution against GGUF-backed expert tensors.
 
 ### `src/engine/types.rs`
 
@@ -325,6 +329,7 @@ src/
 - Defines:
   - GGUF constants and ggml quantization constants
   - Core structs like `Config`, `GGUFFile`, `TransformerWeights`, `RunState`, `Tokenizer`, `QuantizedTensor`
+  - Worker/coordinator sliced expert tensor structs used by distributed routed-MoE loading
   - Qwen3-VL input embedding shaping metadata on `Config`:
     - `input_embedding_dim` (language dim plus optional deepstack lanes)
     - `n_deepstack_layers`
@@ -460,7 +465,8 @@ src/
 
 - Profiling counters and helper functions.
 - Contains all profiling atomics and report formatting:
-  - `set_profiling_enabled`, `prof_start`, `prof_end`, `profiling_reset`, `record_forward_pass`, `print_profile_report`.
+  - `set_profiling_enabled`, `prof_start`, `prof_end`, `profiling_reset`, `record_forward_pass`, `print_profile_report`
+  - distributed MoE transport/request counters used by the coordinator path
 
 ### `src/vendors/*`
 

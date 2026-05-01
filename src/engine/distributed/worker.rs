@@ -1,12 +1,14 @@
-use crate::engine::distributed::coordinator::compute_local_selected_experts;
-use crate::engine::distributed::placement::{ClusterNodeRole, MoePlacementPlan};
+use crate::engine::distributed::placement::{ClusterConfig, ClusterNodeRole};
 use crate::engine::distributed::protocol::{
-    ExpertBatchResponse, FrameKind, HelloFrame, ReadyFrame, decode_error_frame,
-    decode_expert_batch_request, decode_hello_frame, encode_error_frame,
-    encode_expert_batch_response, encode_ready_frame,
+    DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame, ReadyFrame,
+    decode_error_frame, decode_expert_batch_request, decode_hello_frame,
+    encode_discover_response_frame, encode_error_frame, encode_expert_batch_response,
+    encode_ready_frame,
 };
+use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
-use crate::engine::types::{Config, GGUFFile, TransformerWeights, WorkerExpertWeights};
+use crate::engine::kernels::{matmul_quantized_rows, silu_and_mul_inplace};
+use crate::engine::types::{Config, GGUFFile, WorkerExpertWeights};
 use std::net::TcpListener;
 use std::time::Duration;
 
@@ -15,29 +17,83 @@ const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 30;
 struct WorkerRuntime {
     gguf: GGUFFile,
     config: Config,
-    weights: TransformerWeights,
-    plan: MoePlacementPlan,
-    node_index: usize,
+    bind_address: String,
+    resources: NodeResourceSnapshot,
+}
+
+struct WorkerSession {
+    weights: WorkerExpertWeights,
+    assigned_experts: Vec<Vec<bool>>,
 }
 
 impl WorkerRuntime {
-    fn validate_hello(&self, hello: &HelloFrame) -> Result<ReadyFrame, String> {
+    fn discovery_frame(&self) -> DiscoverResponseFrame {
+        DiscoverResponseFrame {
+            node_address: self.bind_address.clone(),
+            dim: self.config.dim,
+            n_layers: self.config.n_layers,
+            n_experts: self.config.n_experts,
+            logical_cpu_count: self.resources.logical_cpu_count,
+            memory_bytes: self.resources.memory_bytes,
+        }
+    }
+
+    fn prepare_session(&self, hello: &HelloFrame) -> Result<(ReadyFrame, WorkerSession), String> {
+        if hello.node_address != self.bind_address {
+            return Err(format!(
+                "coordinator targeted worker '{}' but this worker is '{}'",
+                hello.node_address, self.bind_address
+            ));
+        }
         if hello.dim != self.config.dim
             || hello.n_layers != self.config.n_layers
             || hello.n_experts != self.config.n_experts
         {
             return Err("coordinator HELLO does not match worker model metadata".to_string());
         }
-        Ok(ReadyFrame {
+
+        let mut assigned_lists = vec![Vec::new(); self.config.n_layers];
+        let mut assigned_mask = vec![vec![false; self.config.n_experts]; self.config.n_layers];
+        for &(layer, expert_idx) in &hello.assigned_experts {
+            if layer >= self.config.n_layers || expert_idx >= self.config.n_experts {
+                return Err(format!(
+                    "coordinator assigned invalid expert pair ({layer}, {expert_idx})"
+                ));
+            }
+            if !assigned_mask[layer][expert_idx] {
+                assigned_lists[layer].push(expert_idx);
+                assigned_mask[layer][expert_idx] = true;
+            }
+        }
+
+        let weights = crate::engine::weights::init_worker_expert_weights_from_gguf(
+            &self.gguf,
+            &self.config,
+            &assigned_lists,
+        )?;
+        let loaded_expert_count = assigned_lists.iter().map(Vec::len).sum::<usize>();
+        let ready = ReadyFrame {
+            node_address: self.bind_address.clone(),
             dim: self.config.dim,
             n_layers: self.config.n_layers,
             n_experts: self.config.n_experts,
             activation_dtype: hello.activation_dtype,
-        })
+            logical_cpu_count: self.resources.logical_cpu_count,
+            memory_bytes: self.resources.memory_bytes,
+            loaded_expert_count,
+        };
+        Ok((
+            ready,
+            WorkerSession {
+                weights,
+                assigned_experts: assigned_mask,
+            },
+        ))
     }
 
     fn handle_request(
         &self,
+        session: &WorkerSession,
         request: crate::engine::distributed::protocol::ExpertBatchRequest,
     ) -> Result<ExpertBatchResponse, String> {
         if request.layer >= self.config.n_layers {
@@ -52,36 +108,59 @@ impl WorkerRuntime {
                 request.dim, self.config.dim
             ));
         }
-        let n_experts = self.plan.inventory.n_experts;
         let mapped = self.gguf.mapped.as_slice();
         let mut outputs = Vec::with_capacity(request.expert_ids.len());
+        let mut gate_scratch = vec![0.0f32; self.config.expert_hidden_dim];
+        let mut up_scratch = vec![0.0f32; self.config.expert_hidden_dim];
         for &expert_idx in &request.expert_ids {
-            let plan_index = request
-                .layer
-                .checked_mul(n_experts)
-                .and_then(|value| value.checked_add(expert_idx))
-                .ok_or_else(|| "worker expert plan index overflow".to_string())?;
-            let assigned_node = *self
-                .plan
-                .expert_node_indices
-                .get(plan_index)
-                .ok_or_else(|| "worker expert plan index out of bounds".to_string())?;
-            if assigned_node != self.node_index {
+            if expert_idx >= self.config.n_experts
+                || !session.assigned_experts[request.layer][expert_idx]
+            {
                 return Err(format!(
                     "expert {} in layer {} is not assigned to worker '{}'",
-                    expert_idx, request.layer, self.plan.nodes[self.node_index].node_id
+                    expert_idx, request.layer, self.bind_address
                 ));
             }
+            let tensors = session
+                .weights
+                .experts
+                .get(request.layer)
+                .and_then(|layer| layer.get(expert_idx))
+                .and_then(|slot| slot.as_ref())
+                .ok_or_else(|| {
+                    format!(
+                        "expert {} in layer {} was assigned to worker '{}' but its sliced tensors are missing",
+                        expert_idx, request.layer, self.bind_address
+                    )
+                })?;
             let mut output = vec![0.0f32; self.config.dim];
-            compute_local_selected_experts(
-                request.layer,
+            matmul_quantized_rows(
+                &mut gate_scratch[..self.config.expert_hidden_dim],
                 &request.activation,
-                &[(expert_idx, 1.0)],
-                &mut output,
-                &self.config,
-                &self.weights,
+                &tensors.gate,
+                0,
+                self.config.expert_hidden_dim,
                 mapped,
-                false,
+            )?;
+            matmul_quantized_rows(
+                &mut up_scratch[..self.config.expert_hidden_dim],
+                &request.activation,
+                &tensors.up,
+                0,
+                self.config.expert_hidden_dim,
+                mapped,
+            )?;
+            silu_and_mul_inplace(
+                &mut gate_scratch[..self.config.expert_hidden_dim],
+                &up_scratch[..self.config.expert_hidden_dim],
+            );
+            matmul_quantized_rows(
+                &mut output,
+                &gate_scratch[..self.config.expert_hidden_dim],
+                &tensors.down,
+                0,
+                self.config.dim,
+                mapped,
             )?;
             outputs.push(output);
         }
@@ -98,92 +177,47 @@ impl WorkerRuntime {
 fn build_worker_runtime(
     gguf: GGUFFile,
     config: Config,
-    plan: MoePlacementPlan,
-    node_id: &str,
+    bind_address: &str,
 ) -> Result<WorkerRuntime, String> {
-    let node_index = plan
-        .nodes
-        .iter()
-        .position(|node| node.node_id == node_id)
-        .ok_or_else(|| format!("node id '{}' was not found in cluster config", node_id))?;
-    let node = &plan.nodes[node_index];
-    if node.role != ClusterNodeRole::Worker {
-        return Err(format!(
-            "node '{}' has role '{}' but worker mode requires a worker node",
-            node.node_id,
-            node.role.as_str()
-        ));
-    }
-
-    let worker_weights =
-        crate::engine::weights::init_worker_expert_weights_from_gguf(&gguf, &config)?;
-    let weights = inflate_worker_weights(worker_weights)?;
-
     Ok(WorkerRuntime {
         gguf,
         config,
-        weights,
-        plan,
-        node_index,
-    })
-}
-
-fn inflate_worker_weights(
-    worker_weights: WorkerExpertWeights,
-) -> Result<TransformerWeights, String> {
-    Ok(TransformerWeights {
-        token_embedding_table: Vec::new(),
-        rms_att_weight: Vec::new(),
-        rms_ffn_weight: Vec::new(),
-        wq: Vec::new(),
-        wk: Vec::new(),
-        wv: Vec::new(),
-        wo: Vec::new(),
-        w1: Vec::new(),
-        w2: Vec::new(),
-        w3: Vec::new(),
-        attn_qkv: Vec::new(),
-        ssm_ba: Vec::new(),
-        ssm_alpha: Vec::new(),
-        ssm_beta: Vec::new(),
-        ssm_conv1d: Vec::new(),
-        ssm_a: Vec::new(),
-        ssm_dt_bias: Vec::new(),
-        ssm_norm: Vec::new(),
-        moe_gate_inp: Vec::new(),
-        moe_gate_exps: worker_weights.moe_gate_exps,
-        moe_up_exps: worker_weights.moe_up_exps,
-        moe_down_exps: worker_weights.moe_down_exps,
-        moe_shared_gate_inp: Vec::new(),
-        rms_final_weight: Vec::new(),
-        wcls: Default::default(),
-        wcls_is_embed: false,
-        attn_q_bias: Vec::new(),
-        attn_k_bias: Vec::new(),
-        attn_v_bias: Vec::new(),
-        attn_q_norm: Vec::new(),
-        attn_k_norm: Vec::new(),
-        attn_qk_norm_present: Vec::new(),
-        attn_post_norm: Vec::new(),
-        ffn_post_norm: Vec::new(),
-        attn_post_norm_bias: Vec::new(),
-        ffn_post_norm_bias: Vec::new(),
+        bind_address: bind_address.to_string(),
+        resources: detect_local_node_resources()?,
     })
 }
 
 pub(crate) fn run_worker_server(
     gguf: GGUFFile,
     config: Config,
-    plan: MoePlacementPlan,
-    node_id: &str,
+    cluster: ClusterConfig,
+    bind_address: &str,
 ) -> Result<(), String> {
-    let runtime = build_worker_runtime(gguf, config, plan, node_id)?;
-    let node = &runtime.plan.nodes[runtime.node_index];
+    let runtime = build_worker_runtime(gguf, config, bind_address)?;
+    let node_index = cluster
+        .node
+        .iter()
+        .position(|node| node.address == bind_address)
+        .ok_or_else(|| {
+            format!(
+                "worker bind address '{}' was not found in distributed config",
+                bind_address
+            )
+        })?;
+    let node = &cluster.node[node_index];
+    if node.role != ClusterNodeRole::Worker {
+        return Err(format!(
+            "node '{}' has role '{}' but worker mode requires a worker node",
+            node.id,
+            node.role.as_str()
+        ));
+    }
+
     let listener = TcpListener::bind(&node.address)
         .map_err(|e| format!("failed to bind worker listener '{}': {e}", node.address))?;
     println!(
-        "Distributed worker listening on {} with {} assigned experts",
-        node.address, runtime.plan.nodes[runtime.node_index].assigned_expert_count
+        "Distributed worker listening on {} cpu={} mem_bytes={}",
+        node.address, runtime.resources.logical_cpu_count, runtime.resources.memory_bytes
     );
 
     for stream in listener.incoming() {
@@ -192,57 +226,82 @@ pub(crate) fn run_worker_server(
             stream,
             Duration::from_secs(DEFAULT_REMOTE_TIMEOUT_SECS),
         )?;
-        let hello_message = connection.recv_message()?;
-        if hello_message.kind != FrameKind::Hello {
-            return Err("worker expected HELLO as first distributed frame".to_string());
-        }
-        let hello = decode_hello_frame(&hello_message.payload)?;
-        match runtime.validate_hello(&hello) {
-            Ok(ready) => {
-                let payload = encode_ready_frame(&ready)?;
-                connection.send_message(FrameKind::Ready, hello_message.request_id, &payload)?;
+        let first_message = connection.recv_message()?;
+        match first_message.kind {
+            FrameKind::DiscoverRequest => {
+                let payload = encode_discover_response_frame(&runtime.discovery_frame())?;
+                connection.send_message(
+                    FrameKind::DiscoverResponse,
+                    first_message.request_id,
+                    &payload,
+                )?;
             }
-            Err(err) => {
-                let payload = encode_error_frame(&err)?;
-                connection.send_message(FrameKind::Error, hello_message.request_id, &payload)?;
-                continue;
-            }
-        }
+            FrameKind::Hello => {
+                let hello = decode_hello_frame(&first_message.payload)?;
+                match runtime.prepare_session(&hello) {
+                    Ok((ready, session)) => {
+                        let payload = encode_ready_frame(&ready)?;
+                        connection.send_message(
+                            FrameKind::Ready,
+                            first_message.request_id,
+                            &payload,
+                        )?;
 
-        loop {
-            let message = connection.recv_message()?;
-            match message.kind {
-                FrameKind::ExpertBatchRequest => {
-                    let request = decode_expert_batch_request(&message.payload)?;
-                    match runtime.handle_request(request) {
-                        Ok(response) => {
-                            let payload = encode_expert_batch_response(&response)?;
-                            connection.send_message(
-                                FrameKind::ExpertBatchResponse,
-                                message.request_id,
-                                &payload,
-                            )?;
-                        }
-                        Err(err) => {
-                            let payload = encode_error_frame(&err)?;
-                            connection.send_message(
-                                FrameKind::Error,
-                                message.request_id,
-                                &payload,
-                            )?;
+                        loop {
+                            let message = connection.recv_message()?;
+                            match message.kind {
+                                FrameKind::ExpertBatchRequest => {
+                                    let request = decode_expert_batch_request(&message.payload)?;
+                                    match runtime.handle_request(&session, request) {
+                                        Ok(response) => {
+                                            let payload = encode_expert_batch_response(&response)?;
+                                            connection.send_message(
+                                                FrameKind::ExpertBatchResponse,
+                                                message.request_id,
+                                                &payload,
+                                            )?;
+                                        }
+                                        Err(err) => {
+                                            let payload = encode_error_frame(&err)?;
+                                            connection.send_message(
+                                                FrameKind::Error,
+                                                message.request_id,
+                                                &payload,
+                                            )?;
+                                        }
+                                    }
+                                }
+                                FrameKind::Shutdown => break,
+                                FrameKind::Error => {
+                                    return Err(format!(
+                                        "worker received coordinator error: {}",
+                                        decode_error_frame(&message.payload)?
+                                    ));
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "worker received unexpected frame {:?}",
+                                        other
+                                    ));
+                                }
+                            }
                         }
                     }
+                    Err(err) => {
+                        let payload = encode_error_frame(&err)?;
+                        connection.send_message(
+                            FrameKind::Error,
+                            first_message.request_id,
+                            &payload,
+                        )?;
+                    }
                 }
-                FrameKind::Shutdown => break,
-                FrameKind::Error => {
-                    return Err(format!(
-                        "worker received coordinator error: {}",
-                        decode_error_frame(&message.payload)?
-                    ));
-                }
-                other => {
-                    return Err(format!("worker received unexpected frame {:?}", other));
-                }
+            }
+            other => {
+                return Err(format!(
+                    "worker expected DISCOVER_REQUEST or HELLO as first distributed frame, got {:?}",
+                    other
+                ));
             }
         }
     }

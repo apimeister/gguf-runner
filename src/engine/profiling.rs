@@ -9,6 +9,12 @@ pub(crate) static PROF_ATTN_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_MOE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_FFN_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_FORWARD_PASSES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_REMOTE_BATCHES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_REMOTE_EXPERTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_LOCAL_EXPERTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_BYTES_SENT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_BYTES_RECEIVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_REMOTE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn set_profiling_enabled(enabled: bool) {
@@ -40,6 +46,31 @@ pub(crate) fn record_forward_pass() {
     PROF_FORWARD_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
 }
 
+#[inline(always)]
+pub(crate) fn record_distributed_local_experts(count: usize) {
+    PROF_DMOE_LOCAL_EXPERTS.fetch_add(count as u64, AtomicOrdering::Relaxed);
+}
+
+#[inline(always)]
+pub(crate) fn record_distributed_remote_request(
+    experts: usize,
+    bytes_sent: usize,
+    bytes_received: usize,
+    wait_ns: u64,
+) {
+    PROF_DMOE_REMOTE_BATCHES.fetch_add(1, AtomicOrdering::Relaxed);
+    PROF_DMOE_REMOTE_EXPERTS.fetch_add(experts as u64, AtomicOrdering::Relaxed);
+    PROF_DMOE_BYTES_SENT.fetch_add(bytes_sent as u64, AtomicOrdering::Relaxed);
+    PROF_DMOE_BYTES_RECEIVED.fetch_add(bytes_received as u64, AtomicOrdering::Relaxed);
+    PROF_DMOE_REMOTE_WAIT_NS.fetch_add(wait_ns, AtomicOrdering::Relaxed);
+}
+
+#[inline(always)]
+pub(crate) fn record_distributed_transport_bytes(bytes_sent: usize, bytes_received: usize) {
+    PROF_DMOE_BYTES_SENT.fetch_add(bytes_sent as u64, AtomicOrdering::Relaxed);
+    PROF_DMOE_BYTES_RECEIVED.fetch_add(bytes_received as u64, AtomicOrdering::Relaxed);
+}
+
 pub(crate) fn profiling_reset() {
     PROF_TRANSFORMER_NS.store(0, AtomicOrdering::Relaxed);
     PROF_MATMUL_NS.store(0, AtomicOrdering::Relaxed);
@@ -48,6 +79,12 @@ pub(crate) fn profiling_reset() {
     PROF_MOE_NS.store(0, AtomicOrdering::Relaxed);
     PROF_FFN_NS.store(0, AtomicOrdering::Relaxed);
     PROF_FORWARD_PASSES.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_REMOTE_BATCHES.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_REMOTE_EXPERTS.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_LOCAL_EXPERTS.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_BYTES_SENT.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_BYTES_RECEIVED.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_REMOTE_WAIT_NS.store(0, AtomicOrdering::Relaxed);
 }
 
 pub(crate) fn print_profile_report() {
@@ -58,8 +95,15 @@ pub(crate) fn print_profile_report() {
     let moe_ns = PROF_MOE_NS.load(AtomicOrdering::Relaxed);
     let ffn_ns = PROF_FFN_NS.load(AtomicOrdering::Relaxed);
     let passes = PROF_FORWARD_PASSES.load(AtomicOrdering::Relaxed);
+    let distributed_remote_batches = PROF_DMOE_REMOTE_BATCHES.load(AtomicOrdering::Relaxed);
+    let distributed_remote_experts = PROF_DMOE_REMOTE_EXPERTS.load(AtomicOrdering::Relaxed);
+    let distributed_local_experts = PROF_DMOE_LOCAL_EXPERTS.load(AtomicOrdering::Relaxed);
+    let distributed_bytes_sent = PROF_DMOE_BYTES_SENT.load(AtomicOrdering::Relaxed);
+    let distributed_bytes_received = PROF_DMOE_BYTES_RECEIVED.load(AtomicOrdering::Relaxed);
+    let distributed_remote_wait_ns = PROF_DMOE_REMOTE_WAIT_NS.load(AtomicOrdering::Relaxed);
 
     let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
+    let to_mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
     let pct = |part: u64| {
         if total_ns == 0 {
             0.0
@@ -106,4 +150,28 @@ pub(crate) fn print_profile_report() {
     eprintln!(
         "[PROFILE] note: counters overlap (e.g. matmul is included in SSM/attention/MoE/FFN)"
     );
+    if distributed_remote_batches > 0
+        || distributed_remote_experts > 0
+        || distributed_bytes_sent > 0
+        || distributed_bytes_received > 0
+    {
+        eprintln!(
+            "[PROFILE] distributed_moe remote_batches={} remote_experts={} local_experts={}",
+            distributed_remote_batches, distributed_remote_experts, distributed_local_experts
+        );
+        eprintln!(
+            "[PROFILE] distributed_moe transport_sent={:.3} MiB transport_recv={:.3} MiB",
+            to_mb(distributed_bytes_sent),
+            to_mb(distributed_bytes_received)
+        );
+        eprintln!(
+            "[PROFILE] distributed_moe remote_wait={:.3} ms ({:.3} ms/batch)",
+            to_ms(distributed_remote_wait_ns),
+            if distributed_remote_batches == 0 {
+                0.0
+            } else {
+                to_ms(distributed_remote_wait_ns) / distributed_remote_batches as f64
+            }
+        );
+    }
 }

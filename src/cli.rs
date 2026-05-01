@@ -134,6 +134,21 @@ fn parse_operation_mode(raw: &str) -> Result<CliOperationMode, String> {
     }
 }
 
+fn parse_distributed_transport_dtype(raw: &str) -> Result<CliDistributedTransportDtype, String> {
+    let value = raw.trim();
+    if value.eq_ignore_ascii_case("bf16") {
+        Ok(CliDistributedTransportDtype::Bf16)
+    } else if value.eq_ignore_ascii_case("fp16") {
+        Ok(CliDistributedTransportDtype::Fp16)
+    } else if value.eq_ignore_ascii_case("q8") || value.eq_ignore_ascii_case("int8") {
+        Ok(CliDistributedTransportDtype::Q8)
+    } else {
+        Err(format!(
+            "invalid value '{raw}': expected one of bf16/fp16/q8"
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CliKvCacheMode {
     Q8,
@@ -149,8 +164,31 @@ pub(crate) enum CliOperationMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CliDistributedMode {
     None,
-    Plan,
     Worker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliDistributedTransportDtype {
+    Bf16,
+    Fp16,
+    Q8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CliDistributedWorkerNodeSpec {
+    pub(crate) address: String,
+}
+
+fn parse_distributed_worker_node_spec(raw: &str) -> Result<CliDistributedWorkerNodeSpec, String> {
+    let address = raw.trim();
+    if address.is_empty() {
+        return Err(format!(
+            "invalid distributed worker node '{raw}': expected 'host:port'"
+        ));
+    }
+    Ok(CliDistributedWorkerNodeSpec {
+        address: address.to_string(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -573,30 +611,56 @@ struct Cli {
     show_features: bool,
 
     #[arg(
-        long = "distributed-plan",
-        help = "Inspect distributed MoE placement for the model and cluster, then exit"
-    )]
-    distributed_plan: bool,
-
-    #[arg(
         long = "distributed-worker",
-        help = "Validate worker bootstrap metadata for the model and cluster, then exit"
+        env = "GGUF_DISTRIBUTED_WORKER",
+        help = "Run as a distributed expert-serving worker"
     )]
     distributed_worker: bool,
 
     #[arg(
-        long = "cluster",
-        value_name = "cluster.toml",
-        help = "Cluster configuration for distributed MoE planning/worker bootstrap"
+        long = "distributed-bind-address",
+        env = "GGUF_DISTRIBUTED_BIND_ADDRESS",
+        value_name = "host:port",
+        help = "Worker bind address used when --distributed-worker is enabled"
     )]
-    cluster: Option<String>,
+    distributed_bind_address: Option<String>,
 
     #[arg(
-        long = "node-id",
+        long = "distributed-coordinator-id",
+        env = "GGUF_DISTRIBUTED_COORDINATOR_ID",
+        default_value = "coordinator",
         value_name = "id",
-        help = "Node id inside --cluster used by distributed worker bootstrap"
+        help = "Coordinator node id used in distributed MoE mode"
     )]
-    node_id: Option<String>,
+    distributed_coordinator_id: String,
+
+    #[arg(
+        long = "distributed-coordinator-address",
+        env = "GGUF_DISTRIBUTED_COORDINATOR_ADDRESS",
+        value_name = "host:port",
+        help = "Coordinator address used for distributed MoE placement metadata"
+    )]
+    distributed_coordinator_address: Option<String>,
+
+    #[arg(
+        long = "distributed-worker-node",
+        env = "GGUF_DISTRIBUTED_WORKER_NODES",
+        value_delimiter = ',',
+        value_parser = parse_distributed_worker_node_spec,
+        value_name = "host:port",
+        help = "Repeatable distributed worker node address"
+    )]
+    distributed_worker_nodes: Vec<CliDistributedWorkerNodeSpec>,
+
+    #[arg(
+        long = "distributed-transport-dtype",
+        env = "GGUF_DISTRIBUTED_TRANSPORT_DTYPE",
+        default_value = "bf16",
+        value_parser = parse_distributed_transport_dtype,
+        value_name = "bf16|fp16|q8",
+        help = "Activation transport dtype for distributed MoE traffic"
+    )]
+    distributed_transport_dtype: CliDistributedTransportDtype,
 
     #[arg(long = "image", value_name = "path")]
     images: Vec<String>,
@@ -907,8 +971,11 @@ pub(crate) struct CliOptions {
     pub(crate) system_prompt: String,
     pub(crate) mode: CliOperationMode,
     pub(crate) distributed_mode: CliDistributedMode,
-    pub(crate) cluster: Option<String>,
-    pub(crate) node_id: Option<String>,
+    pub(crate) distributed_bind_address: Option<String>,
+    pub(crate) distributed_coordinator_id: String,
+    pub(crate) distributed_coordinator_address: Option<String>,
+    pub(crate) distributed_worker_nodes: Vec<CliDistributedWorkerNodeSpec>,
+    pub(crate) distributed_transport_dtype: CliDistributedTransportDtype,
     pub(crate) tools_enabled: bool,
     pub(crate) tool_root: Option<String>,
     pub(crate) tool_enablement: AgentToolEnablement,
@@ -960,24 +1027,30 @@ impl CliOptions {
     pub(crate) fn parse() -> Result<Self, String> {
         let cli = Cli::try_parse().map_err(|e| e.to_string())?;
         let mode = cli.mode;
-        if cli.distributed_plan && cli.distributed_worker {
-            return Err(
-                "conflicting flags: choose only one of --distributed-plan or --distributed-worker"
-                    .to_string(),
-            );
-        }
-        let distributed_mode = if cli.distributed_plan {
-            CliDistributedMode::Plan
-        } else if cli.distributed_worker {
+        let distributed_enabled =
+            cli.distributed_worker || !cli.distributed_worker_nodes.is_empty();
+        let distributed_mode = if cli.distributed_worker {
             CliDistributedMode::Worker
         } else {
             CliDistributedMode::None
         };
-        if distributed_mode != CliDistributedMode::None && cli.cluster.is_none() {
-            return Err("distributed commands require --cluster <cluster.toml>".to_string());
+        if distributed_enabled && cli.distributed_coordinator_address.is_none() {
+            return Err(
+                "distributed mode requires --distributed-coordinator-address <host:port>"
+                    .to_string(),
+            );
         }
-        if distributed_mode == CliDistributedMode::Worker && cli.node_id.is_none() {
-            return Err("--distributed-worker requires --node-id <id>".to_string());
+        if distributed_mode == CliDistributedMode::Worker && cli.distributed_bind_address.is_none()
+        {
+            return Err(
+                "--distributed-worker requires --distributed-bind-address <host:port>".to_string(),
+            );
+        }
+        if distributed_enabled && cli.distributed_worker_nodes.is_empty() {
+            return Err(
+                "distributed mode requires at least one --distributed-worker-node 'host:port'"
+                    .to_string(),
+            );
         }
         let mut allowed_tools = match cli.allowed_tools.as_deref() {
             Some(raw) => parse_allowed_tools(raw)?,
@@ -1001,9 +1074,9 @@ impl CliOptions {
         }
         let requested_tools_enabled = !allowed_tools.is_empty();
         if !cli.show_features
-            && distributed_mode == CliDistributedMode::None
             && !cli.rag_build
             && matches!(mode, CliOperationMode::Oneshot)
+            && distributed_mode != CliDistributedMode::Worker
             && cli.prompt.trim().is_empty()
         {
             return Err("`--prompt` is required in oneshot mode".to_string());
@@ -1048,8 +1121,11 @@ impl CliOptions {
             system_prompt: cli.system_prompt,
             mode,
             distributed_mode,
-            cluster: cli.cluster,
-            node_id: cli.node_id,
+            distributed_bind_address: cli.distributed_bind_address,
+            distributed_coordinator_id: cli.distributed_coordinator_id,
+            distributed_coordinator_address: cli.distributed_coordinator_address,
+            distributed_worker_nodes: cli.distributed_worker_nodes,
+            distributed_transport_dtype: cli.distributed_transport_dtype,
             tools_enabled,
             tool_root: cli.tool_root,
             tool_enablement,

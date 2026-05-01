@@ -2,7 +2,7 @@ use crate::engine::io::{find_gguf_tensor, find_gguf_tensor_names_with_any_prefix
 use crate::engine::kernels::{dequantize_tensor, get_block_size, get_type_size};
 use crate::engine::types::{
     Config, GGML_TYPE_F32, GGUFFile, GgmlType, Gguftensor, MultimodalBackend, MultimodalWeights,
-    QuantizedTensor, TransformerWeights, WorkerExpertWeights,
+    QuantizedTensor, TransformerWeights, WorkerExpertTensors, WorkerExpertWeights,
 };
 use std::collections::BTreeMap;
 
@@ -118,6 +118,53 @@ fn load_layer_tensor_quantized_auto_rows(
     }
     let rows = n_elements / cols;
     load_tensor_quantized(gguf, &name, rows, cols)
+}
+
+fn load_layer_tensor_quantized_row_range(
+    gguf: &GGUFFile,
+    layer: usize,
+    suffix: &str,
+    row_start: usize,
+    n_rows: usize,
+    cols: usize,
+) -> Result<QuantizedTensor, String> {
+    let name = format!("blk.{layer}.{suffix}");
+    let tensor =
+        find_gguf_tensor(gguf, &name).ok_or_else(|| format!("tensor not found: {name}"))?;
+    let n_elements = tensor_n_elements(tensor);
+    if cols == 0 || !n_elements.is_multiple_of(cols) {
+        return Err(format!(
+            "tensor {name} element count {n_elements} is not divisible by cols={cols}"
+        ));
+    }
+    let total_rows = n_elements / cols;
+    let row_end = row_start
+        .checked_add(n_rows)
+        .ok_or_else(|| format!("row range overflow for tensor {name}"))?;
+    if row_end > total_rows {
+        return Err(format!(
+            "row range {}..{} exceeds tensor {} rows {}",
+            row_start, row_end, name, total_rows
+        ));
+    }
+    let row_size = get_type_size(tensor.ttype)
+        .checked_mul(cols / get_block_size(tensor.ttype))
+        .ok_or_else(|| format!("row size overflow for tensor {name}"))?;
+    let data_offset = tensor
+        .data_offset
+        .checked_add(
+            row_start
+                .checked_mul(row_size)
+                .ok_or_else(|| format!("row offset overflow for tensor {name}"))?,
+        )
+        .ok_or_else(|| format!("tensor offset overflow for tensor {name}"))?;
+
+    Ok(QuantizedTensor {
+        data_offset,
+        ttype: tensor.ttype,
+        rows: n_rows,
+        cols,
+    })
 }
 
 const VISION_ENCODER_PREFIXES: &[&str] = &[
@@ -236,6 +283,15 @@ pub(crate) fn init_weights_from_gguf(
     p: &Config,
     debug_mode: bool,
 ) -> Result<TransformerWeights, String> {
+    init_weights_from_gguf_with_local_experts(gguf, p, debug_mode, None)
+}
+
+pub(crate) fn init_weights_from_gguf_with_local_experts(
+    gguf: &GGUFFile,
+    p: &Config,
+    debug_mode: bool,
+    local_assigned_experts: Option<&[Vec<usize>]>,
+) -> Result<TransformerWeights, String> {
     let head_size = if p.head_dim > 0 {
         p.head_dim
     } else {
@@ -322,6 +378,15 @@ pub(crate) fn init_weights_from_gguf(
         vec![QuantizedTensor::default(); n_layers]
     } else {
         Vec::new()
+    };
+    let local_moe_experts = if let Some(assigned_experts) = local_assigned_experts {
+        Some(init_worker_expert_weights_from_gguf(
+            gguf,
+            p,
+            assigned_experts,
+        )?)
+    } else {
+        None
     };
     let mut moe_shared_gate_inp = if p.is_qwen3next {
         vec![0.0f32; n_layers * p.dim]
@@ -540,27 +605,29 @@ pub(crate) fn init_weights_from_gguf(
                     p.n_experts,
                     p.dim,
                 )?;
-                moe_gate_exps[l] = load_layer_tensor_quantized(
-                    gguf,
-                    l,
-                    "ffn_gate_exps.weight",
-                    p.n_experts * p.expert_hidden_dim,
-                    p.dim,
-                )?;
-                moe_up_exps[l] = load_layer_tensor_quantized(
-                    gguf,
-                    l,
-                    "ffn_up_exps.weight",
-                    p.n_experts * p.expert_hidden_dim,
-                    p.dim,
-                )?;
-                moe_down_exps[l] = load_layer_tensor_quantized(
-                    gguf,
-                    l,
-                    "ffn_down_exps.weight",
-                    p.n_experts * p.dim,
-                    p.expert_hidden_dim,
-                )?;
+                if local_moe_experts.is_none() {
+                    moe_gate_exps[l] = load_layer_tensor_quantized(
+                        gguf,
+                        l,
+                        "ffn_gate_exps.weight",
+                        p.n_experts * p.expert_hidden_dim,
+                        p.dim,
+                    )?;
+                    moe_up_exps[l] = load_layer_tensor_quantized(
+                        gguf,
+                        l,
+                        "ffn_up_exps.weight",
+                        p.n_experts * p.expert_hidden_dim,
+                        p.dim,
+                    )?;
+                    moe_down_exps[l] = load_layer_tensor_quantized(
+                        gguf,
+                        l,
+                        "ffn_down_exps.weight",
+                        p.n_experts * p.dim,
+                        p.expert_hidden_dim,
+                    )?;
+                }
 
                 let shared_hidden = if p.shared_expert_hidden_dim > 0 {
                     p.shared_expert_hidden_dim
@@ -616,27 +683,29 @@ pub(crate) fn init_weights_from_gguf(
         if p.is_qwen3moe {
             moe_gate_inp[l] =
                 load_layer_tensor_quantized(gguf, l, "ffn_gate_inp.weight", p.n_experts, p.dim)?;
-            moe_gate_exps[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_gate_exps.weight",
-                p.n_experts * p.expert_hidden_dim,
-                p.dim,
-            )?;
-            moe_up_exps[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_up_exps.weight",
-                p.n_experts * p.expert_hidden_dim,
-                p.dim,
-            )?;
-            moe_down_exps[l] = load_layer_tensor_quantized(
-                gguf,
-                l,
-                "ffn_down_exps.weight",
-                p.n_experts * p.dim,
-                p.expert_hidden_dim,
-            )?;
+            if local_moe_experts.is_none() {
+                moe_gate_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_gate_exps.weight",
+                    p.n_experts * p.expert_hidden_dim,
+                    p.dim,
+                )?;
+                moe_up_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_up_exps.weight",
+                    p.n_experts * p.expert_hidden_dim,
+                    p.dim,
+                )?;
+                moe_down_exps[l] = load_layer_tensor_quantized(
+                    gguf,
+                    l,
+                    "ffn_down_exps.weight",
+                    p.n_experts * p.dim,
+                    p.expert_hidden_dim,
+                )?;
+            }
         } else if !p.is_qwen3next {
             w1[l] = load_layer_tensor_quantized(gguf, l, "ffn_gate.weight", p.hidden_dim, p.dim)?;
             w2[l] = load_layer_tensor_quantized(gguf, l, "ffn_down.weight", p.dim, p.hidden_dim)?;
@@ -736,6 +805,7 @@ pub(crate) fn init_weights_from_gguf(
         moe_gate_exps,
         moe_up_exps,
         moe_down_exps,
+        local_moe_experts,
         moe_shared_gate_inp,
         rms_final_weight,
         wcls,
@@ -756,42 +826,66 @@ pub(crate) fn init_weights_from_gguf(
 pub(crate) fn init_worker_expert_weights_from_gguf(
     gguf: &GGUFFile,
     p: &Config,
+    assigned_experts: &[Vec<usize>],
 ) -> Result<WorkerExpertWeights, String> {
     if p.n_experts == 0 || p.expert_hidden_dim == 0 {
         return Err("worker expert loading requires a routed-MoE model".to_string());
     }
 
-    let mut moe_gate_exps = vec![QuantizedTensor::default(); p.n_layers];
-    let mut moe_up_exps = vec![QuantizedTensor::default(); p.n_layers];
-    let mut moe_down_exps = vec![QuantizedTensor::default(); p.n_layers];
-
-    for l in 0..p.n_layers {
-        moe_gate_exps[l] = load_layer_tensor_quantized(
-            gguf,
-            l,
-            "ffn_gate_exps.weight",
-            p.n_experts * p.expert_hidden_dim,
-            p.dim,
-        )?;
-        moe_up_exps[l] = load_layer_tensor_quantized(
-            gguf,
-            l,
-            "ffn_up_exps.weight",
-            p.n_experts * p.expert_hidden_dim,
-            p.dim,
-        )?;
-        moe_down_exps[l] = load_layer_tensor_quantized(
-            gguf,
-            l,
-            "ffn_down_exps.weight",
-            p.n_experts * p.dim,
-            p.expert_hidden_dim,
-        )?;
+    if assigned_experts.len() != p.n_layers {
+        return Err(format!(
+            "assigned expert layer count mismatch: got {}, expected {}",
+            assigned_experts.len(),
+            p.n_layers
+        ));
     }
 
-    Ok(WorkerExpertWeights {
-        moe_gate_exps,
-        moe_up_exps,
-        moe_down_exps,
-    })
+    let mut experts = Vec::with_capacity(p.n_layers);
+    for (layer, layer_experts) in assigned_experts.iter().enumerate() {
+        let mut layer_slots = Vec::with_capacity(p.n_experts);
+        layer_slots.resize_with(p.n_experts, || None);
+        for &expert_idx in layer_experts {
+            if expert_idx >= p.n_experts {
+                return Err(format!(
+                    "assigned expert index {} out of range for layer {}",
+                    expert_idx, layer
+                ));
+            }
+            let gate_row_start = expert_idx
+                .checked_mul(p.expert_hidden_dim)
+                .ok_or_else(|| format!("gate row offset overflow for layer {layer}"))?;
+            let down_row_start = expert_idx
+                .checked_mul(p.dim)
+                .ok_or_else(|| format!("down row offset overflow for layer {layer}"))?;
+            layer_slots[expert_idx] = Some(WorkerExpertTensors {
+                gate: load_layer_tensor_quantized_row_range(
+                    gguf,
+                    layer,
+                    "ffn_gate_exps.weight",
+                    gate_row_start,
+                    p.expert_hidden_dim,
+                    p.dim,
+                )?,
+                up: load_layer_tensor_quantized_row_range(
+                    gguf,
+                    layer,
+                    "ffn_up_exps.weight",
+                    gate_row_start,
+                    p.expert_hidden_dim,
+                    p.dim,
+                )?,
+                down: load_layer_tensor_quantized_row_range(
+                    gguf,
+                    layer,
+                    "ffn_down_exps.weight",
+                    down_row_start,
+                    p.dim,
+                    p.expert_hidden_dim,
+                )?,
+            });
+        }
+        experts.push(layer_slots);
+    }
+
+    Ok(WorkerExpertWeights { experts })
 }

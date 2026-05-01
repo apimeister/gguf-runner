@@ -1,9 +1,10 @@
 use crate::app::events::{
     RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress, emit_runtime_event,
 };
-use crate::cli::CliOptions;
+use crate::cli::{CliDistributedTransportDtype, CliOptions};
 use crate::engine::distributed::{
     ActivationDtype, DistributedMoeCoordinator, build_moe_placement_plan,
+    discover_cluster_resources,
 };
 use crate::engine::io::{get_gguf_string_from_map, parse_gguf_file};
 use crate::engine::kernels::{TopKSampler, argmax, sample, softmax};
@@ -22,6 +23,14 @@ use crate::engine::vision::{
 };
 use crate::rag::{DocumentEncoder, RagIndex, prepend_rag_context};
 use image::{ImageFormat, ImageReader};
+
+fn map_transport_dtype(dtype: CliDistributedTransportDtype) -> ActivationDtype {
+    match dtype {
+        CliDistributedTransportDtype::Bf16 => ActivationDtype::Bf16,
+        CliDistributedTransportDtype::Fp16 => ActivationDtype::Fp16,
+        CliDistributedTransportDtype::Q8 => ActivationDtype::Q8,
+    }
+}
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -2381,18 +2390,48 @@ impl ModelRuntime {
             crate::engine::runtime::configure_rayon_threads(n_threads, debug_mode);
         }
 
-        let weights = crate::engine::weights::init_weights_from_gguf(&gguf, &config, debug_mode)?;
-        let distributed_moe = if cli.cluster.is_some() {
-            let cluster_path = cli
-                .cluster
-                .as_deref()
-                .ok_or("distributed cluster path missing".to_string())?;
-            let cluster = super::load_cluster_config(cluster_path)?;
-            let plan = build_moe_placement_plan(&gguf, &config, &cluster)?;
-            Some(DistributedMoeCoordinator::connect(
-                plan,
-                ActivationDtype::Bf16,
-            )?)
+        let distributed_plan = if !cli.distributed_worker_nodes.is_empty() {
+            let cluster = super::build_cluster_config_from_cli(cli)?;
+            let discovered_cluster = discover_cluster_resources(&cluster, &config)?;
+            let plan = build_moe_placement_plan(&gguf, &config, &discovered_cluster)?;
+            super::print_placement_plan(&plan);
+            Some(plan)
+        } else {
+            None
+        };
+        let weights = if let Some(plan) = distributed_plan.as_ref() {
+            let coordinator_index = plan
+                .nodes
+                .iter()
+                .position(|node| node.node_id == plan.coordinator_node_id)
+                .ok_or_else(|| {
+                    format!(
+                        "distributed coordinator '{}' was not found in placement plan",
+                        plan.coordinator_node_id
+                    )
+                })?;
+            let mut assigned_experts = vec![Vec::new(); config.n_layers];
+            for (layer, expert_idx) in plan.assigned_experts_for_node(coordinator_index) {
+                assigned_experts[layer].push(expert_idx);
+            }
+            crate::engine::weights::init_weights_from_gguf_with_local_experts(
+                &gguf,
+                &config,
+                debug_mode,
+                Some(&assigned_experts),
+            )?
+        } else {
+            crate::engine::weights::init_weights_from_gguf(&gguf, &config, debug_mode)?
+        };
+        let distributed_moe = if let Some(plan) = distributed_plan {
+            let transport_dtype = map_transport_dtype(cli.distributed_transport_dtype);
+            if debug_mode {
+                eprintln!(
+                    "Distributed MoE transport dtype: {}",
+                    transport_dtype.as_str()
+                );
+            }
+            Some(DistributedMoeCoordinator::connect(plan, transport_dtype)?)
         } else {
             None
         };

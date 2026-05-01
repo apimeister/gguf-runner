@@ -110,9 +110,12 @@ Known-good status from `docs/performance.md` (text benchmarks) and local model/m
 
 `gguf-runner` now includes an experimental distributed routed-MoE mode for multi-host execution.
 
-- `--distributed-plan` prints a metadata-based expert placement summary for a `cluster.toml`
-- `--distributed-worker` starts a worker process bound to one cluster node id
-- normal generation with `--cluster <cluster.toml>` runs the coordinator path
+- `--distributed-worker` starts a worker process bound to one worker listen address
+- normal generation with distributed coordinator/worker flags runs the coordinator path
+- placement summary is printed during distributed startup, so there is no separate plan command
+- the coordinator now discovers worker CPU and memory before placement, then assigns experts during
+  the HELLO handshake
+- activation transport dtype is configurable with `--distributed-transport-dtype bf16|fp16|q8`
 
 Start here:
 

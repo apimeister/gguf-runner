@@ -426,6 +426,7 @@ pub(crate) struct TransformerWeights {
     pub(crate) moe_gate_exps: Vec<QuantizedTensor>,
     pub(crate) moe_up_exps: Vec<QuantizedTensor>,
     pub(crate) moe_down_exps: Vec<QuantizedTensor>,
+    pub(crate) local_moe_experts: Option<WorkerExpertWeights>,
     pub(crate) moe_shared_gate_inp: Vec<f32>,
     pub(crate) rms_final_weight: Vec<f32>,
     pub(crate) wcls: QuantizedTensor,
@@ -443,10 +444,14 @@ pub(crate) struct TransformerWeights {
     pub(crate) ffn_post_norm_bias: Vec<f32>,
 }
 
+pub(crate) struct WorkerExpertTensors {
+    pub(crate) gate: QuantizedTensor,
+    pub(crate) up: QuantizedTensor,
+    pub(crate) down: QuantizedTensor,
+}
+
 pub(crate) struct WorkerExpertWeights {
-    pub(crate) moe_gate_exps: Vec<QuantizedTensor>,
-    pub(crate) moe_up_exps: Vec<QuantizedTensor>,
-    pub(crate) moe_down_exps: Vec<QuantizedTensor>,
+    pub(crate) experts: Vec<Vec<Option<WorkerExpertTensors>>>,
 }
 
 pub(crate) struct RunState {

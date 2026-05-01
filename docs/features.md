@@ -64,9 +64,11 @@ Supported tensor data paths include:
   - current runtime returns explicit "not implemented yet" errors for native image/video/audio embedding execution paths
 - autoregressive generation loop
 - experimental distributed routed-MoE execution:
-  - `--distributed-plan` for metadata-based cluster planning
   - `--distributed-worker` for remote expert-serving workers
-  - coordinator generation path enabled by passing `--cluster <cluster.toml>`
+  - coordinator generation path enabled by distributed CLI/env config
+  - placement summary printed during distributed startup
+  - coordinator-driven resource discovery for worker CPU/memory before placement
+  - worker assignment delivered during distributed HELLO rather than precomputed worker-side planning
   - persistent TCP transport with explicit protocol framing and fail-fast validation
 - quantized KV cache for attention state:
   - default TurboQuant-style `turbo` KV cache mode:
@@ -99,10 +101,15 @@ Supported tensor data paths include:
 User-facing CLI options are defined in `src/cli.rs`.
 
 Distributed CLI options:
-- `--cluster <cluster.toml>`
-- `--distributed-plan`
 - `--distributed-worker`
-- `--node-id <id>`
+- `--distributed-bind-address <host:port>`
+- `--distributed-coordinator-id <id>`
+- `--distributed-coordinator-address <host:port>`
+- repeatable `--distributed-worker-node 'host:port'`
+- `--distributed-transport-dtype <bf16|fp16|q8>`
+
+Distributed resource notes:
+- placement uses discovered node memory and CPU from the coordinator discovery pass
 
 Agent config file (optional):
 - `~/.gguf-runner/config.toml`
