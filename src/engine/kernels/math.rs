@@ -14,7 +14,17 @@ pub(crate) fn accum(a: &mut [f32], b: &[f32], size: usize) {
     axpy_inplace(&mut a[..size], 1.0, &b[..size]);
 }
 
+/// Root mean square normalization: `o[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps)`.
+/// x86_64: AVX-2 (8-wide) or AVX-512 (16-wide).
+/// aarch64: NEON 4-element (vectorized).
+/// Other: scalar.
 pub(crate) fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
+    #[cfg(target_arch = "x86_64")]
+    if size >= 8 {
+        return unsafe {
+            rmsnorm_x86_64(o, x, weight, size, eps);
+        };
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -60,6 +70,7 @@ pub(crate) fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps
             j += 1;
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
     #[cfg(not(target_arch = "aarch64"))]
     {
         let mut ss = 0.0f32;
@@ -75,7 +86,17 @@ pub(crate) fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps
     }
 }
 
+/// RMS normalization in-place: `x[i] = weight[i] * x[i] / sqrt(mean(x^2) + eps)`.
+/// x86_64: AVX-2 (8-wide) or AVX-512 (16-wide).
+/// aarch64: NEON 4-element (vectorized).
+/// Other: scalar.
 pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize, eps: f32) {
+    #[cfg(target_arch = "x86_64")]
+    if size >= 8 {
+        return unsafe {
+            rmsnorm_inplace_x86_64(x, weight, size, eps);
+        };
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -121,6 +142,7 @@ pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize, eps: f
             j += 1;
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
     #[cfg(not(target_arch = "aarch64"))]
     {
         let mut ss = 0.0f32;
@@ -133,6 +155,264 @@ pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize, eps: f
         for i in 0..size {
             x[i] = weight[i] * (ss * x[i]);
         }
+    }
+}
+
+// ─── x86_64 SIMD paths for rmsnorm ───
+
+/// Dispatch rmsnorm on x86_64: AVX-512 (16-wide) or AVX-2 (8-wide).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn rmsnorm_x86_64(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
+    use crate::engine::switches::use_x86_avx512f;
+    use std::arch::x86_64::*;
+
+    if use_x86_avx512f() {
+        rmsnorm_avx512(o, x, weight, size, eps);
+    } else {
+        rmsnorm_avx2(o, x, weight, size, eps);
+    }
+}
+
+/// Dispatch rmsnorm_inplace on x86_64: AVX-512 (16-wide) or AVX-2 (8-wide).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn rmsnorm_inplace_x86_64(x: &mut [f32], weight: &[f32], size: usize, eps: f32) {
+    use crate::engine::switches::use_x86_avx512f;
+    use std::arch::x86_64::*;
+
+    if use_x86_avx512f() {
+        rmsnorm_inplace_avx512(x, weight, size, eps);
+    } else {
+        rmsnorm_inplace_avx2(x, weight, size, eps);
+    }
+}
+
+/// AVX-2 (8-wide) RMS normalization.
+/// Processes 8 elements per iteration using FMA:
+///  - Sum of squares: 2× 8-element MACs with 2 accumulator registers
+///  - Normalize: 8-element scale+multiply in one pass
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn rmsnorm_avx2(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    // Pass 1: sum of squares (8 elements per iteration, 2×8-wide FMA)
+    while i + 8 <= size {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
+        acc0 = _mm256_fmadd_ps(xv, xv, acc0);
+        acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
+        i += 8;
+    }
+
+    // Horizontal sum of accumulators
+    let acc = _mm256_add_ps(acc0, acc1);
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut ss: f32 = tmp.iter().sum::<f32>();
+
+    // Tail scalar
+    while i < size {
+        ss += x[i] * x[i];
+        i += 1;
+    }
+
+    // Compute scale
+    ss /= size as f32;
+    ss += eps;
+    let scale = 1.0 / ss.sqrt();
+
+    // Pass 2: scale and multiply (8 elements per iteration)
+    i = 0;
+    let scale_vec = _mm256_set1_ps(scale);
+    while i + 8 <= size {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
+        let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 4));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
+        let result = _mm256_fmadd_ps(xv, wv, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
+        let result2 = _mm256_fmadd_ps(xv2, wv2, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
+        _mm256_storeu_ps(o.as_mut_ptr().add(i), result);
+        _mm256_storeu_ps(o.as_mut_ptr().add(i + 4), result2);
+        i += 8;
+    }
+
+    // Tail scalar
+    while i < size {
+        o[i] = weight[i] * (scale * x[i]);
+        i += 1;
+    }
+}
+
+/// AVX-512 (16-wide) RMS normalization.
+/// Same algorithm as AVX-2 but processes 16 elements per iteration.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn rmsnorm_avx512(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+
+    // Pass 1: sum of squares (16 elements per iteration, 2×16-wide FMA)
+    while i + 16 <= size {
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
+        acc0 = _mm512_fmadd_ps(xv, xv, acc0);
+        acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
+        i += 16;
+    }
+
+    // Horizontal sum of accumulators
+    let acc = _mm512_add_ps(acc0, acc1);
+    let mut tmp = [0.0f32; 16];
+    _mm512_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut ss: f32 = tmp.iter().sum::<f32>();
+
+    // Tail scalar
+    while i < size {
+        ss += x[i] * x[i];
+        i += 1;
+    }
+
+    // Compute scale
+    ss /= size as f32;
+    ss += eps;
+    let scale = 1.0 / ss.sqrt();
+
+    // Pass 2: scale and multiply (16 elements per iteration)
+    i = 0;
+    let scale_vec = _mm512_set1_ps(scale);
+    while i + 16 <= size {
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
+        let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 8));
+        let result = _mm512_fmadd_ps(xv, wv, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
+        let result2 = _mm512_fmadd_ps(xv2, wv2, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
+        _mm512_storeu_ps(o.as_mut_ptr().add(i), result);
+        _mm512_storeu_ps(o.as_mut_ptr().add(i + 8), result2);
+        i += 16;
+    }
+
+    // Tail scalar
+    while i < size {
+        o[i] = weight[i] * (scale * x[i]);
+        i += 1;
+    }
+}
+
+/// AVX-2 (8-wide) RMS normalization in-place.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn rmsnorm_inplace_avx2(x: &mut [f32], weight: &[f32], size: usize, eps: f32) {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    // Pass 1: sum of squares
+    while i + 8 <= size {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
+        acc0 = _mm256_fmadd_ps(xv, xv, acc0);
+        acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
+        i += 8;
+    }
+
+    let acc = _mm256_add_ps(acc0, acc1);
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut ss: f32 = tmp.iter().sum::<f32>();
+
+    while i < size {
+        ss += x[i] * x[i];
+        i += 1;
+    }
+
+    ss /= size as f32;
+    ss += eps;
+    let scale = 1.0 / ss.sqrt();
+
+    // Pass 2: scale and multiply in-place
+    i = 0;
+    let scale_vec = _mm256_set1_ps(scale);
+    while i + 8 <= size {
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
+        let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 4));
+        let result = _mm256_fmadd_ps(xv, wv, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
+        let result2 = _mm256_fmadd_ps(xv2, wv2, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
+        _mm256_storeu_ps(x.as_mut_ptr().add(i), result);
+        _mm256_storeu_ps(x.as_mut_ptr().add(i + 4), result2);
+        i += 8;
+    }
+
+    while i < size {
+        x[i] = weight[i] * (scale * x[i]);
+        i += 1;
+    }
+}
+
+/// AVX-512 (16-wide) RMS normalization in-place.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn rmsnorm_inplace_avx512(x: &mut [f32], weight: &[f32], size: usize, eps: f32) {
+    use std::arch::x86_64::*;
+
+    let mut i = 0usize;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+
+    // Pass 1: sum of squares
+    while i + 16 <= size {
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
+        acc0 = _mm512_fmadd_ps(xv, xv, acc0);
+        acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
+        i += 16;
+    }
+
+    let acc = _mm512_add_ps(acc0, acc1);
+    let mut tmp = [0.0f32; 16];
+    _mm512_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut ss: f32 = tmp.iter().sum::<f32>();
+
+    while i < size {
+        ss += x[i] * x[i];
+        i += 1;
+    }
+
+    ss /= size as f32;
+    ss += eps;
+    let scale = 1.0 / ss.sqrt();
+
+    // Pass 2: scale and multiply in-place
+    i = 0;
+    let scale_vec = _mm512_set1_ps(scale);
+    while i + 16 <= size {
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
+        let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 8));
+        let result = _mm512_fmadd_ps(xv, wv, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
+        let result2 = _mm512_fmadd_ps(xv2, wv2, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
+        _mm512_storeu_ps(x.as_mut_ptr().add(i), result);
+        _mm512_storeu_ps(x.as_mut_ptr().add(i + 8), result2);
+        i += 16;
+    }
+
+    while i < size {
+        x[i] = weight[i] * (scale * x[i]);
+        i += 1;
     }
 }
 
@@ -258,7 +538,6 @@ pub(crate) fn softmax(x: &mut [f32], size: usize) {
             *ptr.add(i) /= sum;
             i += 1;
         }
-        return;
     }
     #[allow(unreachable_code)]
     {
@@ -344,7 +623,6 @@ pub(crate) fn silu_and_mul_inplace(hb: &mut [f32], hb2: &[f32]) {
             *p.add(i) = (v / (1.0_f32 + (-v).exp())) * *q.add(i);
             i += 1;
         }
-        return;
     }
     #[allow(unreachable_code)]
     for (h, &g) in hb.iter_mut().zip(hb2.iter()) {
