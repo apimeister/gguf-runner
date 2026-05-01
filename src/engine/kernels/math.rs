@@ -281,10 +281,17 @@ pub(crate) fn softmax(x: &mut [f32], size: usize) {
 }
 
 /// Fused SiLU-and-multiply: `hb[i] = silu(hb[i]) * hb2[i]` for all i.
+/// x86_64: AVX-2 (8-wide) or AVX-512 (16-wide) with range-reduced polynomial exp.
 /// aarch64: vectorized with a degree-5 polynomial exp approximation (4 elements/iteration).
 /// Other: scalar fallback using libm expf.
 pub(crate) fn silu_and_mul_inplace(hb: &mut [f32], hb2: &[f32]) {
     debug_assert_eq!(hb.len(), hb2.len());
+    #[cfg(target_arch = "x86_64")]
+    if hb.len() >= 8 {
+        unsafe {
+            return silu_and_mul_x86_64(hb, hb2);
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -347,9 +354,16 @@ pub(crate) fn silu_and_mul_inplace(hb: &mut [f32], hb2: &[f32]) {
 }
 
 /// Multiply `dst[i]` by `sigmoid(gate[i])` in-place.
+/// x86_64: AVX-2 (8-wide) or AVX-512 (16-wide) with range-reduced polynomial exp.
 /// aarch64: vectorized with same exp approximation strategy used in other kernels.
 pub(crate) fn sigmoid_mul_inplace(dst: &mut [f32], gate: &[f32]) {
     debug_assert_eq!(dst.len(), gate.len());
+    #[cfg(target_arch = "x86_64")]
+    if dst.len() >= 8 {
+        unsafe {
+            return sigmoid_mul_x86_64(dst, gate);
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -399,6 +413,422 @@ pub(crate) fn sigmoid_mul_inplace(dst: &mut [f32], gate: &[f32]) {
     for (d, &g) in dst.iter_mut().zip(gate.iter()) {
         let s = 1.0_f32 / (1.0_f32 + (-g).exp());
         *d = finite_or_zero(*d * s);
+    }
+}
+
+// ─── x86_64 SIMD paths for silu_and_mul and sigmoid_mul ───
+
+/// Dispatch silu_and_mul on x86_64: AVX-512 (16-wide) or AVX-2 (8-wide).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn silu_and_mul_x86_64(hb: &mut [f32], hb2: &[f32]) {
+    use crate::engine::switches::{use_x86_avx512bf16, use_x86_avx512f};
+    use std::arch::x86_64::*;
+
+    if use_x86_avx512f() {
+        silu_and_mul_avx512(hb, hb2);
+    } else if use_x86_avx2_fma() {
+        silu_and_mul_avx2(hb, hb2);
+    }
+}
+
+/// Dispatch sigmoid_mul on x86_64: AVX-512 (16-wide) or AVX-2 (8-wide).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sigmoid_mul_x86_64(dst: &mut [f32], gate: &[f32]) {
+    use crate::engine::switches::{use_x86_avx512bf16, use_x86_avx512f};
+    use std::arch::x86_64::*;
+
+    if use_x86_avx512f() {
+        sigmoid_mul_avx512(dst, gate);
+    } else if use_x86_avx2_fma() {
+        sigmoid_mul_avx2(dst, gate);
+    }
+}
+
+/// AVX-2 (8-wide) fused SiLU-and-multiply.
+/// Uses the same range-reduced Taylor series exp approximation as aarch64 NEON.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn silu_and_mul_avx2(hb: &mut [f32], hb2: &[f32]) {
+    use std::arch::x86_64::*;
+
+    const EXP_MAX: f32 = 88.0;
+    const EXP_MIN: f32 = -88.0;
+    const LN2_HI: f32 = 0.693_359_4_f32;
+    const LN2_LO: f32 = -2.121_944_4e-4_f32;
+
+    let n = hb.len();
+    let p = hb.as_mut_ptr();
+    let q = hb2.as_ptr();
+    let mut i = 0usize;
+
+    while i + 8 <= n {
+        // Load 8 values: v (silu input), gate (multiply)
+        let v = _mm256_loadu_ps(p.add(i));
+        let gate = _mm256_loadu_ps(q.add(i));
+
+        // ─── exp(-v) via range reduction ───
+        // negate: -v
+        let neg_v = _mm256_sub_ps(_mm256_setzero_ps(), v);
+        // clamp: max(min(-v, 88.0), -88.0)
+        let clamped = _mm256_min_ps(
+            _mm256_max_ps(neg_v, _mm256_set1_ps(EXP_MIN)),
+            _mm256_set1_ps(EXP_MAX),
+        );
+
+        // n_f = round(clamped * LOG2_E)
+        let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+        let n_f = _mm256_round_ps(
+            _mm256_mul_ps(clamped, log2e),
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        );
+
+        // r = clamped - n_f * (ln2_hi + ln2_lo)
+        // = clamped - n_f * ln2_hi - n_f * ln2_lo
+        let r = _mm256_fmadd_ps(
+            _mm256_sub_ps(clamped, _mm256_mul_ps(n_f, _mm256_set1_ps(LN2_HI))),
+            _mm256_set1_ps(-LN2_LO),
+            _mm256_setzero_ps(),
+        );
+
+        // Horner polynomial for exp(r): 1 + r*(1 + r*(0.5 + r*(1/6 + r*(1/24 + r*(1/120))))
+        let c5 = _mm256_set1_ps(1.0_f32 / 120.0_f32);
+        let c4 = _mm256_set1_ps(1.0_f32 / 24.0_f32);
+        let c3 = _mm256_set1_ps(1.0_f32 / 6.0_f32);
+        let c2 = _mm256_set1_ps(0.5_f32);
+        let one = _mm256_set1_ps(1.0_f32);
+
+        let poly = _mm256_add_ps(
+            one,
+            _mm256_mul_ps(
+                r,
+                _mm256_add_ps(
+                    one,
+                    _mm256_mul_ps(
+                        r,
+                        _mm256_add_ps(
+                            c2,
+                            _mm256_mul_ps(
+                                r,
+                                _mm256_add_ps(
+                                    c3,
+                                    _mm256_mul_ps(r, _mm256_add_ps(c4, _mm256_mul_ps(r, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        // Scale by 2^n: extract exponent from n_f, compute 2^n
+        let ni = _mm256_cvttps_epi32(n_f);
+        let biased_exp = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
+        let p2n = _mm256_castsi256_ps(_mm256_slli_epi32(biased_exp, 23));
+        let exp_neg_v = _mm256_mul_ps(poly, p2n);
+
+        // sigmoid = 1 / (1 + exp(-v)) with one NR refinement
+        let denom = _mm256_add_ps(one, exp_neg_v);
+        let rec = _mm256_rcp_ps(denom);
+        let rec = _mm256_mul_ps(
+            _mm256_sub_ps(_mm256_set1_ps(2.0), _mm256_mul_ps(denom, rec)),
+            rec,
+        );
+
+        // result = v * sigmoid(v) * gate
+        let result = _mm256_mul_ps(_mm256_mul_ps(v, gate), rec);
+        _mm256_storeu_ps(p.add(i), result);
+        i += 8;
+    }
+
+    // Tail: scalar
+    while i < n {
+        let v = *p.add(i);
+        *p.add(i) = (v / (1.0_f32 + (-v).exp())) * *q.add(i);
+        i += 1;
+    }
+}
+
+/// AVX-512 (16-wide) fused SiLU-and-multiply.
+/// Uses the same algorithm as AVX-2 but processes 16 elements per iteration.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn silu_and_mul_avx512(hb: &mut [f32], hb2: &[f32]) {
+    use std::arch::x86_64::*;
+
+    const EXP_MAX: f32 = 88.0;
+    const EXP_MIN: f32 = -88.0;
+    const LN2_HI: f32 = 0.693_359_4_f32;
+    const LN2_LO: f32 = -2.121_944_4e-4_f32;
+
+    let n = hb.len();
+    let p = hb.as_mut_ptr();
+    let q = hb2.as_ptr();
+    let mut i = 0usize;
+
+    while i + 16 <= n {
+        // Load 16 values
+        let v = _mm512_loadu_ps(p.add(i));
+        let gate = _mm512_loadu_ps(q.add(i));
+
+        // negate, clamp
+        let neg_v = _mm512_sub_ps(_mm512_setzero_ps(), v);
+        let clamped = _mm512_min_ps(
+            _mm512_max_ps(neg_v, _mm512_set1_ps(EXP_MIN)),
+            _mm512_set1_ps(EXP_MAX),
+        );
+
+        // n_f = round(clamped * LOG2_E)
+        let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
+        let n_f = _mm512_roundscale_ps(_mm512_mul_ps(clamped, log2e), _MM_FROUND_TO_NEAREST_INT);
+
+        // r = clamped - n_f * ln2 (computed as clamped - n_f*ln2_hi - n_f*ln2_lo)
+        let r = _mm512_fmadd_ps(
+            _mm512_sub_ps(clamped, _mm512_mul_ps(n_f, _mm512_set1_ps(LN2_HI))),
+            _mm512_set1_ps(-LN2_LO),
+            _mm512_setzero_ps(),
+        );
+
+        // Horner polynomial
+        let c5 = _mm512_set1_ps(1.0_f32 / 120.0_f32);
+        let c4 = _mm512_set1_ps(1.0_f32 / 24.0_f32);
+        let c3 = _mm512_set1_ps(1.0_f32 / 6.0_f32);
+        let c2 = _mm512_set1_ps(0.5_f32);
+        let one = _mm512_set1_ps(1.0_f32);
+
+        let poly = _mm512_add_ps(
+            one,
+            _mm512_mul_ps(
+                r,
+                _mm512_add_ps(
+                    one,
+                    _mm512_mul_ps(
+                        r,
+                        _mm512_add_ps(
+                            c2,
+                            _mm512_mul_ps(
+                                r,
+                                _mm512_add_ps(
+                                    c3,
+                                    _mm512_mul_ps(r, _mm512_add_ps(c4, _mm512_mul_ps(r, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        // Scale by 2^n
+        let ni = _mm512_cvttps_epi32(n_f);
+        let biased_exp = _mm512_add_epi32(ni, _mm512_set1_epi32(127));
+        let p2n = _mm512_castsi512_ps(_mm512_slli_epi32(biased_exp, 23));
+        let exp_neg_v = _mm512_mul_ps(poly, p2n);
+
+        // sigmoid with NR refinement
+        let denom = _mm512_add_ps(one, exp_neg_v);
+        let rec = _mm512_rcp_ps(denom);
+        let rec = _mm512_mul_ps(
+            _mm512_sub_ps(_mm512_set1_ps(2.0), _mm512_mul_ps(denom, rec)),
+            rec,
+        );
+
+        // result = v * sigmoid(v) * gate
+        let result = _mm512_mul_ps(_mm512_mul_ps(v, gate), rec);
+        _mm512_storeu_ps(p.add(i), result);
+        i += 16;
+    }
+
+    // Tail: scalar
+    while i < n {
+        let v = *p.add(i);
+        *p.add(i) = (v / (1.0_f32 + (-v).exp())) * *q.add(i);
+        i += 1;
+    }
+}
+
+/// AVX-2 (8-wide) sigmoid multiply: dst[i] *= sigmoid(gate[i]).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sigmoid_mul_avx2(dst: &mut [f32], gate: &[f32]) {
+    use std::arch::x86_64::*;
+
+    const EXP_MAX: f32 = 88.0;
+    const EXP_MIN: f32 = -88.0;
+    const LN2_HI: f32 = 0.693_359_4_f32;
+    const LN2_LO: f32 = -2.121_944_4e-4_f32;
+
+    let n = dst.len();
+    let p = dst.as_mut_ptr();
+    let q = gate.as_ptr();
+    let mut i = 0usize;
+
+    while i + 8 <= n {
+        let dv = _mm256_loadu_ps(p.add(i));
+        let gv = _mm256_loadu_ps(q.add(i));
+
+        // exp(-gate)
+        let neg_g = _mm256_sub_ps(_mm256_setzero_ps(), gv);
+        let clamped = _mm256_min_ps(
+            _mm256_max_ps(neg_g, _mm256_set1_ps(EXP_MIN)),
+            _mm256_set1_ps(EXP_MAX),
+        );
+
+        let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+        let n_f = _mm256_round_ps(
+            _mm256_mul_ps(clamped, log2e),
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        );
+
+        let r = _mm256_fmadd_ps(
+            _mm256_sub_ps(clamped, _mm256_mul_ps(n_f, _mm256_set1_ps(LN2_HI))),
+            _mm256_set1_ps(-LN2_LO),
+            _mm256_setzero_ps(),
+        );
+
+        let c5 = _mm256_set1_ps(1.0_f32 / 120.0_f32);
+        let c4 = _mm256_set1_ps(1.0_f32 / 24.0_f32);
+        let c3 = _mm256_set1_ps(1.0_f32 / 6.0_f32);
+        let c2 = _mm256_set1_ps(0.5_f32);
+        let one = _mm256_set1_ps(1.0_f32);
+
+        let poly = _mm256_add_ps(
+            one,
+            _mm256_mul_ps(
+                r,
+                _mm256_add_ps(
+                    one,
+                    _mm256_mul_ps(
+                        r,
+                        _mm256_add_ps(
+                            c2,
+                            _mm256_mul_ps(
+                                r,
+                                _mm256_add_ps(
+                                    c3,
+                                    _mm256_mul_ps(r, _mm256_add_ps(c4, _mm256_mul_ps(r, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        let ni = _mm256_cvttps_epi32(n_f);
+        let biased_exp = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
+        let p2n = _mm256_castsi256_ps(_mm256_slli_epi32(biased_exp, 23));
+        let exp_neg_g = _mm256_mul_ps(poly, p2n);
+
+        let denom = _mm256_add_ps(one, exp_neg_g);
+        let rec = _mm256_rcp_ps(denom);
+        let rec = _mm256_mul_ps(
+            _mm256_sub_ps(_mm256_set1_ps(2.0), _mm256_mul_ps(denom, rec)),
+            rec,
+        );
+
+        // dst *= sigmoid(gate)
+        let result = _mm256_mul_ps(dv, rec);
+        _mm256_storeu_ps(p.add(i), result);
+        i += 8;
+    }
+
+    // Tail: scalar
+    while i < n {
+        let s = 1.0_f32 / (1.0_f32 + (-*q.add(i)).exp());
+        *p.add(i) = finite_or_zero(*p.add(i) * s);
+        i += 1;
+    }
+}
+
+/// AVX-512 (16-wide) sigmoid multiply.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn sigmoid_mul_avx512(dst: &mut [f32], gate: &[f32]) {
+    use std::arch::x86_64::*;
+
+    const EXP_MAX: f32 = 88.0;
+    const EXP_MIN: f32 = -88.0;
+    const LN2_HI: f32 = 0.693_359_4_f32;
+    const LN2_LO: f32 = -2.121_944_4e-4_f32;
+
+    let n = dst.len();
+    let p = dst.as_mut_ptr();
+    let q = gate.as_ptr();
+    let mut i = 0usize;
+
+    while i + 16 <= n {
+        let dv = _mm512_loadu_ps(p.add(i));
+        let gv = _mm512_loadu_ps(q.add(i));
+
+        // exp(-gate)
+        let neg_g = _mm512_sub_ps(_mm512_setzero_ps(), gv);
+        let clamped = _mm512_min_ps(
+            _mm512_max_ps(neg_g, _mm512_set1_ps(EXP_MIN)),
+            _mm512_set1_ps(EXP_MAX),
+        );
+
+        let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
+        let n_f = _mm512_roundscale_ps(_mm512_mul_ps(clamped, log2e), _MM_FROUND_TO_NEAREST_INT);
+
+        let r = _mm512_fmadd_ps(
+            _mm512_sub_ps(clamped, _mm512_mul_ps(n_f, _mm512_set1_ps(LN2_HI))),
+            _mm512_set1_ps(-LN2_LO),
+            _mm512_setzero_ps(),
+        );
+
+        let c5 = _mm512_set1_ps(1.0_f32 / 120.0_f32);
+        let c4 = _mm512_set1_ps(1.0_f32 / 24.0_f32);
+        let c3 = _mm512_set1_ps(1.0_f32 / 6.0_f32);
+        let c2 = _mm512_set1_ps(0.5_f32);
+        let one = _mm512_set1_ps(1.0_f32);
+
+        let poly = _mm512_add_ps(
+            one,
+            _mm512_mul_ps(
+                r,
+                _mm512_add_ps(
+                    one,
+                    _mm512_mul_ps(
+                        r,
+                        _mm512_add_ps(
+                            c2,
+                            _mm512_mul_ps(
+                                r,
+                                _mm512_add_ps(
+                                    c3,
+                                    _mm512_mul_ps(r, _mm512_add_ps(c4, _mm512_mul_ps(r, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        let ni = _mm512_cvttps_epi32(n_f);
+        let biased_exp = _mm512_add_epi32(ni, _mm512_set1_epi32(127));
+        let p2n = _mm512_castsi512_ps(_mm512_slli_epi32(biased_exp, 23));
+        let exp_neg_g = _mm512_mul_ps(poly, p2n);
+
+        let denom = _mm512_add_ps(one, exp_neg_g);
+        let rec = _mm512_rcp_ps(denom);
+        let rec = _mm512_mul_ps(
+            _mm512_sub_ps(_mm512_set1_ps(2.0), _mm512_mul_ps(denom, rec)),
+            rec,
+        );
+
+        let result = _mm512_mul_ps(dv, rec);
+        _mm512_storeu_ps(p.add(i), result);
+        i += 16;
+    }
+
+    // Tail: scalar
+    while i < n {
+        let s = 1.0_f32 / (1.0_f32 + (-*q.add(i)).exp());
+        *p.add(i) = finite_or_zero(*p.add(i) * s);
+        i += 1;
     }
 }
 

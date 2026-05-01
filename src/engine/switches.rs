@@ -98,6 +98,8 @@ static AARCH64_I8MM_Q8_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_AVX2_FMA_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
+static X86_AVX2_BF16ENC_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
 static X86_F16C_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_QK_MR4_CFG: OnceLock<bool> = OnceLock::new();
@@ -105,6 +107,10 @@ static X86_QK_MR4_CFG: OnceLock<bool> = OnceLock::new();
 static X86_AVXVNNI_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_AVX512VNNI_Q8_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static X86_AVX512F_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+static X86_AVX512BF16_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_IS_AMD_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "aarch64")]
@@ -154,6 +160,10 @@ pub(crate) struct RuntimeSwitchConfig {
     pub(crate) x86_avxvnni: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_avx512vnni_q8: Option<bool>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) x86_avx512: Option<bool>,
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) x86_avx512bf16: Option<bool>,
     pub(crate) layer_debug: Option<bool>,
     pub(crate) layer_debug_pos: Option<usize>,
     pub(crate) kv_cache_mode: Option<KvCacheMode>,
@@ -226,6 +236,20 @@ pub(crate) fn use_x86_avx2_fma() -> bool {
     })
 }
 
+/// Returns true if AVX-2 bf16/fp16 encoding SIMD is available on x86_64.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn use_x86_avx2_bf16_enc() -> bool {
+    *X86_AVX2_BF16ENC_CFG.get_or_init(|| use_x86_avx2_fma())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn use_x86_avx2_bf16_enc() -> bool {
+    false
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn use_x86_f16c() -> bool {
@@ -258,6 +282,41 @@ pub(crate) fn use_x86_avx512_vnni_q8() -> bool {
         std::arch::is_x86_feature_detected!("avx512vnni")
             && std::arch::is_x86_feature_detected!("avx512vl")
     })
+}
+
+/// Returns true if AVX-512 Foundation (core vector ops) is available on x86_64.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn use_x86_avx512f() -> bool {
+    *X86_AVX512F_CFG.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn use_x86_avx512f() -> bool {
+    false
+}
+
+/// Returns true if AVX-512 BF16 instructions are available on x86_64.
+/// Intel Core Ultra supports this natively.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn use_x86_avx512bf16() -> bool {
+    *X86_AVX512BF16_CFG.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512bf16")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn use_x86_avx512bf16() -> bool {
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -347,6 +406,18 @@ pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
                 && std::arch::is_x86_feature_detected!("avx512vnni")
                 && std::arch::is_x86_feature_detected!("avx512vl");
             let _ = X86_AVX512VNNI_Q8_CFG.set(enabled);
+        }
+        if let Some(v) = config.x86_avx512 {
+            let enabled = v
+                && std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vl");
+            let _ = X86_AVX512F_CFG.set(enabled);
+        }
+        if let Some(v) = config.x86_avx512bf16 {
+            let enabled = v
+                && std::arch::is_x86_feature_detected!("avx512bf16")
+                && std::arch::is_x86_feature_detected!("avx512vnni");
+            let _ = X86_AVX512BF16_CFG.set(enabled);
         }
     }
 }

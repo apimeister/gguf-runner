@@ -1,4 +1,5 @@
 use crate::engine::io::{bf16_to_fp32, fp16_to_fp32};
+use crate::engine::kernels::{encode_bf16_vector, encode_fp16_vector};
 
 pub(crate) const DISTRIBUTED_PROTOCOL_MAGIC: u32 = 0x444D_4F45;
 pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 2;
@@ -188,68 +189,14 @@ fn read_string(src: &[u8], offset: &mut usize) -> Result<String, String> {
     Ok(value)
 }
 
-fn encode_fp32_scalar_to_bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding_bias = ((bits >> 16) & 1) + 0x7fff;
-    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
-}
-
-fn encode_fp32_scalar_to_fp16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = bits & 0x7f_ff_ff;
-
-    if exp == 255 {
-        if mant == 0 {
-            return sign | 0x7c00;
-        }
-        return sign | 0x7c00 | ((mant >> 13) as u16).max(1);
-    }
-
-    let half_exp = exp - 127 + 15;
-    if half_exp >= 31 {
-        return sign | 0x7c00;
-    }
-    if half_exp <= 0 {
-        if half_exp < -10 {
-            return sign;
-        }
-        let mantissa = mant | 0x0080_0000;
-        let shift = (14 - half_exp) as u32;
-        let mut half_mant = (mantissa >> shift) as u16;
-        let round_bit = 1u32 << (shift - 1);
-        if (mantissa & round_bit) != 0
-            && ((mantissa & (round_bit - 1)) != 0 || (half_mant & 1) != 0)
-        {
-            half_mant = half_mant.wrapping_add(1);
-        }
-        return sign | half_mant;
-    }
-
-    let mut half_mant = (mant >> 13) as u16;
-    let round_bits = mant & 0x1fff;
-    if round_bits > 0x1000 || (round_bits == 0x1000 && (half_mant & 1) != 0) {
-        half_mant = half_mant.wrapping_add(1);
-        if half_mant == 0x0400 {
-            return sign | (((half_exp + 1) as u16) << 10);
-        }
-    }
-
-    sign | ((half_exp as u16) << 10) | half_mant
-}
-
 pub(crate) fn encode_activation_vector(values: &[f32], dtype: ActivationDtype) -> Vec<u8> {
     match dtype {
         ActivationDtype::Fp16 | ActivationDtype::Bf16 => {
-            let mut out = Vec::with_capacity(values.len() * 2);
-            for &value in values {
-                let bits = match dtype {
-                    ActivationDtype::Fp16 => encode_fp32_scalar_to_fp16_bits(value),
-                    ActivationDtype::Bf16 => encode_fp32_scalar_to_bf16_bits(value),
-                    ActivationDtype::Q8 => unreachable!(),
-                };
-                out.extend_from_slice(&bits.to_le_bytes());
+            let mut out = vec![0u8; values.len() * 2];
+            match dtype {
+                ActivationDtype::Fp16 => encode_fp16_vector(values, &mut out),
+                ActivationDtype::Bf16 => encode_bf16_vector(values, &mut out),
+                ActivationDtype::Q8 => unreachable!(),
             }
             out
         }

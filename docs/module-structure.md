@@ -420,6 +420,8 @@ src/
 - `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, and x86 Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, AMD-aware x86 MR4 dispatch preference (AVX2-first on AMD), architecture-specific matmul row prefetch helpers (x86 + aarch64), and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
   - one-time kernel self-check disable warnings are now quiet by default and can be re-enabled with `GGUF_KERNEL_VALIDATION_WARNINGS=1`
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
+- `simd.rs`: SIMD activation encoding for distributed MoE transport. `encode_bf16_vector` / `encode_fp16_vector` process 8 f32 values per iteration on x86_64 with AVX-2 intrinsics, falling back to scalar on other architectures. Bit-exact IEEE 754 round-to-nearest-even encoding for bf16 (with rounding bias arithmetic) and fp16 (with round-bit checking).
+- `math.rs`: inference activation kernels. On x86_64, `silu_and_mul_inplace` and `sigmoid_mul_inplace` dispatch to AVX-2 (8-wide) or AVX-512 (16-wide) SIMD implementations using range-reduced Taylor series exp approximation (same polynomial order as aarch64 NEON). Includes Newton-Raphson sigmoid refinement for ~23-bit accuracy.
 
 ### `src/engine/runtime/*`
 
@@ -454,7 +456,7 @@ src/
   - AArch64 matmul row prefetch distance switch (`aarch64_matmul_prefetch_rows`)
     - default values for non-x86 matmul thresholds and aarch64 prefetch distance are now derived from `available_parallelism()` heuristics (with CLI/env overrides preserved)
   - KV cache selection switch (`kv_cache_mode`: `q8` / `turbo`, default `turbo`)
-  - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
+  - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8/AVX512F/AVX512-BF16 switches)
     - default behavior uses runtime CPU feature detection for architecture fast paths (for example aarch64 `dotprod` Q8 and x86 `AVX512VNNI` Q8), while `RuntimeSwitchConfig`/CLI/env can still force-disable paths
     - x86 includes a lightweight CPUID vendor probe (`AuthenticAMD`) used to steer selected kernel dispatch choices
   - Layer debug toggles

@@ -232,6 +232,10 @@ pub(crate) fn run() -> Result<(), String> {
         x86_avxvnni: cli.x86_avxvnni,
         #[cfg(target_arch = "x86_64")]
         x86_avx512vnni_q8: cli.x86_avx512vnni_q8,
+        #[cfg(target_arch = "x86_64")]
+        x86_avx512: cli.x86_avx512,
+        #[cfg(target_arch = "x86_64")]
+        x86_avx512bf16: cli.x86_avx512bf16,
         layer_debug: cli.layer_debug,
         layer_debug_pos: cli.layer_debug_pos,
         kv_cache_mode: map_kv_cache_mode(cli.kv_cache_mode),

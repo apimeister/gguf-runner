@@ -107,6 +107,29 @@ No model-family branches should be added to generic app or engine flow. Qwen-spe
 should be expressed through existing vendor config/policy plumbing, or through generic MoE metadata
 already present in `Config`.
 
+## Implementation Checklist
+
+- [x] Capture a repo-specific implementation checklist tied to current module boundaries.
+- [x] Add initial CLI/app scaffolding for distributed planning and worker bootstrap modes.
+- [x] Create `src/engine/distributed/` as the home for protocol, placement, transport, and worker/coordinator logic.
+- [x] Add cluster config domain types and metadata-only placement planning.
+- [x] Add a `distributed-worker` bootstrap path that validates cluster role, model metadata, and assigned experts.
+- [x] Add GGUF-backed expert inventory helpers for routed MoE layers.
+- [x] Extract the routed expert path in `src/engine/runtime/inference.rs` behind a generic executor trait.
+- [x] Preserve existing local behavior via a `LocalMoeExpertExecutor`.
+- [x] Add a distributed executor implementation that partitions selected experts by host.
+- [x] Define the binary distributed protocol with explicit framing, versioning, and request ids.
+- [x] Implement fp16/bf16 activation encode/decode helpers for transport.
+- [x] Make distributed activation transport dtype configurable (`bf16`, `fp16`, `q8`).
+- [x] Add persistent TCP transport and request/response matching.
+- [x] Implement the long-running worker server loop.
+- [x] Add fail-fast distributed error handling and validation.
+- [x] Add partial expert tensor loading by assigned row ranges.
+- [x] Add an initial localhost correctness harness for local vs routed expert execution.
+- [x] Add distributed profiling counters and benchmark reporting.
+- [x] Reduce coordinator expert loading to dense/runtime tensors plus coordinator-assigned expert slices.
+- [ ] Update docs and architecture notes as each phase lands.
+
 ## Phase 0: Measurements And Baseline
 
 Before distributed execution, collect repeatable single-host numbers.
@@ -165,61 +188,41 @@ Initial placement policy:
 - keep some experts local to the coordinator to reduce network traffic
 - avoid requiring any worker to load dense attention or final logits
 
-Add a dry-run command:
+Current implementation note:
 
-```bash
-gguf-runner distributed-plan \
-  --model Qwen3.5-122B-A10B-Q4.gguf \
-  --cluster ./cluster.toml
-```
+- placement now uses discovered per-node memory/CPU resources to reject impossible assignments
+- the coordinator reserves a baseline equal to non-expert checkpoint bytes before expert assignment
+- placement keeps a coordinator-local expert window per layer based on `n_experts_used` when capacity allows
+- remaining experts are distributed with capacity-weighted worker targets rather than simple least-bytes assignment
 
-Example `cluster.toml`:
+Current implementation note:
 
-```toml
-[[node]]
-id = "coordinator"
-address = "192.168.10.10:7000"
-role = "coordinator"
-memory_gb = 32
-
-[[node]]
-id = "worker-a"
-address = "192.168.10.11:7000"
-role = "worker"
-memory_gb = 32
-
-[[node]]
-id = "worker-b"
-address = "192.168.10.12:7000"
-role = "worker"
-memory_gb = 32
-
-[[node]]
-id = "worker-c"
-address = "192.168.10.13:7000"
-role = "worker"
-memory_gb = 32
-```
+- the coordinator now performs a lightweight discovery pass to read worker CPU and memory before planning
+- placement config is now supplied via CLI flags and env vars rather than a TOML cluster file
+- placement summary is printed during distributed coordinator/worker startup instead of a separate plan mode
 
 ## Phase 2: Worker Process
 
 Add a worker mode:
 
 ```bash
-gguf-runner distributed-worker \
+gguf-runner \
   --model Qwen3.5-122B-A10B-Q4.gguf \
-  --cluster ./cluster.toml \
-  --node-id worker-a
+  --distributed-worker \
+  --distributed-bind-address 192.168.10.11:7000 \
+  --distributed-coordinator-address 192.168.10.10:7000 \
+  --distributed-transport-dtype bf16
 ```
 
 Worker responsibilities:
 
 1. parse GGUF metadata
-2. load only assigned expert tensors
-3. validate tensor shapes and quantization types
-4. listen for coordinator connections
-5. process expert batches
-6. report health and loaded tensor summary
+2. answer coordinator discovery with local CPU/memory
+3. load only assigned expert tensors after HELLO assignment
+4. validate tensor shapes and quantization types
+5. listen for coordinator connections
+6. process expert batches
+7. report health and loaded tensor summary
 
 The worker should not initialize tokenizer, sampling, KV cache, or CLI decode state.
 
@@ -323,9 +326,10 @@ This likely requires adding executor state to `RunState` or passing a runtime ex
 
 Start with fail-fast semantics:
 
-- if any worker disconnects, abort the generation
+- transport discovery/connect/send/recv failures retry a small number of times first
+- if any worker still disconnects after retries, abort the generation
 - if a response has wrong shape/dtype/request id, abort
-- if a worker times out, abort
+- if a worker still times out after retries, abort
 
 Later resilience:
 
@@ -341,6 +345,13 @@ Add a test mode that runs the same prompt with:
 
 1. all experts local
 2. selected experts routed through localhost worker processes
+
+Current status:
+
+- a real localhost expert-equivalence test now exists under `src/engine/distributed/worker.rs`
+- it is `#[ignore]` and expects `GGUF_RUNNER_TEST_MOE_MODEL` to point to a routed-MoE GGUF
+- it validates one real routed expert path end-to-end through the worker/coordinator protocol and compares the remote result against the local expert executor
+- full greedy token parity and logits-level comparison are still pending
 
 Compare:
 
@@ -382,6 +393,12 @@ Add debug counters:
 - bytes sent/received
 - per-worker average and p95 latency
 - local vs remote expert count
+
+Current status:
+
+- `--profiling` now reports distributed MoE aggregate counters for remote batches, remote experts, local experts, transport bytes, and aggregate remote wait time
+- the coordinator prints per-worker batch, expert, transport, and average wait summaries on shutdown
+- benchmark automation and p95 latency tracking are still pending
 
 ## Phase 9: Optimization Passes
 

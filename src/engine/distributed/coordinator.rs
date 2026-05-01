@@ -18,8 +18,12 @@ use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
 use std::collections::HashMap;
+use std::sync::mpsc;
+use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+const BATCH_RETRY_ATTEMPTS: usize = 3;
 
 const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 30;
 const DISTRIBUTED_FRAME_HEADER_LEN: usize = 20;
@@ -356,6 +360,21 @@ pub(crate) fn compute_local_selected_experts(
     Ok(())
 }
 
+/// Results sent back from a concurrent batch worker task.
+#[derive(Debug, Clone)]
+struct BatchTaskResult {
+    node_address: String,
+    expert_ids: Vec<usize>,
+    outputs: Vec<Vec<f32>>,
+    /// Activation buffer returned to pool after use.
+    activation: Vec<f32>,
+    bytes_sent: usize,
+    bytes_received: usize,
+    wait_ns: u64,
+    error: Option<String>,
+}
+
+#[allow(dead_code)]
 struct RemoteWorkerClient {
     node_index: usize,
     address: String,
@@ -365,6 +384,7 @@ struct RemoteWorkerClient {
     stats: RemoteWorkerStats,
 }
 
+#[allow(dead_code)]
 impl RemoteWorkerClient {
     fn shutdown(&mut self) {
         let _ = self.connection.send_message(FrameKind::Shutdown, 0, &[]);
@@ -410,6 +430,45 @@ pub(crate) struct DistributedMoeCoordinator {
     activation_dtype: ActivationDtype,
     next_request_id: u64,
     remote_workers: Vec<RemoteWorkerClient>,
+    activation_buffer_pool: ActivationBufferPool,
+}
+
+/// Pre-allocated activation buffers to avoid per-batch `input.to_vec()` allocations.
+struct ActivationBufferPool {
+    /// Buffer size = dim (model dimension, e.g., 14336 for Qwen3.5-122B)
+    buffer_size: usize,
+    /// Pool of reusable buffers (up to max_concurrent for thread safety)
+    buffers: Vec<Vec<f32>>,
+}
+
+impl ActivationBufferPool {
+    fn new(dim: usize, max_concurrent: usize) -> Self {
+        let mut buffers = Vec::with_capacity(max_concurrent);
+        for _ in 0..max_concurrent {
+            buffers.push(vec![0.0f32; dim]);
+        }
+        Self {
+            buffer_size: dim,
+            buffers,
+        }
+    }
+
+    /// Get a buffer by value (moves it into the caller's thread).
+    /// This eliminates per-batch allocation overhead.
+    fn get_buffer(&mut self) -> Vec<f32> {
+        self.buffers
+            .pop()
+            .unwrap_or_else(|| vec![0.0f32; self.buffer_size])
+    }
+
+    /// Return a buffer to the pool for reuse.
+    fn put_buffer(&mut self, mut buffer: Vec<f32>) {
+        if buffer.len() == self.buffer_size {
+            // Clear the buffer to prevent stale data from leaking between batches
+            buffer.fill(0.0);
+            self.buffers.push(buffer);
+        }
+    }
 }
 
 fn connect_worker_with_hello(
@@ -525,11 +584,20 @@ impl DistributedMoeCoordinator {
                 stats: RemoteWorkerStats::default(),
             });
         }
+        let dim = plan.inventory.dim;
+        let max_concurrent = plan
+            .nodes
+            .iter()
+            .filter(|n| n.role == ClusterNodeRole::Worker)
+            .count()
+            .max(1);
+
         Ok(Self {
             plan,
             activation_dtype,
             next_request_id: 1,
             remote_workers,
+            activation_buffer_pool: ActivationBufferPool::new(dim, max_concurrent),
         })
     }
 
@@ -609,7 +677,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         }
 
         let mut local_selected = Vec::new();
-        let mut remote_selected: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut remote_selected: Vec<(usize, Vec<usize>)> = Vec::new();
         let n_experts = self.plan.inventory.n_experts;
         for &(expert_idx, _) in selected {
             let plan_index = layer
@@ -628,11 +696,10 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                 {
                     local_selected.push((expert_idx, *route_weight));
                 }
+            } else if let Some(pos) = remote_selected.iter().position(|(n, _)| *n == node_index) {
+                remote_selected[pos].1.push(expert_idx);
             } else {
-                remote_selected
-                    .entry(node_index)
-                    .or_default()
-                    .push(expert_idx);
+                remote_selected.push((node_index, vec![expert_idx]));
             }
         }
 
@@ -650,119 +717,87 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
             )?;
         }
 
+        // ─── Concurrent batch: send to all workers in parallel, then collect ───
+        // Each spawned thread creates its own fresh connection and sends the batch.
+        // Results come back via mpsc channels.
+        let activation_dtype = self.activation_dtype;
+        let plan = &self.plan;
+        let mut batch_handles: Vec<(mpsc::Receiver<BatchTaskResult>, usize)> = Vec::new();
+
+        for (node_index, expert_ids) in &remote_selected {
+            let node_address = plan.nodes[*node_index].address.clone();
+            let address = self.remote_workers[*node_index].address.clone();
+            let stats = RemoteWorkerStats::default();
+            // Use pre-allocated buffer instead of allocating a new vector each time
+            let activation = self.activation_buffer_pool.get_buffer();
+            let expert_ids = expert_ids.clone();
+            let n_layers = plan.inventory.n_layers;
+            let n_experts = plan.inventory.n_experts;
+            let assigned_experts = plan
+                .assigned_experts_for_node(*node_index)
+                .collect::<Vec<_>>();
+
+            let (tx, rx) = mpsc::channel::<BatchTaskResult>();
+            let _handle = thread::spawn(move || {
+                let input = BatchTaskInput {
+                    address,
+                    activation_dtype,
+                    layer,
+                    expert_ids,
+                    activation,
+                    dim,
+                    n_layers,
+                    n_experts,
+                    assigned_experts,
+                    stats,
+                    node_address,
+                };
+                run_batch(input, tx);
+            });
+            batch_handles.push((rx, *node_index));
+        }
+
+        // Collect results from all concurrent batches
         let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
-        let mut next_request_id = self.next_request_id;
-        for client in &mut self.remote_workers {
-            let Some(expert_ids) = remote_selected.get(&client.node_index) else {
-                continue;
-            };
-            let request_id = next_request_id;
-            next_request_id = next_request_id.wrapping_add(1).max(1);
-            let request = ExpertBatchRequest {
-                token_pos: 0,
-                layer,
-                activation_dtype: self.activation_dtype,
-                dim,
-                expert_ids: expert_ids.clone(),
-                activation: input.to_vec(),
-            };
-            let payload = encode_expert_batch_request(&request)?;
-            let (message, wait_ns, wire_sent, wire_received) = {
-                let mut last_transport_error = None;
-                let mut result = None;
-                for attempt in 0..DEFAULT_REMOTE_RETRY_ATTEMPTS {
-                    let wire_sent = DISTRIBUTED_FRAME_HEADER_LEN + payload.len();
-                    let wait_start = Instant::now();
-                    match client.connection.send_message(
-                        FrameKind::ExpertBatchRequest,
-                        request_id,
-                        &payload,
-                    ) {
-                        Ok(()) => {}
-                        Err(err) => {
-                            last_transport_error = Some(err);
-                            if attempt + 1 < DEFAULT_REMOTE_RETRY_ATTEMPTS {
-                                client.reconnect()?;
-                                sleep(Duration::from_millis(
-                                    DEFAULT_REMOTE_RETRY_BACKOFF_MS * (attempt as u64 + 1),
-                                ));
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                    match client.connection.recv_message() {
-                        Ok(message) => {
-                            let wait_ns = wait_start.elapsed().as_nanos() as u64;
-                            let wire_received =
-                                DISTRIBUTED_FRAME_HEADER_LEN + message.payload.len();
-                            result = Some((message, wait_ns, wire_sent, wire_received));
-                            break;
-                        }
-                        Err(err) => {
-                            last_transport_error = Some(err);
-                            if attempt + 1 < DEFAULT_REMOTE_RETRY_ATTEMPTS {
-                                client.reconnect()?;
-                                sleep(Duration::from_millis(
-                                    DEFAULT_REMOTE_RETRY_BACKOFF_MS * (attempt as u64 + 1),
-                                ));
-                                continue;
-                            }
-                            break;
-                        }
-                    }
+        for (rx, node_index) in batch_handles {
+            let task_result = match rx.recv() {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(format!(
+                        "worker '{}' batch channel disconnected",
+                        plan.nodes[node_index].address
+                    ));
                 }
-                result.ok_or_else(|| {
-                    format!(
-                        "worker '{}' request failed after {} attempt(s): {}",
-                        client.address,
-                        DEFAULT_REMOTE_RETRY_ATTEMPTS,
-                        last_transport_error
-                            .unwrap_or_else(|| "unknown transport failure".to_string())
-                    )
-                })?
             };
-            client
-                .stats
-                .record_request(expert_ids.len(), wire_sent, wire_received, wait_ns);
-            record_distributed_remote_request(expert_ids.len(), wire_sent, wire_received, wait_ns);
-            if message.request_id != request_id {
+
+            // Return activation buffer to pool for reuse on next token
+            self.activation_buffer_pool
+                .put_buffer(task_result.activation.clone());
+
+            if let Some(ref err) = task_result.error {
                 return Err(format!(
-                    "worker '{}' returned mismatched request id: got {}, expected {}",
-                    self.plan.nodes[client.node_index].address, message.request_id, request_id
+                    "worker '{}' batch failed: {}",
+                    task_result.node_address, err
                 ));
             }
-            match message.kind {
-                FrameKind::ExpertBatchResponse => {
-                    let response = decode_expert_batch_response(&message.payload)?;
-                    if response.layer != layer || response.dim != dim {
-                        return Err(format!(
-                            "worker '{}' returned invalid response shape for layer {}",
-                            self.plan.nodes[client.node_index].address, layer
-                        ));
-                    }
-                    for (expert_idx, values) in
-                        response.expert_ids.into_iter().zip(response.outputs)
-                    {
-                        remote_outputs.insert(expert_idx, values);
-                    }
-                }
-                FrameKind::Error => {
-                    return Err(format!(
-                        "worker '{}' returned error: {}",
-                        self.plan.nodes[client.node_index].address,
-                        decode_error_frame(&message.payload)?
-                    ));
-                }
-                other => {
-                    return Err(format!(
-                        "worker '{}' returned unexpected frame {:?}",
-                        self.plan.nodes[client.node_index].address, other
-                    ));
-                }
+
+            // Record profiling counters
+            if task_result.bytes_sent > 0 {
+                record_distributed_remote_request(
+                    task_result.expert_ids.len(),
+                    task_result.bytes_sent,
+                    task_result.bytes_received,
+                    task_result.wait_ns,
+                );
+            }
+
+            // Populate remote_outputs with decoded expert outputs
+            for (expert_idx, values) in task_result.expert_ids.into_iter().zip(task_result.outputs)
+            {
+                remote_outputs.insert(expert_idx, values);
             }
         }
-        self.next_request_id = next_request_id;
+        self.next_request_id = 1; // Reset per-layer
 
         for &(expert_idx, route_weight) in selected {
             if let Some(values) = remote_outputs.get(&expert_idx) {
@@ -771,4 +806,168 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         }
         Ok(())
     }
+}
+
+/// Runs a single batch task: connects to worker, sends request, collects response.
+fn run_batch(input: BatchTaskInput, tx: mpsc::Sender<BatchTaskResult>) {
+    let BatchTaskInput {
+        address,
+        activation_dtype,
+        layer,
+        expert_ids,
+        activation,
+        dim,
+        n_layers,
+        n_experts,
+        assigned_experts,
+        mut stats,
+        node_address,
+    } = input;
+
+    // Build the HelloFrame for the worker handshake
+    let hello = HelloFrame {
+        node_address: address.clone(),
+        dim,
+        n_layers,
+        n_experts,
+        activation_dtype,
+        assigned_experts,
+    };
+
+    // Connect to the worker
+    let conn_result = connect_worker_with_hello(
+        &address,
+        Duration::from_secs(DEFAULT_REMOTE_TIMEOUT_SECS),
+        &hello,
+        &address,
+    );
+    let mut connection = match conn_result {
+        Ok((conn, _bsent, _brecv)) => conn,
+        Err(err) => {
+            let err_msg = err.clone();
+            let addr = node_address.clone();
+            let exp_ids = expert_ids.clone();
+            let result_clone = BatchTaskResult {
+                node_address: addr,
+                expert_ids: exp_ids,
+                outputs: vec![],
+                activation: activation.clone(),
+                bytes_sent: 0,
+                bytes_received: 0,
+                wait_ns: 0,
+                error: Some(err_msg),
+            };
+            tx.send(result_clone).expect("channel dropped");
+            return;
+        }
+    };
+
+    // Send request, retry on failure, decode response
+    let mut last_error: Option<String> = None;
+    let mut decoded_outputs: Vec<Vec<f32>> = Vec::new();
+    let mut wire_sent = 0usize;
+    let mut wire_received = 0usize;
+    let mut wait_ns = 0u64;
+
+    for attempt in 0..BATCH_RETRY_ATTEMPTS {
+        let request = ExpertBatchRequest {
+            token_pos: 0,
+            layer,
+            activation_dtype,
+            dim,
+            expert_ids: expert_ids.clone(),
+            activation: activation.clone(),
+        };
+        let payload = match encode_expert_batch_request(&request) {
+            Ok(p) => p,
+            Err(err) => {
+                last_error = Some(format!("encode: {}", err));
+                continue;
+            }
+        };
+
+        wire_sent = DISTRIBUTED_FRAME_HEADER_LEN + payload.len();
+        let wait_start = Instant::now();
+        match connection.send_message(FrameKind::ExpertBatchRequest, 0, &payload) {
+            Ok(()) => {}
+            Err(err) => {
+                last_error = Some(err);
+                if attempt + 1 < BATCH_RETRY_ATTEMPTS {
+                    continue;
+                }
+                break;
+            }
+        }
+        match connection.recv_message() {
+            Ok(message) => {
+                wait_ns = wait_start.elapsed().as_nanos() as u64;
+                wire_received = DISTRIBUTED_FRAME_HEADER_LEN + message.payload.len();
+                stats.record_request(expert_ids.len(), wire_sent, wire_received, wait_ns);
+
+                match message.kind {
+                    FrameKind::ExpertBatchResponse => {
+                        match decode_expert_batch_response(&message.payload) {
+                            Ok(response) => {
+                                if response.layer == layer && response.dim == dim {
+                                    decoded_outputs = response.outputs;
+                                } else {
+                                    last_error = Some(format!(
+                                        "invalid response shape: layer {} dim {}",
+                                        response.layer, response.dim
+                                    ));
+                                }
+                            }
+                            Err(err) => last_error = Some(err),
+                        }
+                    }
+                    FrameKind::Error => {
+                        if let Ok(msg) = decode_error_frame(&message.payload) {
+                            last_error = Some(msg);
+                        } else {
+                            last_error = Some("unknown error frame".to_string());
+                        }
+                    }
+                    other => {
+                        last_error = Some(format!("unexpected frame: {:?}", other));
+                    }
+                }
+                break;
+            }
+            Err(err) => {
+                last_error = Some(err);
+                if attempt + 1 < BATCH_RETRY_ATTEMPTS {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    let result_clone = BatchTaskResult {
+        node_address,
+        expert_ids: expert_ids.clone(),
+        outputs: decoded_outputs,
+        activation: activation.clone(),
+        bytes_sent: wire_sent,
+        bytes_received: wire_received,
+        wait_ns,
+        error: last_error,
+    };
+
+    tx.send(result_clone).expect("channel dropped");
+}
+/// Input data for a concurrent batch worker task.
+/// Spawned via `std::thread::spawn`.
+struct BatchTaskInput {
+    address: String,
+    activation_dtype: ActivationDtype,
+    layer: usize,
+    expert_ids: Vec<usize>,
+    activation: Vec<f32>,
+    dim: usize,
+    n_layers: usize,
+    n_experts: usize,
+    assigned_experts: Vec<(usize, usize)>,
+    stats: RemoteWorkerStats,
+    node_address: String,
 }

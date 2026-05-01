@@ -79,6 +79,7 @@ pub(crate) struct MoePlacementInventory {
     pub(crate) down_bytes_per_expert: usize,
     pub(crate) total_bytes_per_expert: usize,
     pub(crate) total_bytes_all_experts: usize,
+    pub(crate) placement_rotation_stride: usize, // New: controls local window rotation speed
 }
 
 #[derive(Clone, Debug)]
@@ -336,11 +337,16 @@ fn build_moe_placement_plan_from_inventory(
     let mut worker_order = worker_indices.clone();
 
     for layer in 0..inventory.n_layers {
+        // ─── Local expert window rotation ───
+        // Slow down rotation: shift the local window every `stride` layers instead of every layer.
+        // This keeps the same set of local experts across consecutive layers, reducing remote traffic.
+        let stride = inventory.placement_rotation_stride.max(1);
+        let rotation_group = layer / stride; // 0, 0, 0, 0, 1, 1, 1, 1, ... for stride=4
         let local_target = inventory.n_experts_used.max(1).min(inventory.n_experts);
         let local_offset = if inventory.n_experts == 0 {
             0
         } else {
-            layer
+            rotation_group
                 .checked_mul(local_target)
                 .map(|value| value % inventory.n_experts)
                 .unwrap_or(0)
@@ -365,8 +371,12 @@ fn build_moe_placement_plan_from_inventory(
             placed_local += 1;
         }
 
-        if !worker_order.is_empty() {
-            let rotate_by = (layer + placed_local) % worker_order.len();
+        // ─── Worker order rotation ───
+        // Rotate the worker order only when entering a new rotation group,
+        // not every layer. This keeps the same set of experts assigned to remote workers
+        // across consecutive layers within the same group.
+        if !worker_order.is_empty() && layer % stride == 0 {
+            let rotate_by = (layer / stride + placed_local) % worker_order.len();
             worker_order.rotate_left(rotate_by);
         }
 
@@ -461,6 +471,17 @@ pub(crate) fn build_moe_placement_plan(
     let checkpoint_bytes = gguf.mapped.len;
     let non_expert_checkpoint_bytes = checkpoint_bytes.saturating_sub(total_bytes_all_experts);
 
+    // Default rotation stride: slow down rotation for deeper models.
+    // stride=4 means each local node keeps the same experts for 4 consecutive layers,
+    // reducing remote traffic on bandwidth-constrained networks.
+    let placement_rotation_stride = if config.n_layers >= 48 {
+        4
+    } else if config.n_layers >= 24 {
+        2
+    } else {
+        1
+    };
+
     let inventory = MoePlacementInventory {
         n_layers: config.n_layers,
         n_experts: config.n_experts,
@@ -474,6 +495,7 @@ pub(crate) fn build_moe_placement_plan(
         down_bytes_per_expert,
         total_bytes_per_expert,
         total_bytes_all_experts,
+        placement_rotation_stride,
     };
 
     build_moe_placement_plan_from_inventory(inventory, cluster)
@@ -528,6 +550,7 @@ mod tests {
             down_bytes_per_expert: 10,
             total_bytes_per_expert: 30,
             total_bytes_all_experts: 4 * 8 * 30,
+            placement_rotation_stride: 2,
         }
     }
 

@@ -655,10 +655,10 @@ struct Cli {
     #[arg(
         long = "distributed-transport-dtype",
         env = "GGUF_DISTRIBUTED_TRANSPORT_DTYPE",
-        default_value = "bf16",
+        default_value = "q8",
         value_parser = parse_distributed_transport_dtype,
         value_name = "bf16|fp16|q8",
-        help = "Activation transport dtype for distributed MoE traffic"
+        help = "Activation transport dtype for distributed MoE traffic (default: q8)"
     )]
     distributed_transport_dtype: CliDistributedTransportDtype,
 
@@ -892,6 +892,20 @@ struct Cli {
     x86_avx512vnni_q8: Option<bool>,
 
     #[arg(
+        long = "x86-avx512",
+        env = "GGUF_X86_AVX512",
+        value_parser = parse_boolish
+    )]
+    x86_avx512: Option<bool>,
+
+    #[arg(
+        long = "x86-avx512-bf16",
+        env = "GGUF_X86_AVX512BF16",
+        value_parser = parse_boolish
+    )]
+    x86_avx512bf16: Option<bool>,
+
+    #[arg(
         long = "layer-debug",
         hide = true,
         env = "GGUF_LAYER_DEBUG",
@@ -953,6 +967,7 @@ struct Cli {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct CliOptions {
     pub(crate) model: String,
     pub(crate) prompt: String,
@@ -1012,6 +1027,8 @@ pub(crate) struct CliOptions {
     pub(crate) x86_avxvnni: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_avx512vnni_q8: Option<bool>,
+    pub(crate) x86_avx512: Option<bool>,
+    pub(crate) x86_avx512bf16: Option<bool>,
     pub(crate) layer_debug: Option<bool>,
     pub(crate) layer_debug_pos: Option<usize>,
     pub(crate) rag_encoder: Option<String>,
@@ -1165,6 +1182,8 @@ impl CliOptions {
             x86_avxvnni: cli.x86_avxvnni,
             #[cfg(target_arch = "x86_64")]
             x86_avx512vnni_q8: cli.x86_avx512vnni_q8,
+            x86_avx512: cli.x86_avx512,
+            x86_avx512bf16: cli.x86_avx512bf16,
             layer_debug: cli.layer_debug,
             layer_debug_pos: cli.layer_debug_pos,
             rag_encoder: cli.rag_encoder,
