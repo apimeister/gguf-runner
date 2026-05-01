@@ -964,8 +964,13 @@ unsafe fn scale_simd_inplace(x: *mut f32, alpha: f32, n: usize) {
     }
 }
 
+/// Scale all elements in `x` by `alpha`: `x[i] *= alpha`.
 #[inline(always)]
 pub(crate) fn scale_slice_inplace(x: &mut [f32], alpha: f32) {
+    debug_assert!(
+        !x.is_empty(),
+        "scale_slice_inplace: input must not be empty"
+    );
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     unsafe {
         scale_simd_inplace(x.as_mut_ptr(), alpha, x.len());

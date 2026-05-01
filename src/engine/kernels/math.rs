@@ -9,7 +9,12 @@ use crate::engine::switches::{
 };
 use crate::engine::types::{Config, RunState, TransformerWeights};
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
+/// Accumulate `b[..size]` into `a[..size]`: `a[i] += b[i]`.
 pub(crate) fn accum(a: &mut [f32], b: &[f32], size: usize) {
+    debug_assert!(
+        size <= a.len() && size <= b.len(),
+        "accum: size exceeds array bounds"
+    );
     use crate::engine::kernels::axpy_inplace;
     axpy_inplace(&mut a[..size], 1.0, &b[..size]);
 }
@@ -19,6 +24,13 @@ pub(crate) fn accum(a: &mut [f32], b: &[f32], size: usize) {
 /// aarch64: NEON 4-element (vectorized).
 /// Other: scalar.
 pub(crate) fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
+    debug_assert_eq!(o.len(), x.len(), "rmsnorm: o and x must have same length");
+    debug_assert_eq!(
+        o.len(),
+        weight.len(),
+        "rmsnorm: o and weight must have same length"
+    );
+    debug_assert!(size <= o.len(), "rmsnorm: size exceeds array bounds");
     #[cfg(target_arch = "x86_64")]
     if size >= 8 {
         return unsafe {
@@ -91,6 +103,15 @@ pub(crate) fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps
 /// aarch64: NEON 4-element (vectorized).
 /// Other: scalar.
 pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize, eps: f32) {
+    debug_assert_eq!(
+        x.len(),
+        weight.len(),
+        "rmsnorm_inplace: x and weight must have same length"
+    );
+    debug_assert!(
+        size <= x.len(),
+        "rmsnorm_inplace: size exceeds array bounds"
+    );
     #[cfg(target_arch = "x86_64")]
     if size >= 8 {
         return unsafe {
@@ -429,6 +450,20 @@ pub(crate) fn layernorm_inplace(
     size: usize,
     eps: f32,
 ) {
+    debug_assert_eq!(
+        x.len(),
+        weight.len(),
+        "layernorm_inplace: x and weight must have same length"
+    );
+    debug_assert_eq!(
+        x.len(),
+        bias.len(),
+        "layernorm_inplace: x and bias must have same length"
+    );
+    debug_assert!(
+        size <= x.len(),
+        "layernorm_inplace: size exceeds array bounds"
+    );
     let mean = x[..size].iter().sum::<f32>() / size as f32;
     let var = x[..size]
         .iter()
@@ -463,7 +498,19 @@ pub(crate) fn rmsnorm_per_head_gemma_inplace(
     }
 }
 
+/// Softmax: `x[i] = exp(x[i] - max) / Σexp(x[j] - max)`.
+/// x86_64: AVX-2 (8-wide) or AVX-512 (16-wide) with range-reduced polynomial exp.
+/// aarch64: NEON 4-element with degree-5 polynomial exp approximation.
+/// Other: scalar fallback using libm expf.
 pub(crate) fn softmax(x: &mut [f32], size: usize) {
+    debug_assert!(!x.is_empty(), "softmax: input must not be empty");
+    debug_assert!(size <= x.len(), "softmax: size exceeds array bounds");
+    #[cfg(target_arch = "x86_64")]
+    if size >= 8 {
+        return unsafe {
+            softmax_x86_64(x, size);
+        };
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -539,7 +586,8 @@ pub(crate) fn softmax(x: &mut [f32], size: usize) {
             i += 1;
         }
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         let mut max_val = x[0];
         for &v in x.iter().take(size).skip(1) {
@@ -556,6 +604,394 @@ pub(crate) fn softmax(x: &mut [f32], size: usize) {
         for i in 0..size {
             x[i] *= inv_sum;
         }
+    }
+}
+
+// ─── x86_64 SIMD paths for softmax ───
+
+/// Dispatch softmax on x86_64: AVX-512 (16-wide) or AVX-2 (8-wide).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn softmax_x86_64(x: &mut [f32], size: usize) {
+    use crate::engine::switches::use_x86_avx512f;
+    use std::arch::x86_64::*;
+
+    if use_x86_avx512f() {
+        softmax_avx512(x, size);
+    } else {
+        softmax_avx2(x, size);
+    }
+}
+
+/// AVX-2 (8-wide) softmax: max scan, exp with polynomial, normalize.
+/// Uses same range-reduced degree-5 Taylor series exp as aarch64 NEON.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
+    use std::arch::x86_64::*;
+
+    const EXP_LO: f32 = -88.0;
+    const LN2_HI: f32 = 0.693_359_4_f32;
+    const LN2_LO: f32 = -2.121_944_4e-4_f32;
+
+    let mut i = 0usize;
+    let mut acc_max = _mm256_set1_ps(f32::NEG_INFINITY);
+
+    // Pass 1: vectorized max scan (8 elements per iteration, 2×4-element reductions)
+    while i + 8 <= size {
+        let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
+        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
+        acc_max = _mm256_max_ps(acc_max, v0);
+        acc_max = _mm256_max_ps(acc_max, v1);
+        i += 8;
+    }
+
+    // Horizontal max from accumulator
+    let mut tmp_max = [0.0f32; 8];
+    _mm256_storeu_ps(tmp_max.as_mut_ptr(), acc_max);
+    let mut max_val = tmp_max[0];
+    for &v in &tmp_max[1..] {
+        if v > max_val {
+            max_val = v;
+        }
+    }
+
+    // Scalar tail for max
+    while i < size {
+        let v = *x.as_ptr().add(i);
+        if v > max_val {
+            max_val = v;
+        }
+        i += 1;
+    }
+
+    // Pass 2: exp(x[i] - max), accumulate sum
+    // Range-reduced polynomial exp (same as silu_and_mul)
+    let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
+    let ln2_hi = _mm256_set1_ps(LN2_HI);
+    let ln2_lo = _mm256_set1_ps(LN2_LO);
+    let one = _mm256_set1_ps(1.0_f32);
+    let c2 = _mm256_set1_ps(0.5_f32);
+    let c3 = _mm256_set1_ps(1.0_f32 / 6.0_f32);
+    let c4 = _mm256_set1_ps(1.0_f32 / 24.0_f32);
+    let c5 = _mm256_set1_ps(1.0_f32 / 120.0_f32);
+    let exp_lo = _mm256_set1_ps(EXP_LO);
+    let max_vec = _mm256_set1_ps(max_val);
+    let mut acc_sum = _mm256_setzero_ps();
+    let ptr = x.as_mut_ptr();
+    i = 0;
+
+    while i + 8 <= size {
+        // x[i] - max, clamped to [-88, 0]
+        let xv = _mm256_max_ps(
+            _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i)), max_vec),
+            _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i + 4)), max_vec),
+        );
+        let xv2 = _mm256_max_ps(
+            _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i + 4)), max_vec),
+            exp_lo,
+        );
+        let xv = _mm256_min_ps(
+            _mm256_max_ps(_mm256_sub_ps(_mm256_loadu_ps(ptr.add(i)), max_vec), exp_lo),
+            _mm256_setzero_ps(),
+        );
+        let xv2 = _mm256_min_ps(
+            _mm256_max_ps(
+                _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i + 4)), max_vec),
+                exp_lo,
+            ),
+            _mm256_setzero_ps(),
+        );
+
+        // Range reduction
+        let n_f = _mm256_round_ps(
+            _mm256_mul_ps(xv, log2e),
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        );
+        let n_f2 = _mm256_round_ps(
+            _mm256_mul_ps(xv2, log2e),
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        );
+
+        let r = _mm256_fmadd_ps(
+            _mm256_sub_ps(xv, _mm256_mul_ps(n_f, ln2_hi)),
+            _mm256_set1_ps(-LN2_LO),
+            _mm256_setzero_ps(),
+        );
+        let r2 = _mm256_fmadd_ps(
+            _mm256_sub_ps(xv2, _mm256_mul_ps(n_f2, ln2_hi)),
+            _mm256_set1_ps(-LN2_LO),
+            _mm256_setzero_ps(),
+        );
+
+        // Horner polynomial: 1 + r*(1 + r*(c2 + r*(c3 + r*(c4 + r*c5))))
+        let poly = _mm256_add_ps(
+            one,
+            _mm256_mul_ps(
+                r,
+                _mm256_add_ps(
+                    one,
+                    _mm256_mul_ps(
+                        r,
+                        _mm256_add_ps(
+                            c2,
+                            _mm256_mul_ps(
+                                r,
+                                _mm256_add_ps(
+                                    c3,
+                                    _mm256_mul_ps(r, _mm256_add_ps(c4, _mm256_mul_ps(r, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        let poly2 = _mm256_add_ps(
+            one,
+            _mm256_mul_ps(
+                r2,
+                _mm256_add_ps(
+                    one,
+                    _mm256_mul_ps(
+                        r2,
+                        _mm256_add_ps(
+                            c2,
+                            _mm256_mul_ps(
+                                r2,
+                                _mm256_add_ps(
+                                    c3,
+                                    _mm256_mul_ps(r2, _mm256_add_ps(c4, _mm256_mul_ps(r2, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        // Scale by 2^n
+        let ni = _mm256_cvttps_epi32(n_f);
+        let ni2 = _mm256_cvttps_epi32(n_f2);
+        let biased_exp = _mm256_add_epi32(ni, _mm256_set1_epi32(127));
+        let biased_exp2 = _mm256_add_epi32(ni2, _mm256_set1_epi32(127));
+        let p2n = _mm256_castsi256_ps(_mm256_slli_epi32(biased_exp, 23));
+        let p2n2 = _mm256_castsi256_ps(_mm256_slli_epi32(biased_exp2, 23));
+        let ev = _mm256_mul_ps(poly, p2n);
+        let ev2 = _mm256_mul_ps(poly2, p2n2);
+
+        acc_sum = _mm256_add_ps(acc_sum, _mm256_add_ps(ev, ev2));
+        _mm256_storeu_ps(ptr.add(i), ev);
+        _mm256_storeu_ps(ptr.add(i + 4), ev2);
+        i += 8;
+    }
+
+    // Scalar tail for exp
+    let mut sum = 0.0f32;
+    while i < size {
+        let v = (x.as_ptr().add(i) as *const f32).read() - max_val;
+        let ev = v.exp();
+        (ptr as *mut f32).add(i).write(ev);
+        sum += ev;
+        i += 1;
+    }
+
+    // Horizontal sum from accumulator
+    let mut tmp_sum = [0.0f32; 8];
+    _mm256_storeu_ps(tmp_sum.as_mut_ptr(), acc_sum);
+    sum += tmp_sum.iter().sum::<f32>();
+
+    // Pass 3: normalize
+    let inv_sum = 1.0 / sum;
+    let inv_sum_vec = _mm256_set1_ps(inv_sum);
+    i = 0;
+    while i + 8 <= size {
+        let v0 = _mm256_loadu_ps(ptr.add(i));
+        let v1 = _mm256_loadu_ps(ptr.add(i + 4));
+        _mm256_storeu_ps(ptr.add(i), _mm256_mul_ps(v0, inv_sum_vec));
+        _mm256_storeu_ps(ptr.add(i + 4), _mm256_mul_ps(v1, inv_sum_vec));
+        i += 8;
+    }
+
+    // Scalar tail for normalize
+    while i < size {
+        *ptr.add(i) *= inv_sum;
+        i += 1;
+    }
+}
+
+/// AVX-512 (16-wide) softmax: same algorithm as AVX-2 but 16 elements per iteration.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
+    use std::arch::x86_64::*;
+
+    const EXP_LO: f32 = -88.0;
+    const LN2_HI: f32 = 0.693_359_4_f32;
+    const LN2_LO: f32 = -2.121_944_4e-4_f32;
+
+    let mut i = 0usize;
+    let mut acc_max = _mm512_set1_ps(f32::NEG_INFINITY);
+
+    // Pass 1: vectorized max scan (16 elements per iteration)
+    while i + 16 <= size {
+        let v0 = _mm512_loadu_ps(x.as_ptr().add(i));
+        let v1 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
+        acc_max = _mm512_max_ps(acc_max, v0);
+        acc_max = _mm512_max_ps(acc_max, v1);
+        i += 16;
+    }
+
+    // Horizontal max from accumulator
+    let mut tmp_max = [0.0f32; 16];
+    _mm512_storeu_ps(tmp_max.as_mut_ptr(), acc_max);
+    let mut max_val = tmp_max[0];
+    for &v in &tmp_max[1..] {
+        if v > max_val {
+            max_val = v;
+        }
+    }
+
+    // Scalar tail for max
+    while i < size {
+        let v = *x.as_ptr().add(i);
+        if v > max_val {
+            max_val = v;
+        }
+        i += 1;
+    }
+
+    // Pass 2: exp(x[i] - max), accumulate sum
+    let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
+    let ln2_hi = _mm512_set1_ps(LN2_HI);
+    let ln2_lo = _mm512_set1_ps(LN2_LO);
+    let one = _mm512_set1_ps(1.0_f32);
+    let c2 = _mm512_set1_ps(0.5_f32);
+    let c3 = _mm512_set1_ps(1.0_f32 / 6.0_f32);
+    let c4 = _mm512_set1_ps(1.0_f32 / 24.0_f32);
+    let c5 = _mm512_set1_ps(1.0_f32 / 120.0_f32);
+    let exp_lo = _mm512_set1_ps(EXP_LO);
+    let max_vec = _mm512_set1_ps(max_val);
+    let mut acc_sum = _mm512_setzero_ps();
+    let ptr = x.as_mut_ptr();
+    i = 0;
+
+    while i + 16 <= size {
+        let xv = _mm512_min_ps(
+            _mm512_max_ps(_mm512_sub_ps(_mm512_loadu_ps(ptr.add(i)), max_vec), exp_lo),
+            _mm512_setzero_ps(),
+        );
+        let xv2 = _mm512_min_ps(
+            _mm512_max_ps(
+                _mm512_sub_ps(_mm512_loadu_ps(ptr.add(i + 8)), max_vec),
+                exp_lo,
+            ),
+            _mm512_setzero_ps(),
+        );
+
+        let n_f = _mm512_roundscale_ps(_mm512_mul_ps(xv, log2e), _MM_FROUND_TO_NEAREST_INT);
+        let n_f2 = _mm512_roundscale_ps(_mm512_mul_ps(xv2, log2e), _MM_FROUND_TO_NEAREST_INT);
+
+        let r = _mm512_fmadd_ps(
+            _mm512_sub_ps(xv, _mm512_mul_ps(n_f, ln2_hi)),
+            _mm512_set1_ps(-LN2_LO),
+            _mm512_setzero_ps(),
+        );
+        let r2 = _mm512_fmadd_ps(
+            _mm512_sub_ps(xv2, _mm512_mul_ps(n_f2, ln2_hi)),
+            _mm512_set1_ps(-LN2_LO),
+            _mm512_setzero_ps(),
+        );
+
+        let poly = _mm512_add_ps(
+            one,
+            _mm512_mul_ps(
+                r,
+                _mm512_add_ps(
+                    one,
+                    _mm512_mul_ps(
+                        r,
+                        _mm512_add_ps(
+                            c2,
+                            _mm512_mul_ps(
+                                r,
+                                _mm512_add_ps(
+                                    c3,
+                                    _mm512_mul_ps(r, _mm512_add_ps(c4, _mm512_mul_ps(r, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        let poly2 = _mm512_add_ps(
+            one,
+            _mm512_mul_ps(
+                r2,
+                _mm512_add_ps(
+                    one,
+                    _mm512_mul_ps(
+                        r2,
+                        _mm512_add_ps(
+                            c2,
+                            _mm512_mul_ps(
+                                r2,
+                                _mm512_add_ps(
+                                    c3,
+                                    _mm512_mul_ps(r2, _mm512_add_ps(c4, _mm512_mul_ps(r2, c5))),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+
+        let ni = _mm512_cvttps_epi32(n_f);
+        let ni2 = _mm512_cvttps_epi32(n_f2);
+        let biased_exp = _mm512_add_epi32(ni, _mm512_set1_epi32(127));
+        let biased_exp2 = _mm512_add_epi32(ni2, _mm512_set1_epi32(127));
+        let p2n = _mm512_castsi512_ps(_mm512_slli_epi32(biased_exp, 23));
+        let p2n2 = _mm512_castsi512_ps(_mm512_slli_epi32(biased_exp2, 23));
+        let ev = _mm512_mul_ps(poly, p2n);
+        let ev2 = _mm512_mul_ps(poly2, p2n2);
+
+        acc_sum = _mm512_add_ps(acc_sum, _mm512_add_ps(ev, ev2));
+        _mm512_storeu_ps(ptr.add(i), ev);
+        _mm512_storeu_ps(ptr.add(i + 8), ev2);
+        i += 16;
+    }
+
+    // Scalar tail
+    let mut sum = 0.0f32;
+    while i < size {
+        let v = (ptr as *const f32).add(i).read() - max_val;
+        let ev = v.exp();
+        (ptr as *mut f32).add(i).write(ev);
+        sum += ev;
+        i += 1;
+    }
+
+    let mut tmp_sum = [0.0f32; 16];
+    _mm512_storeu_ps(tmp_sum.as_mut_ptr(), acc_sum);
+    sum += tmp_sum.iter().sum::<f32>();
+
+    // Pass 3: normalize
+    let inv_sum = 1.0 / sum;
+    let inv_sum_vec = _mm512_set1_ps(inv_sum);
+    i = 0;
+    while i + 16 <= size {
+        let v0 = _mm512_loadu_ps(ptr.add(i));
+        let v1 = _mm512_loadu_ps(ptr.add(i + 8));
+        _mm512_storeu_ps(ptr.add(i), _mm512_mul_ps(v0, inv_sum_vec));
+        _mm512_storeu_ps(ptr.add(i + 8), _mm512_mul_ps(v1, inv_sum_vec));
+        i += 16;
+    }
+
+    while i < size {
+        *ptr.add(i) *= inv_sum;
+        i += 1;
     }
 }
 
@@ -1139,6 +1575,10 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
 /// Zero any NaN/Inf elements in `x` in-place.
 /// aarch64: 4-wide NEON bitmask (no branches, no exp).
 pub(crate) fn sanitize_finite_inplace(x: &mut [f32]) {
+    debug_assert!(
+        !x.is_empty(),
+        "sanitize_finite_inplace: input must not be empty"
+    );
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -1171,8 +1611,10 @@ pub(crate) fn sanitize_finite_inplace(x: &mut [f32]) {
     }
 }
 
+/// L2 norm of vector x: `sqrt(Σx[i]²)`.
 #[inline(always)]
 pub(crate) fn l2_norm(x: &[f32]) -> f32 {
+    debug_assert!(!x.is_empty(), "l2_norm: input must not be empty");
     let mut ss = 0.0f32;
     for &v in x {
         ss += v * v;
