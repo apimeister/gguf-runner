@@ -465,9 +465,83 @@ impl ActivationBufferPool {
     fn put_buffer(&mut self, mut buffer: Vec<f32>) {
         if buffer.len() == self.buffer_size {
             // Clear the buffer to prevent stale data from leaking between batches
-            buffer.fill(0.0);
+            fill_simd_inplace(&mut buffer);
             self.buffers.push(buffer);
         }
+    }
+}
+
+/// Fill buffer with zeros using SIMD (AVX-2/AVX-512) when size permits.
+/// Avoids per-element branch overhead for large activations.
+#[inline]
+fn fill_simd_inplace(x: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if x.len() >= 8 {
+        return unsafe {
+            fill_simd_x86_64(x);
+        };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        x.fill(0.0);
+    }
+}
+
+/// x86_64 dispatch for SIMD fill.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn fill_simd_x86_64(x: &mut [f32]) {
+    use crate::engine::switches::use_x86_avx512f;
+    if use_x86_avx512f() {
+        fill_simd_avx512(x);
+    } else {
+        fill_simd_avx2(x);
+    }
+}
+
+/// AVX-2 (8-wide) SIMD fill with zeros.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn fill_simd_avx2(x: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let n = x.len();
+    let ptr = x.as_mut_ptr();
+    let zero = _mm256_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 8 <= n {
+        _mm256_storeu_ps(ptr.add(i), zero);
+        i += 8;
+    }
+
+    // Scalar tail
+    while i < n {
+        ptr.add(i).write(0.0);
+        i += 1;
+    }
+}
+
+/// AVX-512 (16-wide) SIMD fill with zeros.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn fill_simd_avx512(x: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let n = x.len();
+    let ptr = x.as_mut_ptr();
+    let zero = _mm512_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 16 <= n {
+        _mm512_storeu_ps(ptr.add(i), zero);
+        i += 16;
+    }
+
+    // Scalar tail
+    while i < n {
+        ptr.add(i).write(0.0);
+        i += 1;
     }
 }
 

@@ -646,6 +646,34 @@ unsafe fn dot_f32_avx2_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
     sum
 }
 
+/// AVX-512 (16-wide) dot product: 16 elements per iteration.
+/// Uses 2×16-wide accumulation for better ILP.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl,fma")]
+unsafe fn dot_f32_avx512_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
+    let mut i = 0usize;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+    while i + 16 <= n {
+        let a0 = _mm512_loadu_ps(a.add(i));
+        let b0 = _mm512_loadu_ps(b.add(i));
+        let a1 = _mm512_loadu_ps(a.add(i + 8));
+        let b1 = _mm512_loadu_ps(b.add(i + 8));
+        acc0 = _mm512_fmadd_ps(a0, b0, acc0);
+        acc1 = _mm512_fmadd_ps(a1, b1, acc1);
+        i += 16;
+    }
+    let acc = _mm512_add_ps(acc0, acc1);
+    let mut tmp = [0.0f32; 16];
+    _mm512_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut sum = tmp.iter().copied().sum::<f32>();
+    while i < n {
+        sum += *a.add(i) * *b.add(i);
+        i += 1;
+    }
+    sum
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,f16c,fma")]
 unsafe fn vec_dot_f16_f16c_prefix(x: *const f32, w: *const u8, n: usize) -> f32 {
@@ -767,6 +795,9 @@ unsafe fn dot_q4_nibbles_pair_avx2_ptr(
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dot_f32_simd_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
+    if use_x86_avx512f() {
+        return dot_f32_avx512_ptr(a, b, n);
+    }
     if use_x86_avx2_fma() {
         return dot_f32_avx2_ptr(a, b, n);
     }
