@@ -20,8 +20,6 @@ use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -362,20 +360,6 @@ pub(crate) fn compute_local_selected_experts(
     Ok(())
 }
 
-/// Results sent back from a concurrent batch worker task.
-#[derive(Debug, Clone)]
-struct BatchTaskResult {
-    node_address: String,
-    expert_ids: Vec<usize>,
-    outputs: Vec<Vec<f32>>,
-    /// Activation buffer returned to pool after use.
-    activation: Vec<f32>,
-    bytes_sent: usize,
-    bytes_received: usize,
-    wait_ns: u64,
-    error: Option<String>,
-}
-
 #[allow(dead_code)]
 struct RemoteWorkerClient {
     node_index: usize,
@@ -411,6 +395,8 @@ struct RemoteWorkerStats {
     wait_ns: u64,
 }
 
+type RemoteBatchReply = (Vec<Vec<f32>>, usize, usize, u64);
+
 impl RemoteWorkerStats {
     fn record_request(
         &mut self,
@@ -430,7 +416,6 @@ impl RemoteWorkerStats {
 pub(crate) struct DistributedMoeCoordinator {
     plan: MoePlacementPlan,
     activation_dtype: ActivationDtype,
-    next_request_id: u64,
     remote_workers: Vec<RemoteWorkerClient>,
     activation_buffer_pool: ActivationBufferPool,
 }
@@ -671,7 +656,6 @@ impl DistributedMoeCoordinator {
         Ok(Self {
             plan,
             activation_dtype,
-            next_request_id: 1,
             remote_workers,
             activation_buffer_pool: ActivationBufferPool::new(dim, max_concurrent),
         })
@@ -793,98 +777,44 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
             )?;
         }
 
-        // ─── Concurrent batch: send to all workers in parallel, then collect ───
-        // Each spawned thread creates its own fresh connection and sends the batch.
-        // Results come back via mpsc channels.
-        let activation_dtype = self.activation_dtype;
-        let plan = &self.plan;
-        let mut batch_handles: Vec<(mpsc::Receiver<BatchTaskResult>, usize)> = Vec::new();
-
+        let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
         for (node_index, expert_ids) in &remote_selected {
-            let node_address = plan.nodes[*node_index].address.clone();
-            let address = self
+            let node_address = self.plan.nodes[*node_index].address.clone();
+            let worker = self
                 .remote_workers
-                .iter()
+                .iter_mut()
                 .find(|worker| worker.node_index == *node_index)
                 .ok_or_else(|| {
                     format!(
                         "distributed worker '{}' is missing an active coordinator connection",
                         node_address
                     )
-                })?
-                .address
-                .clone();
-            let stats = RemoteWorkerStats::default();
-            // Use pre-allocated buffer instead of allocating a new vector each time
-            let activation = self.activation_buffer_pool.get_buffer();
-            let expert_ids = expert_ids.clone();
-            let n_layers = plan.inventory.n_layers;
-            let n_experts = plan.inventory.n_experts;
-            let assigned_experts = plan
-                .assigned_experts_for_node(*node_index)
-                .collect::<Vec<_>>();
-
-            let (tx, rx) = mpsc::channel::<BatchTaskResult>();
-            let _handle = thread::spawn(move || {
-                let input = BatchTaskInput {
-                    address,
-                    activation_dtype,
-                    layer,
-                    expert_ids,
-                    activation,
-                    dim,
-                    n_layers,
-                    n_experts,
-                    assigned_experts,
-                    stats,
-                    node_address,
-                };
-                run_batch(input, tx);
-            });
-            batch_handles.push((rx, *node_index));
-        }
-
-        // Collect results from all concurrent batches
-        let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
-        for (rx, node_index) in batch_handles {
-            let task_result = match rx.recv() {
-                Ok(result) => result,
-                Err(_) => {
-                    return Err(format!(
-                        "worker '{}' batch channel disconnected",
-                        plan.nodes[node_index].address
-                    ));
-                }
-            };
-
-            // Return activation buffer to pool for reuse on next token
-            self.activation_buffer_pool
-                .put_buffer(task_result.activation);
-
-            if let Some(ref err) = task_result.error {
-                return Err(format!(
-                    "worker '{}' batch failed: {}",
-                    task_result.node_address, err
-                ));
-            }
-
-            // Record profiling counters
-            if task_result.bytes_sent > 0 {
+                })?;
+            let mut activation = self.activation_buffer_pool.get_buffer();
+            activation[..dim].copy_from_slice(&input[..dim]);
+            let batch_result = request_remote_batch(
+                worker,
+                layer,
+                self.activation_dtype,
+                dim,
+                expert_ids,
+                &activation,
+            );
+            self.activation_buffer_pool.put_buffer(activation);
+            let (outputs, bytes_sent, bytes_received, wait_ns) = batch_result
+                .map_err(|err| format!("worker '{}' batch failed: {}", node_address, err))?;
+            if bytes_sent > 0 {
                 record_distributed_remote_request(
-                    task_result.expert_ids.len(),
-                    task_result.bytes_sent,
-                    task_result.bytes_received,
-                    task_result.wait_ns,
+                    expert_ids.len(),
+                    bytes_sent,
+                    bytes_received,
+                    wait_ns,
                 );
             }
-
-            // Populate remote_outputs with decoded expert outputs
-            for (expert_idx, values) in task_result.expert_ids.into_iter().zip(task_result.outputs)
-            {
+            for (expert_idx, values) in expert_ids.iter().copied().zip(outputs) {
                 remote_outputs.insert(expert_idx, values);
             }
         }
-        self.next_request_id = 1; // Reset per-layer
 
         for &(expert_idx, route_weight) in selected {
             if let Some(values) = remote_outputs.get(&expert_idx) {
@@ -895,168 +825,76 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
     }
 }
 
-/// Runs a single batch task: connects to worker, sends request, collects response.
-fn run_batch(input: BatchTaskInput, tx: mpsc::Sender<BatchTaskResult>) {
-    let BatchTaskInput {
-        address,
-        activation_dtype,
-        layer,
-        expert_ids,
-        activation,
-        dim,
-        n_layers,
-        n_experts,
-        assigned_experts,
-        mut stats,
-        node_address,
-    } = input;
-
-    // Build the HelloFrame for the worker handshake
-    let hello = HelloFrame {
-        node_address: address.clone(),
-        dim,
-        n_layers,
-        n_experts,
-        activation_dtype,
-        assigned_experts,
-    };
-
-    // Connect to the worker
-    let conn_result = connect_worker_with_hello(
-        &address,
-        Duration::from_secs(DEFAULT_REMOTE_TIMEOUT_SECS),
-        &hello,
-        &address,
-    );
-    let mut connection = match conn_result {
-        Ok((conn, _bsent, _brecv)) => conn,
-        Err(err) => {
-            let err_msg = err.clone();
-            let addr = node_address.clone();
-            let exp_ids = expert_ids.clone();
-            let result_clone = BatchTaskResult {
-                node_address: addr,
-                expert_ids: exp_ids,
-                outputs: vec![],
-                activation: activation.clone(),
-                bytes_sent: 0,
-                bytes_received: 0,
-                wait_ns: 0,
-                error: Some(err_msg),
-            };
-            tx.send(result_clone).expect("channel dropped");
-            return;
-        }
-    };
-
-    // Send request, retry on failure, decode response
+fn request_remote_batch(
+    worker: &mut RemoteWorkerClient,
+    layer: usize,
+    activation_dtype: ActivationDtype,
+    dim: usize,
+    expert_ids: &[usize],
+    activation: &[f32],
+) -> Result<RemoteBatchReply, String> {
     let mut last_error: Option<String> = None;
-    let mut decoded_outputs: Vec<Vec<f32>> = Vec::new();
-    let mut wire_sent = 0usize;
-    let mut wire_received = 0usize;
-    let mut wait_ns = 0u64;
-
     for attempt in 0..BATCH_RETRY_ATTEMPTS {
         let request = ExpertBatchRequest {
             token_pos: 0,
             layer,
             activation_dtype,
             dim,
-            expert_ids: expert_ids.clone(),
-            activation: activation.clone(),
+            expert_ids: expert_ids.to_vec(),
+            activation: activation.to_vec(),
         };
-        let payload = match encode_expert_batch_request(&request) {
-            Ok(p) => p,
-            Err(err) => {
-                last_error = Some(format!("encode: {}", err));
+        let payload =
+            encode_expert_batch_request(&request).map_err(|err| format!("encode: {err}"))?;
+        let wire_sent = DISTRIBUTED_FRAME_HEADER_LEN + payload.len();
+        let wait_start = Instant::now();
+        if let Err(err) = worker
+            .connection
+            .send_message(FrameKind::ExpertBatchRequest, 0, &payload)
+        {
+            last_error = Some(err);
+            if attempt + 1 < BATCH_RETRY_ATTEMPTS {
+                worker.reconnect()?;
                 continue;
             }
-        };
-
-        wire_sent = DISTRIBUTED_FRAME_HEADER_LEN + payload.len();
-        let wait_start = Instant::now();
-        match connection.send_message(FrameKind::ExpertBatchRequest, 0, &payload) {
-            Ok(()) => {}
-            Err(err) => {
-                last_error = Some(err);
-                if attempt + 1 < BATCH_RETRY_ATTEMPTS {
-                    continue;
-                }
-                break;
-            }
+            break;
         }
-        match connection.recv_message() {
+        match worker.connection.recv_message() {
             Ok(message) => {
-                wait_ns = wait_start.elapsed().as_nanos() as u64;
-                wire_received = DISTRIBUTED_FRAME_HEADER_LEN + message.payload.len();
-                stats.record_request(expert_ids.len(), wire_sent, wire_received, wait_ns);
-
-                match message.kind {
+                let wait_ns = wait_start.elapsed().as_nanos() as u64;
+                let wire_received = DISTRIBUTED_FRAME_HEADER_LEN + message.payload.len();
+                worker
+                    .stats
+                    .record_request(expert_ids.len(), wire_sent, wire_received, wait_ns);
+                return match message.kind {
                     FrameKind::ExpertBatchResponse => {
-                        match decode_expert_batch_response(&message.payload) {
-                            Ok(response) => {
-                                if response.layer == layer && response.dim == dim {
-                                    decoded_outputs = response.outputs;
-                                } else {
-                                    last_error = Some(format!(
-                                        "invalid response shape: layer {} dim {}",
-                                        response.layer, response.dim
-                                    ));
-                                }
-                            }
-                            Err(err) => last_error = Some(err),
-                        }
-                    }
-                    FrameKind::Error => {
-                        if let Ok(msg) = decode_error_frame(&message.payload) {
-                            last_error = Some(msg);
+                        let response = decode_expert_batch_response(&message.payload)?;
+                        if response.layer != layer || response.dim != dim {
+                            Err(format!(
+                                "invalid response shape: layer {} dim {}",
+                                response.layer, response.dim
+                            ))
                         } else {
-                            last_error = Some("unknown error frame".to_string());
+                            Ok((response.outputs, wire_sent, wire_received, wait_ns))
                         }
                     }
-                    other => {
-                        last_error = Some(format!("unexpected frame: {:?}", other));
-                    }
-                }
-                break;
+                    FrameKind::Error => Err(decode_error_frame(&message.payload)?),
+                    other => Err(format!("unexpected frame: {:?}", other)),
+                };
             }
             Err(err) => {
                 last_error = Some(err);
                 if attempt + 1 < BATCH_RETRY_ATTEMPTS {
+                    worker.reconnect()?;
                     continue;
                 }
                 break;
             }
         }
     }
-
-    let _ = connection.send_message(FrameKind::Shutdown, 0, &[]);
-
-    let result_clone = BatchTaskResult {
-        node_address,
-        expert_ids: expert_ids.clone(),
-        outputs: decoded_outputs,
-        activation,
-        bytes_sent: wire_sent,
-        bytes_received: wire_received,
-        wait_ns,
-        error: last_error,
-    };
-
-    tx.send(result_clone).expect("channel dropped");
-}
-/// Input data for a concurrent batch worker task.
-/// Spawned via `std::thread::spawn`.
-struct BatchTaskInput {
-    address: String,
-    activation_dtype: ActivationDtype,
-    layer: usize,
-    expert_ids: Vec<usize>,
-    activation: Vec<f32>,
-    dim: usize,
-    n_layers: usize,
-    n_experts: usize,
-    assigned_experts: Vec<(usize, usize)>,
-    stats: RemoteWorkerStats,
-    node_address: String,
+    Err(last_error.unwrap_or_else(|| {
+        format!(
+            "worker '{}' batch failed without a specific transport error",
+            worker.address
+        )
+    }))
 }
