@@ -1,5 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-
 use crate::engine::distributed::placement::{
     ClusterConfig, ClusterNodeConfig, ClusterNodeRole, MoePlacementPlan,
 };
@@ -12,8 +10,8 @@ use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_n
 use crate::engine::distributed::transport::FramedConnection;
 use crate::engine::kernels::{axpy_inplace, matmul_quantized_rows, silu_and_mul_inplace};
 use crate::engine::profiling::{
-    profiling_enabled, record_distributed_local_experts, record_distributed_remote_request,
-    record_distributed_transport_bytes,
+    profiling_enabled, record_distributed_coordinator_timing, record_distributed_local_experts,
+    record_distributed_remote_request, record_distributed_transport_bytes,
 };
 use crate::engine::types::{Config, QuantizedTensor, TransformerWeights, WorkerExpertTensors};
 use rayon::prelude::{
@@ -449,86 +447,10 @@ impl ActivationBufferPool {
     }
 
     /// Return a buffer to the pool for reuse.
-    fn put_buffer(&mut self, mut buffer: Vec<f32>) {
+    fn put_buffer(&mut self, buffer: Vec<f32>) {
         if buffer.len() == self.buffer_size {
-            // Clear the buffer to prevent stale data from leaking between batches
-            fill_simd_inplace(&mut buffer);
             self.buffers.push(buffer);
         }
-    }
-}
-
-/// Fill buffer with zeros using SIMD (AVX-2/AVX-512) when size permits.
-/// Avoids per-element branch overhead for large activations.
-#[inline]
-fn fill_simd_inplace(x: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    if x.len() >= 8 {
-        return unsafe {
-            fill_simd_x86_64(x);
-        };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        x.fill(0.0);
-    }
-}
-
-/// x86_64 dispatch for SIMD fill.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn fill_simd_x86_64(x: &mut [f32]) {
-    use crate::engine::switches::use_x86_avx512f;
-    if use_x86_avx512f() {
-        fill_simd_avx512(x);
-    } else {
-        fill_simd_avx2(x);
-    }
-}
-
-/// AVX-2 (8-wide) SIMD fill with zeros.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn fill_simd_avx2(x: &mut [f32]) {
-    use std::arch::x86_64::*;
-
-    let n = x.len();
-    let ptr = x.as_mut_ptr();
-    let zero = _mm256_setzero_ps();
-    let mut i = 0usize;
-
-    while i + 8 <= n {
-        _mm256_storeu_ps(ptr.add(i), zero);
-        i += 8;
-    }
-
-    // Scalar tail
-    while i < n {
-        ptr.add(i).write(0.0);
-        i += 1;
-    }
-}
-
-/// AVX-512 (16-wide) SIMD fill with zeros.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn fill_simd_avx512(x: &mut [f32]) {
-    use std::arch::x86_64::*;
-
-    let n = x.len();
-    let ptr = x.as_mut_ptr();
-    let zero = _mm512_setzero_ps();
-    let mut i = 0usize;
-
-    while i + 16 <= n {
-        _mm512_storeu_ps(ptr.add(i), zero);
-        i += 16;
-    }
-
-    // Scalar tail
-    while i < n {
-        ptr.add(i).write(0.0);
-        i += 1;
     }
 }
 
@@ -727,6 +649,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         weights: &TransformerWeights,
         mapped: &[u8],
     ) -> Result<(), String> {
+        let total_start = Instant::now();
         let dim = config.dim;
         output[..dim].fill(0.0);
         if selected.is_empty() {
@@ -760,6 +683,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
             }
         }
 
+        let local_start = Instant::now();
         if !local_selected.is_empty() {
             record_distributed_local_experts(local_selected.len());
             compute_local_selected_experts(
@@ -773,7 +697,9 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                 true,
             )?;
         }
+        let local_ns = local_start.elapsed().as_nanos() as u64;
 
+        let remote_start = Instant::now();
         let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
         for (node_index, expert_ids) in &remote_selected {
             let node_address = self.plan.nodes[*node_index].address.clone();
@@ -812,11 +738,29 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                 remote_outputs.insert(expert_idx, values);
             }
         }
+        let remote_ns = remote_start.elapsed().as_nanos() as u64;
 
         for &(expert_idx, route_weight) in selected {
             if let Some(values) = remote_outputs.get(&expert_idx) {
                 axpy_inplace(&mut output[..dim], route_weight, values);
             }
+        }
+        let total_ns = total_start.elapsed().as_nanos() as u64;
+        record_distributed_coordinator_timing(total_ns, local_ns, remote_ns);
+        if profiling_enabled() {
+            eprintln!(
+                "[PROFILE] distributed_moe layer={} local_experts={} remote_nodes={} remote_experts={} total={:.3} ms local={:.3} ms remote={:.3} ms",
+                layer,
+                local_selected.len(),
+                remote_selected.len(),
+                remote_selected
+                    .iter()
+                    .map(|(_, ids)| ids.len())
+                    .sum::<usize>(),
+                total_ns as f64 / 1_000_000.0,
+                local_ns as f64 / 1_000_000.0,
+                remote_ns as f64 / 1_000_000.0
+            );
         }
         Ok(())
     }

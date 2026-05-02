@@ -15,6 +15,9 @@ pub(crate) static PROF_DMOE_LOCAL_EXPERTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_DMOE_BYTES_SENT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_DMOE_BYTES_RECEIVED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_DMOE_REMOTE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_COORD_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_COORD_LOCAL_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PROF_DMOE_COORD_REMOTE_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn set_profiling_enabled(enabled: bool) {
@@ -71,6 +74,13 @@ pub(crate) fn record_distributed_transport_bytes(bytes_sent: usize, bytes_receiv
     PROF_DMOE_BYTES_RECEIVED.fetch_add(bytes_received as u64, AtomicOrdering::Relaxed);
 }
 
+#[inline(always)]
+pub(crate) fn record_distributed_coordinator_timing(total_ns: u64, local_ns: u64, remote_ns: u64) {
+    PROF_DMOE_COORD_TOTAL_NS.fetch_add(total_ns, AtomicOrdering::Relaxed);
+    PROF_DMOE_COORD_LOCAL_NS.fetch_add(local_ns, AtomicOrdering::Relaxed);
+    PROF_DMOE_COORD_REMOTE_NS.fetch_add(remote_ns, AtomicOrdering::Relaxed);
+}
+
 pub(crate) fn profiling_reset() {
     PROF_TRANSFORMER_NS.store(0, AtomicOrdering::Relaxed);
     PROF_MATMUL_NS.store(0, AtomicOrdering::Relaxed);
@@ -85,6 +95,9 @@ pub(crate) fn profiling_reset() {
     PROF_DMOE_BYTES_SENT.store(0, AtomicOrdering::Relaxed);
     PROF_DMOE_BYTES_RECEIVED.store(0, AtomicOrdering::Relaxed);
     PROF_DMOE_REMOTE_WAIT_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_COORD_TOTAL_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_COORD_LOCAL_NS.store(0, AtomicOrdering::Relaxed);
+    PROF_DMOE_COORD_REMOTE_NS.store(0, AtomicOrdering::Relaxed);
 }
 
 pub(crate) fn print_profile_report() {
@@ -101,6 +114,9 @@ pub(crate) fn print_profile_report() {
     let distributed_bytes_sent = PROF_DMOE_BYTES_SENT.load(AtomicOrdering::Relaxed);
     let distributed_bytes_received = PROF_DMOE_BYTES_RECEIVED.load(AtomicOrdering::Relaxed);
     let distributed_remote_wait_ns = PROF_DMOE_REMOTE_WAIT_NS.load(AtomicOrdering::Relaxed);
+    let distributed_coord_total_ns = PROF_DMOE_COORD_TOTAL_NS.load(AtomicOrdering::Relaxed);
+    let distributed_coord_local_ns = PROF_DMOE_COORD_LOCAL_NS.load(AtomicOrdering::Relaxed);
+    let distributed_coord_remote_ns = PROF_DMOE_COORD_REMOTE_NS.load(AtomicOrdering::Relaxed);
 
     let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
     let to_mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
@@ -172,6 +188,12 @@ pub(crate) fn print_profile_report() {
             } else {
                 to_ms(distributed_remote_wait_ns) / distributed_remote_batches as f64
             }
+        );
+        eprintln!(
+            "[PROFILE] distributed_moe coordinator_total={:.3} ms local_compute={:.3} ms remote_dispatch={:.3} ms",
+            to_ms(distributed_coord_total_ns),
+            to_ms(distributed_coord_local_ns),
+            to_ms(distributed_coord_remote_ns)
         );
     }
 }
