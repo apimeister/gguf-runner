@@ -292,6 +292,10 @@ impl MappedFile {
     }
 }
 
+// SAFETY: the mapped region is only read (never written) during inference;
+// `ptr` is valid for the lifetime of the struct and immutable across threads.
+unsafe impl Sync for MappedFile {}
+
 impl Drop for MappedFile {
     fn drop(&mut self) {
         #[cfg(unix)]

@@ -683,26 +683,10 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
             }
         }
 
-        let local_start = Instant::now();
-        if !local_selected.is_empty() {
-            record_distributed_local_experts(local_selected.len());
-            compute_local_selected_experts(
-                layer,
-                input,
-                &local_selected,
-                output,
-                config,
-                weights,
-                mapped,
-                true,
-            )?;
-        }
-        let local_ns = local_start.elapsed().as_nanos() as u64;
-
         let remote_start = Instant::now();
         let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
 
-        // Phase 1: fire requests at all workers so they run in parallel.
+        // Phase 1: fire requests at all workers first so they start computing immediately.
         let mut send_info: Vec<(usize, Instant)> = Vec::with_capacity(remote_selected.len());
         for (node_index, expert_ids) in &remote_selected {
             let node_address = self.plan.nodes[*node_index].address.clone();
@@ -731,6 +715,23 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                 .map_err(|err| format!("worker '{}' send failed: {}", node_address, err))?;
             send_info.push((wire_sent, wait_start));
         }
+
+        // Overlap: compute local experts while workers run their remote batches.
+        let local_start = Instant::now();
+        if !local_selected.is_empty() {
+            record_distributed_local_experts(local_selected.len());
+            compute_local_selected_experts(
+                layer,
+                input,
+                &local_selected,
+                output,
+                config,
+                weights,
+                mapped,
+                true,
+            )?;
+        }
+        let local_ns = local_start.elapsed().as_nanos() as u64;
 
         // Phase 2: collect responses — workers have been computing since phase 1 finished.
         for ((node_index, expert_ids), (wire_sent, wait_start)) in

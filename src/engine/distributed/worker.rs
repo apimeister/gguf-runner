@@ -8,6 +8,7 @@ use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_n
 use crate::engine::distributed::transport::FramedConnection;
 use crate::engine::kernels::{matmul_quantized_rows, silu_and_mul_inplace};
 use crate::engine::types::{Config, GGUFFile, WorkerExpertWeights};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::net::TcpListener;
 use std::time::Duration;
 
@@ -108,61 +109,66 @@ impl WorkerRuntime {
             ));
         }
         let mapped = self.gguf.mapped.as_slice();
-        let mut outputs = Vec::with_capacity(request.expert_ids.len());
-        let mut gate_scratch = vec![0.0f32; self.config.expert_hidden_dim];
-        let mut up_scratch = vec![0.0f32; self.config.expert_hidden_dim];
-        for &expert_idx in &request.expert_ids {
-            if expert_idx >= self.config.n_experts
-                || !session.assigned_experts[request.layer][expert_idx]
-            {
-                return Err(format!(
-                    "expert {} in layer {} is not assigned to worker '{}'",
-                    expert_idx, request.layer, self.bind_address
-                ));
-            }
-            let tensors = session
-                .weights
-                .experts
-                .get(request.layer)
-                .and_then(|layer| layer.get(expert_idx))
-                .and_then(|slot| slot.as_ref())
-                .ok_or_else(|| {
-                    format!(
-                        "expert {} in layer {} was assigned to worker '{}' but its sliced tensors are missing",
-                        expert_idx, request.layer, self.bind_address
-                    )
-                })?;
-            let mut output = vec![0.0f32; self.config.dim];
-            matmul_quantized_rows(
-                &mut gate_scratch[..self.config.expert_hidden_dim],
-                &request.activation,
-                &tensors.gate,
-                0,
-                self.config.expert_hidden_dim,
-                mapped,
-            )?;
-            matmul_quantized_rows(
-                &mut up_scratch[..self.config.expert_hidden_dim],
-                &request.activation,
-                &tensors.up,
-                0,
-                self.config.expert_hidden_dim,
-                mapped,
-            )?;
-            silu_and_mul_inplace(
-                &mut gate_scratch[..self.config.expert_hidden_dim],
-                &up_scratch[..self.config.expert_hidden_dim],
-            );
-            matmul_quantized_rows(
-                &mut output,
-                &gate_scratch[..self.config.expert_hidden_dim],
-                &tensors.down,
-                0,
-                self.config.dim,
-                mapped,
-            )?;
-            outputs.push(output);
-        }
+        let layer = request.layer;
+        let dim = self.config.dim;
+        let hidden = self.config.expert_hidden_dim;
+
+        // Compute all experts in parallel — each gets its own scratch buffers.
+        let outputs: Vec<Vec<f32>> = request
+            .expert_ids
+            .par_iter()
+            .map(|&expert_idx| {
+                if expert_idx >= self.config.n_experts
+                    || !session.assigned_experts[layer][expert_idx]
+                {
+                    return Err(format!(
+                        "expert {} in layer {} is not assigned to worker '{}'",
+                        expert_idx, layer, self.bind_address
+                    ));
+                }
+                let tensors = session
+                    .weights
+                    .experts
+                    .get(layer)
+                    .and_then(|l| l.get(expert_idx))
+                    .and_then(|slot| slot.as_ref())
+                    .ok_or_else(|| {
+                        format!(
+                            "expert {} in layer {} was assigned to worker '{}' but its sliced tensors are missing",
+                            expert_idx, layer, self.bind_address
+                        )
+                    })?;
+                let mut gate_scratch = vec![0.0f32; hidden];
+                let mut up_scratch = vec![0.0f32; hidden];
+                let mut output = vec![0.0f32; dim];
+                matmul_quantized_rows(
+                    &mut gate_scratch,
+                    &request.activation,
+                    &tensors.gate,
+                    0,
+                    hidden,
+                    mapped,
+                )?;
+                matmul_quantized_rows(
+                    &mut up_scratch,
+                    &request.activation,
+                    &tensors.up,
+                    0,
+                    hidden,
+                    mapped,
+                )?;
+                silu_and_mul_inplace(&mut gate_scratch, &up_scratch);
+                matmul_quantized_rows(
+                    &mut output,
+                    &gate_scratch,
+                    &tensors.down,
+                    0,
+                    dim,
+                    mapped,
+                )?;
+                Ok(output)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(ExpertBatchResponse {
             layer: request.layer,
             output_dtype: request.activation_dtype,
