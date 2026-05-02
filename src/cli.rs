@@ -1051,12 +1051,6 @@ impl CliOptions {
         } else {
             CliDistributedMode::None
         };
-        if distributed_enabled && cli.distributed_coordinator_address.is_none() {
-            return Err(
-                "distributed mode requires --distributed-coordinator-address <host:port>"
-                    .to_string(),
-            );
-        }
         if distributed_mode == CliDistributedMode::Worker && cli.distributed_bind_address.is_none()
         {
             return Err(

@@ -13,12 +13,13 @@ This is the shortest path to run distributed routed-MoE mode.
 Only the coordinator needs the worker list:
 
 ```text
---distributed-coordinator-address 192.168.10.10:7000
 --distributed-transport-dtype bf16
 --distributed-worker-node '192.168.10.11:7000'
 --distributed-worker-node '192.168.10.12:7000'
 --distributed-worker-node '192.168.10.13:7000'
 ```
+
+`--distributed-coordinator-address` is optional and only affects coordinator node metadata in the placement plan.
 
 ## Start Workers
 
@@ -31,7 +32,6 @@ gguf-runner \
   --model ./Qwen3.5-122B-A10B-Q4.gguf \
   --distributed-worker \
   --distributed-bind-address 192.168.10.11:7000 \
-  --distributed-coordinator-address 192.168.10.10:7000 \
   --distributed-transport-dtype bf16
 ```
 
@@ -44,7 +44,6 @@ After all workers are listening, run normal generation on the coordinator:
 ```bash
 gguf-runner \
   --model ./Qwen3.5-122B-A10B-Q4.gguf \
-  --distributed-coordinator-address 192.168.10.10:7000 \
   --distributed-transport-dtype bf16 \
   --distributed-worker-node '192.168.10.11:7000' \
   --distributed-worker-node '192.168.10.12:7000' \

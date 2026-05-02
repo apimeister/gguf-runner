@@ -104,13 +104,14 @@ Distributed CLI options:
 - `--distributed-worker`
 - `--distributed-bind-address <host:port>`
 - `--distributed-coordinator-id <id>`
-- `--distributed-coordinator-address <host:port>`
+- optional `--distributed-coordinator-address <host:port>`
 - repeatable `--distributed-worker-node 'host:port'`
 - `--distributed-transport-dtype <bf16|fp16|q8>`
 
 Distributed resource notes:
-- worker mode only needs `--distributed-bind-address` plus `--distributed-coordinator-address`
+- worker mode only needs `--distributed-bind-address`
 - the coordinator is the only side that needs the full `--distributed-worker-node` list
+- the coordinator only needs the worker list; `--distributed-coordinator-address` is optional placement metadata
 - placement uses discovered node memory and CPU from the coordinator discovery pass
 
 Agent config file (optional):

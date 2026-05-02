@@ -210,7 +210,6 @@ gguf-runner \
   --model Qwen3.5-122B-A10B-Q4.gguf \
   --distributed-worker \
   --distributed-bind-address 192.168.10.11:7000 \
-  --distributed-coordinator-address 192.168.10.10:7000 \
   --distributed-transport-dtype bf16
 ```
 

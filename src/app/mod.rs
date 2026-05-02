@@ -286,7 +286,7 @@ pub(super) fn build_cluster_config_from_cli(cli: &CliOptions) -> Result<ClusterC
     let coordinator_address = cli
         .distributed_coordinator_address
         .as_deref()
-        .ok_or("distributed coordinator address is missing".to_string())?;
+        .unwrap_or(cli.distributed_coordinator_id.as_str());
     let mut node = Vec::with_capacity(cli.distributed_worker_nodes.len() + 1);
     node.push(ClusterNodeConfig {
         id: cli.distributed_coordinator_id.clone(),
@@ -365,10 +365,6 @@ fn run_distributed_worker_mode(cli: &CliOptions) -> Result<(), String> {
     let bind_address = cli.distributed_bind_address.as_deref().ok_or(
         "--distributed-worker requires --distributed-bind-address <host:port>".to_string(),
     )?;
-    let _coordinator_address = cli
-        .distributed_coordinator_address
-        .as_deref()
-        .ok_or("distributed coordinator address is missing".to_string())?;
 
     println!("Distributed worker bootstrap");
     println!("bind: {}", bind_address);

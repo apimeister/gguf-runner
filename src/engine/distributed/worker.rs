@@ -205,85 +205,95 @@ pub(crate) fn run_worker_server(
             stream,
             Duration::from_secs(DEFAULT_REMOTE_TIMEOUT_SECS),
         )?;
-        let first_message = connection.recv_message()?;
-        match first_message.kind {
-            FrameKind::DiscoverRequest => {
-                let payload = encode_discover_response_frame(&runtime.discovery_frame())?;
-                connection.send_message(
-                    FrameKind::DiscoverResponse,
-                    first_message.request_id,
-                    &payload,
-                )?;
-            }
-            FrameKind::Hello => {
-                let hello = decode_hello_frame(&first_message.payload)?;
-                match runtime.prepare_session(&hello) {
-                    Ok((ready, session)) => {
-                        let payload = encode_ready_frame(&ready)?;
-                        connection.send_message(
-                            FrameKind::Ready,
-                            first_message.request_id,
-                            &payload,
-                        )?;
-
-                        loop {
-                            let message = connection.recv_message()?;
-                            match message.kind {
-                                FrameKind::ExpertBatchRequest => {
-                                    let request = decode_expert_batch_request(&message.payload)?;
-                                    match runtime.handle_request(&session, request) {
-                                        Ok(response) => {
-                                            let payload = encode_expert_batch_response(&response)?;
-                                            connection.send_message(
-                                                FrameKind::ExpertBatchResponse,
-                                                message.request_id,
-                                                &payload,
-                                            )?;
-                                        }
-                                        Err(err) => {
-                                            let payload = encode_error_frame(&err)?;
-                                            connection.send_message(
-                                                FrameKind::Error,
-                                                message.request_id,
-                                                &payload,
-                                            )?;
-                                        }
-                                    }
-                                }
-                                FrameKind::Shutdown => break,
-                                FrameKind::Error => {
-                                    return Err(format!(
-                                        "worker received coordinator error: {}",
-                                        decode_error_frame(&message.payload)?
-                                    ));
-                                }
-                                other => {
-                                    return Err(format!(
-                                        "worker received unexpected frame {:?}",
-                                        other
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        let payload = encode_error_frame(&err)?;
-                        connection.send_message(
-                            FrameKind::Error,
-                            first_message.request_id,
-                            &payload,
-                        )?;
-                    }
-                }
-            }
-            other => {
-                return Err(format!(
-                    "worker expected DISCOVER_REQUEST or HELLO as first distributed frame, got {:?}",
-                    other
-                ));
-            }
+        if let Err(err) = handle_worker_connection(&runtime, &mut connection) {
+            eprintln!("distributed worker connection error: {err}");
         }
     }
 
+    Ok(())
+}
+
+fn handle_worker_connection(
+    runtime: &WorkerRuntime,
+    connection: &mut FramedConnection,
+) -> Result<(), String> {
+    let first_message = connection.recv_message()?;
+    match first_message.kind {
+        FrameKind::DiscoverRequest => {
+            let payload = encode_discover_response_frame(&runtime.discovery_frame())?;
+            connection.send_message(
+                FrameKind::DiscoverResponse,
+                first_message.request_id,
+                &payload,
+            )?;
+        }
+        FrameKind::Hello => {
+            let hello = decode_hello_frame(&first_message.payload)?;
+            match runtime.prepare_session(&hello) {
+                Ok((ready, session)) => {
+                    let payload = encode_ready_frame(&ready)?;
+                    connection.send_message(
+                        FrameKind::Ready,
+                        first_message.request_id,
+                        &payload,
+                    )?;
+
+                    loop {
+                        let message = connection.recv_message()?;
+                        match message.kind {
+                            FrameKind::ExpertBatchRequest => {
+                                let request = decode_expert_batch_request(&message.payload)?;
+                                match runtime.handle_request(&session, request) {
+                                    Ok(response) => {
+                                        let payload = encode_expert_batch_response(&response)?;
+                                        connection.send_message(
+                                            FrameKind::ExpertBatchResponse,
+                                            message.request_id,
+                                            &payload,
+                                        )?;
+                                    }
+                                    Err(err) => {
+                                        let payload = encode_error_frame(&err)?;
+                                        connection.send_message(
+                                            FrameKind::Error,
+                                            message.request_id,
+                                            &payload,
+                                        )?;
+                                    }
+                                }
+                            }
+                            FrameKind::Shutdown => break,
+                            FrameKind::Error => {
+                                return Err(format!(
+                                    "worker received coordinator error: {}",
+                                    decode_error_frame(&message.payload)?
+                                ));
+                            }
+                            other => {
+                                return Err(format!(
+                                    "worker received unexpected frame {:?}",
+                                    other
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let payload = encode_error_frame(&err)?;
+                    connection.send_message(
+                        FrameKind::Error,
+                        first_message.request_id,
+                        &payload,
+                    )?;
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "worker expected DISCOVER_REQUEST or HELLO as first distributed frame, got {:?}",
+                other
+            ));
+        }
+    }
     Ok(())
 }
