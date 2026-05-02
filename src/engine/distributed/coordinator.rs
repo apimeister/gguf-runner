@@ -802,7 +802,18 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
 
         for (node_index, expert_ids) in &remote_selected {
             let node_address = plan.nodes[*node_index].address.clone();
-            let address = self.remote_workers[*node_index].address.clone();
+            let address = self
+                .remote_workers
+                .iter()
+                .find(|worker| worker.node_index == *node_index)
+                .ok_or_else(|| {
+                    format!(
+                        "distributed worker '{}' is missing an active coordinator connection",
+                        node_address
+                    )
+                })?
+                .address
+                .clone();
             let stats = RemoteWorkerStats::default();
             // Use pre-allocated buffer instead of allocating a new vector each time
             let activation = self.activation_buffer_pool.get_buffer();
