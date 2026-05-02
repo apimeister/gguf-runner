@@ -239,7 +239,17 @@ fn handle_worker_connection(
                     )?;
 
                     loop {
-                        let message = connection.recv_message()?;
+                        let message = match connection.recv_message() {
+                            Ok(message) => message,
+                            Err(err)
+                                if err.contains(
+                                    "failed to read distributed frame header: failed to fill whole buffer",
+                                ) =>
+                            {
+                                break;
+                            }
+                            Err(err) => return Err(err),
+                        };
                         match message.kind {
                             FrameKind::ExpertBatchRequest => {
                                 let request = decode_expert_batch_request(&message.payload)?;

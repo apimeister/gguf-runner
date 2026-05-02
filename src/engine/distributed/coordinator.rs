@@ -859,7 +859,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
 
             // Return activation buffer to pool for reuse on next token
             self.activation_buffer_pool
-                .put_buffer(task_result.activation.clone());
+                .put_buffer(task_result.activation);
 
             if let Some(ref err) = task_result.error {
                 return Err(format!(
@@ -1030,11 +1030,13 @@ fn run_batch(input: BatchTaskInput, tx: mpsc::Sender<BatchTaskResult>) {
         }
     }
 
+    let _ = connection.send_message(FrameKind::Shutdown, 0, &[]);
+
     let result_clone = BatchTaskResult {
         node_address,
         expert_ids: expert_ids.clone(),
         outputs: decoded_outputs,
-        activation: activation.clone(),
+        activation,
         bytes_sent: wire_sent,
         bytes_received: wire_received,
         wait_ns,
