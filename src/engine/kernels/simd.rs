@@ -62,7 +62,7 @@ unsafe fn encode_bf16_avx2(values: &[f32], out: &mut [u8]) {
 
     while i + 8 <= n {
         let v = _mm256_loadu_ps(values.as_ptr().add(i));
-        let v32 = _mm256_castps_epi32(v);
+        let v32 = _mm256_castps_si256(v);
 
         // ─── Sign bit (bit 31 → bit 15) ───
         // sign = v32 >> 31 → sign at bit 0
@@ -105,7 +105,7 @@ unsafe fn encode_bf16_avx2(values: &[f32], out: &mut [u8]) {
 
         // Extract and store 16-bit values
         let mut tmp = [0i32; 8];
-        _mm256_storeu_si256(tmp.as_mut_ptr(), final16);
+        _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, final16);
         for j in 0..8 {
             let b = tmp[j] as u16;
             out[(i + j) * 2] = b as u8;
@@ -138,7 +138,7 @@ unsafe fn encode_fp16_avx2(values: &[f32], out: &mut [u8]) {
 
     while i + 8 <= n {
         let v = _mm256_loadu_ps(values.as_ptr().add(i));
-        let v32 = _mm256_castps_epi32(v);
+        let v32 = _mm256_castps_si256(v);
 
         // ─── Sign bit (bit 31 → bit 15) ───
         let sign = _mm256_slli_epi32(_mm256_srli_epi32(v32, 31), 15);
@@ -169,7 +169,7 @@ unsafe fn encode_fp16_avx2(values: &[f32], out: &mut [u8]) {
 
         // Extract and store 16-bit values
         let mut tmp = [0i32; 8];
-        _mm256_storeu_si256(tmp.as_mut_ptr(), final16);
+        _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, final16);
         for j in 0..8 {
             let b = tmp[j] as u16;
             out[(i + j) * 2] = b as u8;

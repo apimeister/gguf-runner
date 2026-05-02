@@ -1138,8 +1138,7 @@ pub(crate) fn sigmoid_mul_inplace(dst: &mut [f32], gate: &[f32]) {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn silu_and_mul_x86_64(hb: &mut [f32], hb2: &[f32]) {
-    use crate::engine::switches::{use_x86_avx512bf16, use_x86_avx512f};
-    use std::arch::x86_64::*;
+    use crate::engine::switches::{use_x86_avx2_fma, use_x86_avx512f};
 
     if use_x86_avx512f() {
         silu_and_mul_avx512(hb, hb2);
@@ -1152,8 +1151,7 @@ unsafe fn silu_and_mul_x86_64(hb: &mut [f32], hb2: &[f32]) {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn sigmoid_mul_x86_64(dst: &mut [f32], gate: &[f32]) {
-    use crate::engine::switches::{use_x86_avx512bf16, use_x86_avx512f};
-    use std::arch::x86_64::*;
+    use crate::engine::switches::{use_x86_avx2_fma, use_x86_avx512f};
 
     if use_x86_avx512f() {
         sigmoid_mul_avx512(dst, gate);
@@ -1344,7 +1342,7 @@ unsafe fn silu_and_mul_avx512(hb: &mut [f32], hb2: &[f32]) {
 
         // sigmoid with NR refinement
         let denom = _mm512_add_ps(one, exp_neg_v);
-        let rec = _mm512_rcp_ps(denom);
+        let rec = _mm512_rcp14_ps(denom);
         let rec = _mm512_mul_ps(
             _mm512_sub_ps(_mm512_set1_ps(2.0), _mm512_mul_ps(denom, rec)),
             rec,
@@ -1529,7 +1527,7 @@ unsafe fn sigmoid_mul_avx512(dst: &mut [f32], gate: &[f32]) {
         let exp_neg_g = _mm512_mul_ps(poly, p2n);
 
         let denom = _mm512_add_ps(one, exp_neg_g);
-        let rec = _mm512_rcp_ps(denom);
+        let rec = _mm512_rcp14_ps(denom);
         let rec = _mm512_mul_ps(
             _mm512_sub_ps(_mm512_set1_ps(2.0), _mm512_mul_ps(denom, rec)),
             rec,
@@ -1707,15 +1705,17 @@ unsafe fn sanitize_finite_avx512(x: &mut [f32]) {
         // Load 16 elements (2×8) and extract bits
         let v0 = _mm512_loadu_ps(ptr.add(i));
         let bits0 = _mm512_castps_si512(v0);
-        let is_naninf0 = _mm512_cmpeq_epi32(_mm512_and_si512(bits0, exp_mask), exp_check);
+        let is_naninf0 =
+            _mm512_cmp_epi32_mask::<_MM_CMPINT_EQ>(_mm512_and_si512(bits0, exp_mask), exp_check);
 
         let v1 = _mm512_loadu_ps(ptr.add(i + 8));
         let bits1 = _mm512_castps_si512(v1);
-        let is_naninf1 = _mm512_cmpeq_epi32(_mm512_and_si512(bits1, exp_mask), exp_check);
+        let is_naninf1 =
+            _mm512_cmp_epi32_mask::<_MM_CMPINT_EQ>(_mm512_and_si512(bits1, exp_mask), exp_check);
 
         // Blend: if is_naninf, use zero; otherwise use original
-        let v0_clean = _mm512_blendv_ps(v0, zero, _mm512_castsi512_ps(is_naninf0));
-        let v1_clean = _mm512_blendv_ps(v1, zero, _mm512_castsi512_ps(is_naninf1));
+        let v0_clean = _mm512_mask_blend_ps(is_naninf0, v0, zero);
+        let v1_clean = _mm512_mask_blend_ps(is_naninf1, v1, zero);
 
         _mm512_storeu_ps(ptr.add(i), v0_clean);
         _mm512_storeu_ps(ptr.add(i + 8), v1_clean);

@@ -12,7 +12,7 @@ use crate::engine::switches::{
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
     X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, is_x86_amd, use_x86_avx_vnni,
-    use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_f16c, use_x86_qk_mr4,
+    use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_avx512f, use_x86_f16c, use_x86_qk_mr4,
 };
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 use crate::engine::types::{
