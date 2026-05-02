@@ -221,12 +221,17 @@ unsafe fn rmsnorm_avx2(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, ep
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
 
-    // Pass 1: sum of squares (8 elements per iteration, 2×8-wide FMA)
+    // Pass 1: sum of squares (dual 8-wide, 16 elements per iteration)
+    while i + 16 <= size {
+        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        acc0 = _mm256_fmadd_ps(xv,  xv,  acc0);
+        acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
+        i += 16;
+    }
     while i + 8 <= size {
         let xv = _mm256_loadu_ps(x.as_ptr().add(i));
-        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
         acc0 = _mm256_fmadd_ps(xv, xv, acc0);
-        acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
         i += 8;
     }
 
@@ -247,18 +252,24 @@ unsafe fn rmsnorm_avx2(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, ep
     ss += eps;
     let scale = 1.0 / ss.sqrt();
 
-    // Pass 2: scale and multiply (8 elements per iteration)
+    // Pass 2: scale and multiply (dual 8-wide, 16 elements per iteration)
     i = 0;
     let scale_vec = _mm256_set1_ps(scale);
+    while i + 16 <= size {
+        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
+        let wv  = _mm256_loadu_ps(weight.as_ptr().add(i));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 8));
+        let result  = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv,  wv));
+        let result2 = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv2, wv2));
+        _mm256_storeu_ps(o.as_mut_ptr().add(i),     result);
+        _mm256_storeu_ps(o.as_mut_ptr().add(i + 8), result2);
+        i += 16;
+    }
     while i + 8 <= size {
         let xv = _mm256_loadu_ps(x.as_ptr().add(i));
         let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
-        let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 4));
-        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
-        let result = _mm256_fmadd_ps(xv, wv, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
-        let result2 = _mm256_fmadd_ps(xv2, wv2, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
-        _mm256_storeu_ps(o.as_mut_ptr().add(i), result);
-        _mm256_storeu_ps(o.as_mut_ptr().add(i + 4), result2);
+        _mm256_storeu_ps(o.as_mut_ptr().add(i), _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv)));
         i += 8;
     }
 
@@ -280,12 +291,17 @@ unsafe fn rmsnorm_avx512(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, 
     let mut acc0 = _mm512_setzero_ps();
     let mut acc1 = _mm512_setzero_ps();
 
-    // Pass 1: sum of squares (16 elements per iteration, 2×16-wide FMA)
+    // Pass 1: sum of squares (dual 16-wide, 32 elements per iteration)
+    while i + 32 <= size {
+        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
+        acc0 = _mm512_fmadd_ps(xv,  xv,  acc0);
+        acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
+        i += 32;
+    }
     while i + 16 <= size {
         let xv = _mm512_loadu_ps(x.as_ptr().add(i));
-        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
         acc0 = _mm512_fmadd_ps(xv, xv, acc0);
-        acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
         i += 16;
     }
 
@@ -306,18 +322,24 @@ unsafe fn rmsnorm_avx512(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, 
     ss += eps;
     let scale = 1.0 / ss.sqrt();
 
-    // Pass 2: scale and multiply (16 elements per iteration)
+    // Pass 2: scale and multiply (dual 16-wide, 32 elements per iteration)
     i = 0;
     let scale_vec = _mm512_set1_ps(scale);
+    while i + 32 <= size {
+        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
+        let wv  = _mm512_loadu_ps(weight.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
+        let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 16));
+        let result  = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv,  wv));
+        let result2 = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv2, wv2));
+        _mm512_storeu_ps(o.as_mut_ptr().add(i),      result);
+        _mm512_storeu_ps(o.as_mut_ptr().add(i + 16), result2);
+        i += 32;
+    }
     while i + 16 <= size {
         let xv = _mm512_loadu_ps(x.as_ptr().add(i));
         let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
-        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
-        let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 8));
-        let result = _mm512_fmadd_ps(xv, wv, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
-        let result2 = _mm512_fmadd_ps(xv2, wv2, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
-        _mm512_storeu_ps(o.as_mut_ptr().add(i), result);
-        _mm512_storeu_ps(o.as_mut_ptr().add(i + 8), result2);
+        _mm512_storeu_ps(o.as_mut_ptr().add(i), _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv)));
         i += 16;
     }
 
@@ -338,12 +360,17 @@ unsafe fn rmsnorm_inplace_avx2(x: &mut [f32], weight: &[f32], size: usize, eps: 
     let mut acc0 = _mm256_setzero_ps();
     let mut acc1 = _mm256_setzero_ps();
 
-    // Pass 1: sum of squares
+    // Pass 1: sum of squares (dual 8-wide, 16 elements per iteration)
+    while i + 16 <= size {
+        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        acc0 = _mm256_fmadd_ps(xv,  xv,  acc0);
+        acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
+        i += 16;
+    }
     while i + 8 <= size {
         let xv = _mm256_loadu_ps(x.as_ptr().add(i));
-        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
         acc0 = _mm256_fmadd_ps(xv, xv, acc0);
-        acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
         i += 8;
     }
 
@@ -361,18 +388,24 @@ unsafe fn rmsnorm_inplace_avx2(x: &mut [f32], weight: &[f32], size: usize, eps: 
     ss += eps;
     let scale = 1.0 / ss.sqrt();
 
-    // Pass 2: scale and multiply in-place
+    // Pass 2: scale and multiply in-place (dual 8-wide, 16 elements per iteration)
     i = 0;
     let scale_vec = _mm256_set1_ps(scale);
+    while i + 16 <= size {
+        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
+        let wv  = _mm256_loadu_ps(weight.as_ptr().add(i));
+        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+        let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 8));
+        let result  = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv,  wv));
+        let result2 = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv2, wv2));
+        _mm256_storeu_ps(x.as_mut_ptr().add(i),     result);
+        _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), result2);
+        i += 16;
+    }
     while i + 8 <= size {
         let xv = _mm256_loadu_ps(x.as_ptr().add(i));
         let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
-        let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
-        let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 4));
-        let result = _mm256_fmadd_ps(xv, wv, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
-        let result2 = _mm256_fmadd_ps(xv2, wv2, _mm256_mul_ps(scale_vec, _mm256_setzero_ps()));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), result);
-        _mm256_storeu_ps(x.as_mut_ptr().add(i + 4), result2);
+        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv)));
         i += 8;
     }
 
@@ -392,12 +425,17 @@ unsafe fn rmsnorm_inplace_avx512(x: &mut [f32], weight: &[f32], size: usize, eps
     let mut acc0 = _mm512_setzero_ps();
     let mut acc1 = _mm512_setzero_ps();
 
-    // Pass 1: sum of squares
+    // Pass 1: sum of squares (dual 16-wide, 32 elements per iteration)
+    while i + 32 <= size {
+        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
+        acc0 = _mm512_fmadd_ps(xv,  xv,  acc0);
+        acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
+        i += 32;
+    }
     while i + 16 <= size {
         let xv = _mm512_loadu_ps(x.as_ptr().add(i));
-        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
         acc0 = _mm512_fmadd_ps(xv, xv, acc0);
-        acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
         i += 16;
     }
 
@@ -415,18 +453,24 @@ unsafe fn rmsnorm_inplace_avx512(x: &mut [f32], weight: &[f32], size: usize, eps
     ss += eps;
     let scale = 1.0 / ss.sqrt();
 
-    // Pass 2: scale and multiply in-place
+    // Pass 2: scale and multiply in-place (dual 16-wide, 32 elements per iteration)
     i = 0;
     let scale_vec = _mm512_set1_ps(scale);
+    while i + 32 <= size {
+        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
+        let wv  = _mm512_loadu_ps(weight.as_ptr().add(i));
+        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
+        let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 16));
+        let result  = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv,  wv));
+        let result2 = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv2, wv2));
+        _mm512_storeu_ps(x.as_mut_ptr().add(i),      result);
+        _mm512_storeu_ps(x.as_mut_ptr().add(i + 16), result2);
+        i += 32;
+    }
     while i + 16 <= size {
         let xv = _mm512_loadu_ps(x.as_ptr().add(i));
         let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
-        let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
-        let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 8));
-        let result = _mm512_fmadd_ps(xv, wv, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
-        let result2 = _mm512_fmadd_ps(xv2, wv2, _mm512_mul_ps(scale_vec, _mm512_setzero_ps()));
-        _mm512_storeu_ps(x.as_mut_ptr().add(i), result);
-        _mm512_storeu_ps(x.as_mut_ptr().add(i + 8), result2);
+        _mm512_storeu_ps(x.as_mut_ptr().add(i), _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv)));
         i += 16;
     }
 
@@ -637,12 +681,16 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
     let mut i = 0usize;
     let mut acc_max = _mm256_set1_ps(f32::NEG_INFINITY);
 
-    // Pass 1: vectorized max scan (8 elements per iteration, 2×4-element reductions)
-    while i + 8 <= size {
+    // Pass 1: vectorized max scan (dual 8-wide, 16 elements per iteration)
+    while i + 16 <= size {
         let v0 = _mm256_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 4));
+        let v1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
         acc_max = _mm256_max_ps(acc_max, v0);
         acc_max = _mm256_max_ps(acc_max, v1);
+        i += 16;
+    }
+    while i + 8 <= size {
+        acc_max = _mm256_max_ps(acc_max, _mm256_loadu_ps(x.as_ptr().add(i)));
         i += 8;
     }
 
@@ -681,7 +729,7 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
     let ptr = x.as_mut_ptr();
     i = 0;
 
-    while i + 8 <= size {
+    while i + 16 <= size {
         // x[i] - max, clamped to [-88, 0]
         let xv = _mm256_min_ps(
             _mm256_max_ps(_mm256_sub_ps(_mm256_loadu_ps(ptr.add(i)), max_vec), exp_lo),
@@ -689,7 +737,7 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
         );
         let xv2 = _mm256_min_ps(
             _mm256_max_ps(
-                _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i + 4)), max_vec),
+                _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i + 8)), max_vec),
                 exp_lo,
             ),
             _mm256_setzero_ps(),
@@ -706,14 +754,14 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
         );
 
         let r = _mm256_fmadd_ps(
-            _mm256_sub_ps(xv, _mm256_mul_ps(n_f, ln2_hi)),
+            n_f,
             neg_ln2_lo,
-            _mm256_setzero_ps(),
+            _mm256_sub_ps(xv, _mm256_mul_ps(n_f, ln2_hi)),
         );
         let r2 = _mm256_fmadd_ps(
-            _mm256_sub_ps(xv2, _mm256_mul_ps(n_f2, ln2_hi)),
+            n_f2,
             neg_ln2_lo,
-            _mm256_setzero_ps(),
+            _mm256_sub_ps(xv2, _mm256_mul_ps(n_f2, ln2_hi)),
         );
 
         // Horner polynomial: 1 + r*(1 + r*(c2 + r*(c3 + r*(c4 + r*c5))))
@@ -773,9 +821,9 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
         let ev2 = _mm256_mul_ps(poly2, p2n2);
 
         acc_sum = _mm256_add_ps(acc_sum, _mm256_add_ps(ev, ev2));
-        _mm256_storeu_ps(ptr.add(i), ev);
-        _mm256_storeu_ps(ptr.add(i + 4), ev2);
-        i += 8;
+        _mm256_storeu_ps(ptr.add(i),     ev);
+        _mm256_storeu_ps(ptr.add(i + 8), ev2);
+        i += 16;
     }
 
     // Scalar tail for exp
@@ -797,11 +845,16 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
     let inv_sum = 1.0 / sum;
     let inv_sum_vec = _mm256_set1_ps(inv_sum);
     i = 0;
+    while i + 16 <= size {
+        let v0 = _mm256_loadu_ps(ptr.add(i));
+        let v1 = _mm256_loadu_ps(ptr.add(i + 8));
+        _mm256_storeu_ps(ptr.add(i),     _mm256_mul_ps(v0, inv_sum_vec));
+        _mm256_storeu_ps(ptr.add(i + 8), _mm256_mul_ps(v1, inv_sum_vec));
+        i += 16;
+    }
     while i + 8 <= size {
         let v0 = _mm256_loadu_ps(ptr.add(i));
-        let v1 = _mm256_loadu_ps(ptr.add(i + 4));
         _mm256_storeu_ps(ptr.add(i), _mm256_mul_ps(v0, inv_sum_vec));
-        _mm256_storeu_ps(ptr.add(i + 4), _mm256_mul_ps(v1, inv_sum_vec));
         i += 8;
     }
 
@@ -825,12 +878,16 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
     let mut i = 0usize;
     let mut acc_max = _mm512_set1_ps(f32::NEG_INFINITY);
 
-    // Pass 1: vectorized max scan (16 elements per iteration)
-    while i + 16 <= size {
+    // Pass 1: vectorized max scan (dual 16-wide, 32 elements per iteration)
+    while i + 32 <= size {
         let v0 = _mm512_loadu_ps(x.as_ptr().add(i));
-        let v1 = _mm512_loadu_ps(x.as_ptr().add(i + 8));
+        let v1 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
         acc_max = _mm512_max_ps(acc_max, v0);
         acc_max = _mm512_max_ps(acc_max, v1);
+        i += 32;
+    }
+    while i + 16 <= size {
+        acc_max = _mm512_max_ps(acc_max, _mm512_loadu_ps(x.as_ptr().add(i)));
         i += 16;
     }
 
@@ -868,14 +925,14 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
     let ptr = x.as_mut_ptr();
     i = 0;
 
-    while i + 16 <= size {
+    while i + 32 <= size {
         let xv = _mm512_min_ps(
             _mm512_max_ps(_mm512_sub_ps(_mm512_loadu_ps(ptr.add(i)), max_vec), exp_lo),
             _mm512_setzero_ps(),
         );
         let xv2 = _mm512_min_ps(
             _mm512_max_ps(
-                _mm512_sub_ps(_mm512_loadu_ps(ptr.add(i + 8)), max_vec),
+                _mm512_sub_ps(_mm512_loadu_ps(ptr.add(i + 16)), max_vec),
                 exp_lo,
             ),
             _mm512_setzero_ps(),
@@ -885,14 +942,14 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
         let n_f2 = _mm512_roundscale_ps(_mm512_mul_ps(xv2, log2e), _MM_FROUND_TO_NEAREST_INT);
 
         let r = _mm512_fmadd_ps(
-            _mm512_sub_ps(xv, _mm512_mul_ps(n_f, ln2_hi)),
+            n_f,
             neg_ln2_lo,
-            _mm512_setzero_ps(),
+            _mm512_sub_ps(xv, _mm512_mul_ps(n_f, ln2_hi)),
         );
         let r2 = _mm512_fmadd_ps(
-            _mm512_sub_ps(xv2, _mm512_mul_ps(n_f2, ln2_hi)),
+            n_f2,
             neg_ln2_lo,
-            _mm512_setzero_ps(),
+            _mm512_sub_ps(xv2, _mm512_mul_ps(n_f2, ln2_hi)),
         );
 
         let poly = _mm512_add_ps(
@@ -950,9 +1007,9 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
         let ev2 = _mm512_mul_ps(poly2, p2n2);
 
         acc_sum = _mm512_add_ps(acc_sum, _mm512_add_ps(ev, ev2));
-        _mm512_storeu_ps(ptr.add(i), ev);
-        _mm512_storeu_ps(ptr.add(i + 8), ev2);
-        i += 16;
+        _mm512_storeu_ps(ptr.add(i),      ev);
+        _mm512_storeu_ps(ptr.add(i + 16), ev2);
+        i += 32;
     }
 
     // Scalar tail
@@ -973,11 +1030,16 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
     let inv_sum = 1.0 / sum;
     let inv_sum_vec = _mm512_set1_ps(inv_sum);
     i = 0;
+    while i + 32 <= size {
+        let v0 = _mm512_loadu_ps(ptr.add(i));
+        let v1 = _mm512_loadu_ps(ptr.add(i + 16));
+        _mm512_storeu_ps(ptr.add(i),      _mm512_mul_ps(v0, inv_sum_vec));
+        _mm512_storeu_ps(ptr.add(i + 16), _mm512_mul_ps(v1, inv_sum_vec));
+        i += 32;
+    }
     while i + 16 <= size {
         let v0 = _mm512_loadu_ps(ptr.add(i));
-        let v1 = _mm512_loadu_ps(ptr.add(i + 8));
         _mm512_storeu_ps(ptr.add(i), _mm512_mul_ps(v0, inv_sum_vec));
-        _mm512_storeu_ps(ptr.add(i + 8), _mm512_mul_ps(v1, inv_sum_vec));
         i += 16;
     }
 
@@ -1191,9 +1253,9 @@ unsafe fn silu_and_mul_avx2(hb: &mut [f32], hb2: &[f32]) {
         // r = clamped - n_f * (ln2_hi + ln2_lo)
         // = clamped - n_f * ln2_hi - n_f * ln2_lo
         let r = _mm256_fmadd_ps(
-            _mm256_sub_ps(clamped, _mm256_mul_ps(n_f, _mm256_set1_ps(LN2_HI))),
+            n_f,
             _mm256_set1_ps(-LN2_LO),
-            _mm256_setzero_ps(),
+            _mm256_sub_ps(clamped, _mm256_mul_ps(n_f, _mm256_set1_ps(LN2_HI))),
         );
 
         // Horner polynomial for exp(r): 1 + r*(1 + r*(0.5 + r*(1/6 + r*(1/24 + r*(1/120))))
@@ -1289,9 +1351,9 @@ unsafe fn silu_and_mul_avx512(hb: &mut [f32], hb2: &[f32]) {
 
         // r = clamped - n_f * ln2 (computed as clamped - n_f*ln2_hi - n_f*ln2_lo)
         let r = _mm512_fmadd_ps(
-            _mm512_sub_ps(clamped, _mm512_mul_ps(n_f, _mm512_set1_ps(LN2_HI))),
+            n_f,
             _mm512_set1_ps(-LN2_LO),
-            _mm512_setzero_ps(),
+            _mm512_sub_ps(clamped, _mm512_mul_ps(n_f, _mm512_set1_ps(LN2_HI))),
         );
 
         // Horner polynomial
@@ -1386,9 +1448,9 @@ unsafe fn sigmoid_mul_avx2(dst: &mut [f32], gate: &[f32]) {
         );
 
         let r = _mm256_fmadd_ps(
-            _mm256_sub_ps(clamped, _mm256_mul_ps(n_f, _mm256_set1_ps(LN2_HI))),
+            n_f,
             _mm256_set1_ps(-LN2_LO),
-            _mm256_setzero_ps(),
+            _mm256_sub_ps(clamped, _mm256_mul_ps(n_f, _mm256_set1_ps(LN2_HI))),
         );
 
         let c5 = _mm256_set1_ps(1.0_f32 / 120.0_f32);
@@ -1477,9 +1539,9 @@ unsafe fn sigmoid_mul_avx512(dst: &mut [f32], gate: &[f32]) {
         let n_f = _mm512_roundscale_ps(_mm512_mul_ps(clamped, log2e), _MM_FROUND_TO_NEAREST_INT);
 
         let r = _mm512_fmadd_ps(
-            _mm512_sub_ps(clamped, _mm512_mul_ps(n_f, _mm512_set1_ps(LN2_HI))),
+            n_f,
             _mm512_set1_ps(-LN2_LO),
-            _mm512_setzero_ps(),
+            _mm512_sub_ps(clamped, _mm512_mul_ps(n_f, _mm512_set1_ps(LN2_HI))),
         );
 
         let c5 = _mm512_set1_ps(1.0_f32 / 120.0_f32);
@@ -1644,22 +1706,27 @@ unsafe fn sanitize_finite_avx2(x: &mut [f32]) {
     let zero = _mm256_setzero_ps();
     let mut i = 0usize;
 
-    while i + 8 <= n {
-        // Load 8 elements (2×4) and extract bits
+    while i + 16 <= n {
         let v0 = _mm256_loadu_ps(ptr.add(i));
         let bits0 = _mm256_castps_si256(v0);
         let is_naninf0 = _mm256_cmpeq_epi32(_mm256_and_si256(bits0, exp_mask), exp_check);
 
-        let v1 = _mm256_loadu_ps(ptr.add(i + 4));
+        let v1 = _mm256_loadu_ps(ptr.add(i + 8));
         let bits1 = _mm256_castps_si256(v1);
         let is_naninf1 = _mm256_cmpeq_epi32(_mm256_and_si256(bits1, exp_mask), exp_check);
 
-        // Blend: if is_naninf, use zero; otherwise use original
         let v0_clean = _mm256_blendv_ps(v0, zero, _mm256_castsi256_ps(is_naninf0));
         let v1_clean = _mm256_blendv_ps(v1, zero, _mm256_castsi256_ps(is_naninf1));
 
-        _mm256_storeu_ps(ptr.add(i), v0_clean);
-        _mm256_storeu_ps(ptr.add(i + 4), v1_clean);
+        _mm256_storeu_ps(ptr.add(i),     v0_clean);
+        _mm256_storeu_ps(ptr.add(i + 8), v1_clean);
+        i += 16;
+    }
+    while i + 8 <= n {
+        let v0 = _mm256_loadu_ps(ptr.add(i));
+        let bits0 = _mm256_castps_si256(v0);
+        let is_naninf0 = _mm256_cmpeq_epi32(_mm256_and_si256(bits0, exp_mask), exp_check);
+        _mm256_storeu_ps(ptr.add(i), _mm256_blendv_ps(v0, zero, _mm256_castsi256_ps(is_naninf0)));
         i += 8;
     }
 
@@ -1690,24 +1757,30 @@ unsafe fn sanitize_finite_avx512(x: &mut [f32]) {
     let zero = _mm512_setzero_ps();
     let mut i = 0usize;
 
-    while i + 16 <= n {
-        // Load 16 elements (2×8) and extract bits
+    while i + 32 <= n {
         let v0 = _mm512_loadu_ps(ptr.add(i));
         let bits0 = _mm512_castps_si512(v0);
         let is_naninf0 =
             _mm512_cmp_epi32_mask::<_MM_CMPINT_EQ>(_mm512_and_si512(bits0, exp_mask), exp_check);
 
-        let v1 = _mm512_loadu_ps(ptr.add(i + 8));
+        let v1 = _mm512_loadu_ps(ptr.add(i + 16));
         let bits1 = _mm512_castps_si512(v1);
         let is_naninf1 =
             _mm512_cmp_epi32_mask::<_MM_CMPINT_EQ>(_mm512_and_si512(bits1, exp_mask), exp_check);
 
-        // Blend: if is_naninf, use zero; otherwise use original
         let v0_clean = _mm512_mask_blend_ps(is_naninf0, v0, zero);
         let v1_clean = _mm512_mask_blend_ps(is_naninf1, v1, zero);
 
-        _mm512_storeu_ps(ptr.add(i), v0_clean);
-        _mm512_storeu_ps(ptr.add(i + 8), v1_clean);
+        _mm512_storeu_ps(ptr.add(i),      v0_clean);
+        _mm512_storeu_ps(ptr.add(i + 16), v1_clean);
+        i += 32;
+    }
+    while i + 16 <= n {
+        let v0 = _mm512_loadu_ps(ptr.add(i));
+        let bits0 = _mm512_castps_si512(v0);
+        let is_naninf0 =
+            _mm512_cmp_epi32_mask::<_MM_CMPINT_EQ>(_mm512_and_si512(bits0, exp_mask), exp_check);
+        _mm512_storeu_ps(ptr.add(i), _mm512_mask_blend_ps(is_naninf0, v0, zero));
         i += 16;
     }
 
