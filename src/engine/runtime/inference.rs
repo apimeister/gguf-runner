@@ -406,11 +406,11 @@ impl<'a> TurboSignRef<'a> {
 }
 
 fn turboquant_apply_signs_bits(values: &mut [f32], sign_bits: &[u8]) {
-    let table = &TURBOQUANT_NEG_SIGN_DECODE_TABLE;
     let mut i = 0usize;
     #[cfg(target_arch = "aarch64")]
     {
         use std::arch::aarch64::*;
+        let table = &TURBOQUANT_NEG_SIGN_DECODE_TABLE;
         let ptr = values.as_mut_ptr();
         // Process 8 elements at a time: one byte → 8 sign multipliers
         while i + 8 <= values.len() {
@@ -585,6 +585,7 @@ fn turboquant_transform_with_bits(values: &mut [f32], first_bits: &[u8], second_
     turboquant_apply_signs_bits(values, second_bits);
 }
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 const fn turboquant_build_q2_decode_table() -> [[f32; 4]; 256] {
     let mut table = [[0.0f32; 4]; 256];
     let mut byte = 0usize;
@@ -601,6 +602,7 @@ const fn turboquant_build_q2_decode_table() -> [[f32; 4]; 256] {
     table
 }
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 const fn turboquant_build_sign_decode_table() -> [[f32; 8]; 256] {
     let mut table = [[0.0f32; 8]; 256];
     let mut byte = 0usize;
@@ -616,7 +618,9 @@ const fn turboquant_build_sign_decode_table() -> [[f32; 8]; 256] {
     table
 }
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 static TURBOQUANT_Q2_DECODE_TABLE: [[f32; 4]; 256] = turboquant_build_q2_decode_table();
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 static TURBOQUANT_SIGN_DECODE_TABLE: [[f32; 8]; 256] = turboquant_build_sign_decode_table();
 
 /// Like TURBOQUANT_SIGN_DECODE_TABLE but with inverted convention:
@@ -638,10 +642,12 @@ const fn turboquant_build_neg_sign_decode_table() -> [[f32; 8]; 256] {
 }
 
 static TURBOQUANT_NEG_SIGN_DECODE_TABLE: [[f32; 8]; 256] = turboquant_build_neg_sign_decode_table();
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn turboquant_q2_decode_table() -> &'static [[f32; 4]; 256] {
     &TURBOQUANT_Q2_DECODE_TABLE
 }
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn turboquant_sign_decode_table() -> &'static [[f32; 8]; 256] {
     &TURBOQUANT_SIGN_DECODE_TABLE
 }

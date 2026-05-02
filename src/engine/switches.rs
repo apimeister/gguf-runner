@@ -305,6 +305,7 @@ pub(crate) fn use_x86_avx512f() -> bool {
 /// Intel Core Ultra supports this natively.
 #[cfg(target_arch = "x86_64")]
 #[inline]
+#[allow(dead_code)]
 pub(crate) fn use_x86_avx512bf16() -> bool {
     *X86_AVX512BF16_CFG.get_or_init(|| {
         std::arch::is_x86_feature_detected!("avx512bf16")
@@ -326,7 +327,7 @@ pub(crate) fn is_x86_amd() -> bool {
         use std::arch::x86_64::__cpuid;
 
         // CPUID vendor string is EBX, EDX, ECX for leaf 0.
-        let leaf0 = unsafe { __cpuid(0) };
+        let leaf0 = __cpuid(0);
         let mut vendor = [0u8; 12];
         vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
         vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());

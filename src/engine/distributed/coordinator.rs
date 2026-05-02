@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::engine::distributed::placement::{
     ClusterConfig, ClusterNodeConfig, ClusterNodeRole, MoePlacementPlan,
 };

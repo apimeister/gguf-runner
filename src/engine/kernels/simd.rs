@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 /// SIMD encoding helpers for bf16/fp16 activation transport.
 ///
 /// On x86_64 with AVX-2, processes 8 f32 values per iteration using

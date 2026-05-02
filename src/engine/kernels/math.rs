@@ -1,4 +1,5 @@
 #![allow(clippy::needless_range_loop)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::engine::kernels::{
     axpy_inplace, dot_f32_simd, matmul_quantized, matmul_quantized_rows, scale_slice_inplace,
@@ -186,7 +187,6 @@ pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], size: usize, eps: f
 #[inline]
 unsafe fn rmsnorm_x86_64(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, eps: f32) {
     use crate::engine::switches::use_x86_avx512f;
-    use std::arch::x86_64::*;
 
     if use_x86_avx512f() {
         rmsnorm_avx512(o, x, weight, size, eps);
@@ -200,7 +200,6 @@ unsafe fn rmsnorm_x86_64(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, 
 #[inline]
 unsafe fn rmsnorm_inplace_x86_64(x: &mut [f32], weight: &[f32], size: usize, eps: f32) {
     use crate::engine::switches::use_x86_avx512f;
-    use std::arch::x86_64::*;
 
     if use_x86_avx512f() {
         rmsnorm_inplace_avx512(x, weight, size, eps);
@@ -616,7 +615,6 @@ pub(crate) fn softmax(x: &mut [f32], size: usize) {
 #[inline]
 unsafe fn softmax_x86_64(x: &mut [f32], size: usize) {
     use crate::engine::switches::use_x86_avx512f;
-    use std::arch::x86_64::*;
 
     if use_x86_avx512f() {
         softmax_avx512(x, size);
@@ -1628,7 +1626,6 @@ pub(crate) fn sanitize_finite_inplace(x: &mut [f32]) {
 #[inline]
 unsafe fn sanitize_finite_x86_64(x: &mut [f32]) {
     use crate::engine::switches::use_x86_avx512f;
-    use std::arch::x86_64::*;
 
     if use_x86_avx512f() {
         sanitize_finite_avx512(x);
