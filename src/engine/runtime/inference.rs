@@ -626,6 +626,7 @@ static TURBOQUANT_SIGN_DECODE_TABLE: [[f32; 8]; 256] = turboquant_build_sign_dec
 /// Like TURBOQUANT_SIGN_DECODE_TABLE but with inverted convention:
 /// bit=1 → -1.0 (negate), bit=0 → +1.0 (keep).
 /// Used by turboquant_apply_signs_bits where bit=1 means "negate this element".
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 const fn turboquant_build_neg_sign_decode_table() -> [[f32; 8]; 256] {
     let mut table = [[0.0f32; 8]; 256];
     let mut byte = 0usize;
@@ -641,6 +642,7 @@ const fn turboquant_build_neg_sign_decode_table() -> [[f32; 8]; 256] {
     table
 }
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 static TURBOQUANT_NEG_SIGN_DECODE_TABLE: [[f32; 8]; 256] = turboquant_build_neg_sign_decode_table();
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 fn turboquant_q2_decode_table() -> &'static [[f32; 4]; 256] {

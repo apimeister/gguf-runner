@@ -669,7 +669,7 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
     // Range-reduced polynomial exp (same as silu_and_mul)
     let log2e = _mm256_set1_ps(std::f32::consts::LOG2_E);
     let ln2_hi = _mm256_set1_ps(LN2_HI);
-    let ln2_lo = _mm256_set1_ps(LN2_LO);
+    let neg_ln2_lo = _mm256_set1_ps(-LN2_LO);
     let one = _mm256_set1_ps(1.0_f32);
     let c2 = _mm256_set1_ps(0.5_f32);
     let c3 = _mm256_set1_ps(1.0_f32 / 6.0_f32);
@@ -683,14 +683,6 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
 
     while i + 8 <= size {
         // x[i] - max, clamped to [-88, 0]
-        let xv = _mm256_max_ps(
-            _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i)), max_vec),
-            _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i + 4)), max_vec),
-        );
-        let xv2 = _mm256_max_ps(
-            _mm256_sub_ps(_mm256_loadu_ps(ptr.add(i + 4)), max_vec),
-            exp_lo,
-        );
         let xv = _mm256_min_ps(
             _mm256_max_ps(_mm256_sub_ps(_mm256_loadu_ps(ptr.add(i)), max_vec), exp_lo),
             _mm256_setzero_ps(),
@@ -715,12 +707,12 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
 
         let r = _mm256_fmadd_ps(
             _mm256_sub_ps(xv, _mm256_mul_ps(n_f, ln2_hi)),
-            _mm256_set1_ps(-LN2_LO),
+            neg_ln2_lo,
             _mm256_setzero_ps(),
         );
         let r2 = _mm256_fmadd_ps(
             _mm256_sub_ps(xv2, _mm256_mul_ps(n_f2, ln2_hi)),
-            _mm256_set1_ps(-LN2_LO),
+            neg_ln2_lo,
             _mm256_setzero_ps(),
         );
 
@@ -864,7 +856,7 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
     // Pass 2: exp(x[i] - max), accumulate sum
     let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);
     let ln2_hi = _mm512_set1_ps(LN2_HI);
-    let ln2_lo = _mm512_set1_ps(LN2_LO);
+    let neg_ln2_lo = _mm512_set1_ps(-LN2_LO);
     let one = _mm512_set1_ps(1.0_f32);
     let c2 = _mm512_set1_ps(0.5_f32);
     let c3 = _mm512_set1_ps(1.0_f32 / 6.0_f32);
@@ -894,12 +886,12 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
 
         let r = _mm512_fmadd_ps(
             _mm512_sub_ps(xv, _mm512_mul_ps(n_f, ln2_hi)),
-            _mm512_set1_ps(-LN2_LO),
+            neg_ln2_lo,
             _mm512_setzero_ps(),
         );
         let r2 = _mm512_fmadd_ps(
             _mm512_sub_ps(xv2, _mm512_mul_ps(n_f2, ln2_hi)),
-            _mm512_set1_ps(-LN2_LO),
+            neg_ln2_lo,
             _mm512_setzero_ps(),
         );
 
