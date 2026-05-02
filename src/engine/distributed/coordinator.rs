@@ -691,9 +691,6 @@ impl DistributedMoeCoordinator {
 
 impl Drop for DistributedMoeCoordinator {
     fn drop(&mut self) {
-        for worker in &mut self.remote_workers {
-            worker.shutdown();
-        }
         if profiling_enabled() {
             for worker in &self.remote_workers {
                 if worker.stats.request_batches == 0 {
