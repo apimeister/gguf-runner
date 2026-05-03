@@ -588,7 +588,17 @@ impl DistributedMoeCoordinator {
         config: &Config,
     ) -> Result<Self, String> {
         let timeout = Duration::from_secs(DEFAULT_REMOTE_TIMEOUT_SECS);
-        let mut remote_workers = Vec::new();
+
+        struct WorkerSetup {
+            node_index: usize,
+            address: String,
+            hello: HelloFrame,
+            shard_header_payload: Vec<u8>,
+            shard_data: Vec<u8>,
+        }
+
+        // Phase 1: prepare shard data for every worker (sequential mmap reads).
+        let mut setups: Vec<WorkerSetup> = Vec::new();
         for (node_index, node) in plan.nodes.iter().enumerate() {
             if node.role != ClusterNodeRole::Worker || node.assigned_expert_count == 0 {
                 continue;
@@ -596,16 +606,13 @@ impl DistributedMoeCoordinator {
             let assigned_experts = plan
                 .assigned_experts_for_node(node_index)
                 .collect::<Vec<_>>();
-            // Build assigned_by_layer for this worker
             let mut assigned_by_layer = vec![Vec::new(); config.n_layers];
             for &(layer, expert_idx) in &assigned_experts {
                 assigned_by_layer[layer].push(expert_idx);
             }
             let (shard_header, shard_ranges) =
                 collect_expert_shard_ranges(gguf, config, &assigned_by_layer)?;
-            // Build shard data bytes from the mapped file ranges
-            let mut shard_data: Vec<u8> =
-                Vec::with_capacity(shard_header.total_bytes as usize);
+            let mut shard_data: Vec<u8> = Vec::with_capacity(shard_header.total_bytes as usize);
             for (offset, len) in &shard_ranges {
                 shard_data.extend_from_slice(&mapped[*offset..*offset + *len]);
             }
@@ -618,34 +625,62 @@ impl DistributedMoeCoordinator {
                 activation_dtype,
                 assigned_experts,
             };
-            let (connection, bytes_sent, bytes_received) = connect_worker_with_hello(
-                &node.address,
-                timeout,
-                &hello,
-                &node.address,
-                &shard_header_payload,
-                &shard_data,
-            )?;
-            record_distributed_transport_bytes(bytes_sent, bytes_received);
-            remote_workers.push(RemoteWorkerClient {
+            setups.push(WorkerSetup {
                 node_index,
                 address: node.address.clone(),
                 hello,
-                timeout,
-                connection,
-                stats: RemoteWorkerStats::default(),
                 shard_header_payload,
                 shard_data,
             });
         }
-        let dim = plan.inventory.dim;
-        let max_concurrent = plan
-            .nodes
-            .iter()
-            .filter(|n| n.role == ClusterNodeRole::Worker)
-            .count()
-            .max(1);
 
+        // Phase 2: connect and transfer shards to all workers in parallel.
+        // Each worker has its own dedicated network link so transfers overlap fully.
+        let connections: Vec<Result<(FramedConnection, usize, usize), String>> =
+            std::thread::scope(|s| {
+                let handles: Vec<_> = setups
+                    .iter()
+                    .map(|setup| {
+                        s.spawn(|| {
+                            connect_worker_with_hello(
+                                &setup.address,
+                                timeout,
+                                &setup.hello,
+                                &setup.address,
+                                &setup.shard_header_payload,
+                                &setup.shard_data,
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err("worker connect thread panicked".to_string())
+                        })
+                    })
+                    .collect()
+            });
+
+        let mut remote_workers = Vec::new();
+        for (setup, conn_result) in setups.into_iter().zip(connections) {
+            let (connection, bytes_sent, bytes_received) = conn_result?;
+            record_distributed_transport_bytes(bytes_sent, bytes_received);
+            remote_workers.push(RemoteWorkerClient {
+                node_index: setup.node_index,
+                address: setup.address,
+                hello: setup.hello,
+                timeout,
+                connection,
+                stats: RemoteWorkerStats::default(),
+                shard_header_payload: setup.shard_header_payload,
+                shard_data: setup.shard_data,
+            });
+        }
+
+        let dim = plan.inventory.dim;
+        let max_concurrent = remote_workers.len().max(1);
         Ok(Self {
             plan,
             activation_dtype,
