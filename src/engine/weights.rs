@@ -904,6 +904,13 @@ pub(crate) fn collect_expert_shard_ranges(
             dim: config.dim,
             expert_hidden_dim: config.expert_hidden_dim,
             entries,
+            ssm_inner_size: 0,
+            ssm_group_count: 0,
+            ssm_time_step_rank: 0,
+            ssm_state_size: 0,
+            ssm_conv_kernel: 0,
+            ssm_eps: 1e-6,
+            ssm_float_payload: Vec::new(),
         },
         ranges,
     ))
@@ -974,4 +981,142 @@ pub(crate) fn init_worker_expert_weights_from_gguf(
     }
 
     Ok(WorkerExpertWeights { experts })
+}
+
+pub(crate) struct SsmShardData {
+    pub(crate) entries: Vec<crate::engine::distributed::protocol::ShardTensorEntry>,
+    pub(crate) ranges: Vec<(usize, usize)>,
+    pub(crate) float_payload: Vec<u8>,
+    pub(crate) ssm_inner_size: usize,
+    pub(crate) ssm_group_count: usize,
+    pub(crate) ssm_time_step_rank: usize,
+    pub(crate) ssm_state_size: usize,
+    pub(crate) ssm_conv_kernel: usize,
+    pub(crate) eps: f32,
+    pub(crate) total_bytes: u64,
+}
+
+fn ssm_shard_add_tensor(
+    gguf: &GGUFFile,
+    layer: usize,
+    kind: u8,
+    name: &str,
+    entries: &mut Vec<crate::engine::distributed::protocol::ShardTensorEntry>,
+    ranges: &mut Vec<(usize, usize)>,
+    shard_offset: &mut u64,
+) -> Result<(), String> {
+    use crate::engine::distributed::protocol::ShardTensorEntry;
+    let tensor = find_gguf_tensor(gguf, name)
+        .ok_or_else(|| format!("tensor not found: {name}"))?;
+    let n_elements = tensor_n_elements(tensor);
+    let cols = tensor.ne[0] as usize;
+    if cols == 0 {
+        return Err(format!("tensor {name} has zero cols"));
+    }
+    let total_rows = n_elements / cols;
+    let block_size = get_block_size(tensor.ttype);
+    if block_size == 0 || cols % block_size != 0 {
+        return Err(format!(
+            "cols {cols} not divisible by block_size {block_size} for {name}"
+        ));
+    }
+    let row_size = get_type_size(tensor.ttype) * (cols / block_size);
+    let mmap_offset = tensor.data_offset;
+    let byte_len = total_rows * row_size;
+    entries.push(ShardTensorEntry {
+        layer,
+        expert_idx: 0,
+        kind,
+        ttype: tensor.ttype.0,
+        rows: total_rows,
+        cols,
+        byte_offset: *shard_offset,
+        byte_len: byte_len as u64,
+    });
+    ranges.push((mmap_offset, byte_len));
+    *shard_offset += byte_len as u64;
+    Ok(())
+}
+
+pub(crate) fn collect_ssm_shard_data(
+    gguf: &GGUFFile,
+    config: &Config,
+    byte_offset_start: u64,
+) -> Result<Option<SsmShardData>, String> {
+    use crate::engine::distributed::protocol::{
+        SHARD_KIND_SSM_QKV_IN, SHARD_KIND_SSM_GATE, SHARD_KIND_SSM_OUT,
+        SHARD_KIND_SSM_BA, SHARD_KIND_SSM_ALPHA, SHARD_KIND_SSM_BETA,
+    };
+
+    if config.ssm_inner_size == 0 {
+        return Ok(None);
+    }
+
+    let mut entries = Vec::new();
+    let mut ranges = Vec::new();
+    let mut shard_offset: u64 = byte_offset_start;
+
+    for l in 0..config.n_layers {
+        if find_gguf_tensor(gguf, &format!("blk.{l}.attn_qkv.weight")).is_none() {
+            continue;
+        }
+
+        ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_QKV_IN, &format!("blk.{l}.attn_qkv.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+        ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_GATE, &format!("blk.{l}.attn_gate.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+        ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_OUT, &format!("blk.{l}.ssm_out.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+
+        if find_gguf_tensor(gguf, &format!("blk.{l}.ssm_ba.weight")).is_some() {
+            ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_BA, &format!("blk.{l}.ssm_ba.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+        } else {
+            ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_ALPHA, &format!("blk.{l}.ssm_alpha.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+            ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_BETA, &format!("blk.{l}.ssm_beta.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+        }
+    }
+
+    // Build float payload
+    let ssm_v_heads = config.ssm_time_step_rank;
+    let ssm_head_dim = config.ssm_state_size;
+    let conv_dim = config.ssm_inner_size + 2 * config.ssm_group_count * config.ssm_state_size;
+
+    let mut float_payload: Vec<u8> = Vec::new();
+
+    for l in 0..config.n_layers {
+        if find_gguf_tensor(gguf, &format!("blk.{l}.attn_qkv.weight")).is_none() {
+            continue;
+        }
+
+        let conv1d = load_tensor_float(
+            gguf,
+            &format!("blk.{l}.ssm_conv1d.weight"),
+            Some(config.ssm_conv_kernel * conv_dim),
+        )?;
+        let a = load_layer_tensor_float(gguf, l, "ssm_a", ssm_v_heads)?;
+        let dt = load_layer_tensor_float(gguf, l, "ssm_dt.bias", ssm_v_heads)?;
+        let norm = load_layer_tensor_float(gguf, l, "ssm_norm.weight", ssm_head_dim)?;
+
+        float_payload.extend_from_slice(&(l as u32).to_le_bytes());
+        float_payload.extend_from_slice(&(conv1d.len() as u32).to_le_bytes());
+        for &f in &conv1d { float_payload.extend_from_slice(&f.to_le_bytes()); }
+        float_payload.extend_from_slice(&(a.len() as u32).to_le_bytes());
+        for &f in &a { float_payload.extend_from_slice(&f.to_le_bytes()); }
+        for &f in &dt { float_payload.extend_from_slice(&f.to_le_bytes()); }
+        float_payload.extend_from_slice(&(norm.len() as u32).to_le_bytes());
+        for &f in &norm { float_payload.extend_from_slice(&f.to_le_bytes()); }
+    }
+
+    let eps = if config.rms_norm_eps > 0.0 { config.rms_norm_eps } else { 1e-6 };
+    let total_bytes = shard_offset - byte_offset_start;
+
+    Ok(Some(SsmShardData {
+        entries,
+        ranges,
+        float_payload,
+        ssm_inner_size: config.ssm_inner_size,
+        ssm_group_count: config.ssm_group_count,
+        ssm_time_step_rank: config.ssm_time_step_rank,
+        ssm_state_size: config.ssm_state_size,
+        ssm_conv_kernel: config.ssm_conv_kernel,
+        eps,
+        total_bytes,
+    }))
 }

@@ -1,14 +1,19 @@
 use crate::engine::distributed::protocol::{
     DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame,
-    ReadyFrame, decode_error_frame, decode_expert_batch_request, decode_hello_frame,
-    decode_model_shard_header, encode_discover_response_frame, encode_error_frame,
-    encode_expert_batch_response, encode_ready_frame,
+    ReadyFrame, SsmLayerResponse, decode_error_frame, decode_expert_batch_request,
+    decode_hello_frame, decode_model_shard_header, decode_ssm_layer_request,
+    encode_discover_response_frame, encode_error_frame, encode_expert_batch_response,
+    encode_ready_frame, encode_ssm_layer_response,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
-use crate::engine::kernels::{matmul_quantized_rows, silu_and_mul_inplace};
-use crate::engine::types::{GgmlType, MappedFile, QuantizedTensor, WorkerExpertTensors, WorkerExpertWeights};
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use crate::engine::kernels::{matmul_quantized, matmul_quantized_rows, silu_and_mul_inplace};
+use crate::engine::switches::par_qwen3next_min_heads;
+use crate::engine::types::{
+    GgmlType, MappedFile, QuantizedTensor, WorkerExpertTensors, WorkerExpertWeights,
+    WorkerSsmLayerWeights, WorkerSsmSession,
+};
+use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,6 +33,7 @@ struct WorkerSession {
     n_layers: usize,
     n_experts: usize,
     expert_hidden_dim: usize,
+    ssm_session: Option<WorkerSsmSession>,
 }
 
 fn shard_temp_path(bind_address: &str) -> PathBuf {
@@ -147,6 +153,13 @@ impl WorkerRuntime {
         };
         let loaded_expert_count = hello.assigned_experts.len();
 
+        // Build SSM session if the shard header contains SSM data
+        let ssm_session = if shard_header.ssm_inner_size > 0 {
+            Some(build_ssm_session(&shard_header, shard_mmap.as_slice())?)
+        } else {
+            None
+        };
+
         let ready = ReadyFrame {
             node_address: self.bind_address.clone(),
             dim: shard_header.dim,
@@ -167,6 +180,7 @@ impl WorkerRuntime {
                 n_layers: shard_header.n_layers,
                 n_experts: shard_header.n_experts,
                 expert_hidden_dim: shard_header.expert_hidden_dim,
+                ssm_session,
             },
         ))
     }
@@ -259,6 +273,477 @@ impl WorkerRuntime {
     }
 }
 
+fn parse_ssm_float_payload(
+    payload: &[u8],
+    n_layers: usize,
+) -> Result<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>, String> {
+    let mut offset = 0usize;
+    let mut result = Vec::new();
+
+    let read_u32 = |buf: &[u8], off: &mut usize| -> Result<u32, String> {
+        if *off + 4 > buf.len() {
+            return Err("truncated u32 in float payload".to_string());
+        }
+        let v = u32::from_le_bytes([buf[*off], buf[*off+1], buf[*off+2], buf[*off+3]]);
+        *off += 4;
+        Ok(v)
+    };
+    let read_f32s = |buf: &[u8], off: &mut usize, count: usize| -> Result<Vec<f32>, String> {
+        let end = off.checked_add(count * 4).ok_or("float payload overflow")?;
+        if end > buf.len() {
+            return Err("truncated f32s in float payload".to_string());
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let v = f32::from_le_bytes([buf[*off], buf[*off+1], buf[*off+2], buf[*off+3]]);
+            *off += 4;
+            out.push(v);
+        }
+        Ok(out)
+    };
+
+    let _ = n_layers; // informational
+    while offset < payload.len() {
+        let layer = read_u32(payload, &mut offset)? as usize;
+        let conv1d_len = read_u32(payload, &mut offset)? as usize;
+        let conv1d = read_f32s(payload, &mut offset, conv1d_len)?;
+        let a_len = read_u32(payload, &mut offset)? as usize;
+        let a = read_f32s(payload, &mut offset, a_len)?;
+        let dt_bias = read_f32s(payload, &mut offset, a_len)?; // same len
+        let norm_len = read_u32(payload, &mut offset)? as usize;
+        let norm = read_f32s(payload, &mut offset, norm_len)?;
+        result.push((layer, conv1d, a, dt_bias, norm));
+    }
+    Ok(result)
+}
+
+fn build_ssm_session(
+    shard_header: &crate::engine::distributed::protocol::ModelShardHeaderFrame,
+    mapped: &[u8],
+) -> Result<WorkerSsmSession, String> {
+    let n_layers = shard_header.n_layers;
+    let d_inner = shard_header.ssm_inner_size;
+    let n_k_heads = shard_header.ssm_group_count;
+    let n_v_heads = shard_header.ssm_time_step_rank;
+    let head_dim = shard_header.ssm_state_size;
+    let conv_kernel = shard_header.ssm_conv_kernel;
+    let eps = shard_header.ssm_eps;
+    let dim = shard_header.dim;
+
+    let conv_dim = d_inner + 2 * n_k_heads * head_dim;
+    let hist_steps = if conv_kernel > 0 { conv_kernel - 1 } else { 0 };
+    let conv_stride = hist_steps * conv_dim;
+    let state_stride = n_v_heads * head_dim * head_dim;
+
+    // Build layer weight slots indexed by layer index
+    let mut layer_map: std::collections::HashMap<usize, [Option<QuantizedTensor>; 6]> =
+        std::collections::HashMap::new();
+    for entry in &shard_header.entries {
+        let kind = entry.kind as usize;
+        if kind < 3 || kind > 8 {
+            continue; // not an SSM entry
+        }
+        let t = QuantizedTensor {
+            data_offset: entry.byte_offset as usize,
+            ttype: GgmlType(entry.ttype),
+            rows: entry.rows,
+            cols: entry.cols,
+        };
+        let slot = layer_map.entry(entry.layer).or_insert([None, None, None, None, None, None]);
+        slot[kind - 3] = Some(t);
+    }
+
+    // Parse float payload
+    let float_data = parse_ssm_float_payload(&shard_header.ssm_float_payload, n_layers)?;
+    let mut float_by_layer: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> =
+        std::collections::HashMap::new();
+    for (layer, conv1d, a, dt_bias, norm) in float_data {
+        float_by_layer.insert(layer, (conv1d, a, dt_bias, norm));
+    }
+
+    // Build layers vec
+    let mut layers: Vec<Option<WorkerSsmLayerWeights>> = (0..n_layers).map(|_| None).collect();
+    for (layer, tensors) in layer_map {
+        if layer >= n_layers {
+            continue;
+        }
+        let [qkv_opt, gate_opt, out_opt, ba_opt, alpha_opt, beta_opt] = tensors;
+        let qkv_in = qkv_opt.ok_or_else(|| format!("SSM layer {layer}: missing qkv_in tensor"))?;
+        let gate = gate_opt.ok_or_else(|| format!("SSM layer {layer}: missing gate tensor"))?;
+        let out_proj = out_opt.ok_or_else(|| format!("SSM layer {layer}: missing out_proj tensor"))?;
+
+        let (conv1d, a, dt_bias, norm) = float_by_layer.remove(&layer)
+            .ok_or_else(|| format!("SSM layer {layer}: missing float payload"))?;
+
+        layers[layer] = Some(WorkerSsmLayerWeights {
+            qkv_in,
+            gate,
+            out_proj,
+            ba: ba_opt,
+            alpha: alpha_opt,
+            beta: beta_opt,
+            conv1d,
+            a,
+            dt_bias,
+            norm,
+        });
+    }
+
+    let _ = mapped; // SSM tensors are referenced by byte_offset into the shard mmap
+
+    let conv_state = vec![0.0f32; n_layers * conv_stride];
+    let ssm_state = vec![0.0f32; n_layers * state_stride];
+
+    Ok(WorkerSsmSession {
+        layers,
+        conv_state,
+        ssm_state,
+        dim,
+        d_inner,
+        n_k_heads,
+        n_v_heads,
+        head_dim,
+        conv_kernel,
+        n_layers,
+        eps,
+        ssm_qkv: vec![0.0f32; conv_dim],
+        ssm_z: vec![0.0f32; d_inner],
+        ssm_ba_scratch: vec![0.0f32; 2 * n_v_heads],
+        ssm_gate_exp: vec![0.0f32; n_v_heads],
+        ssm_beta_scratch: vec![0.0f32; n_v_heads],
+        ssm_conv: vec![0.0f32; conv_dim],
+        ssm_q: vec![0.0f32; d_inner],
+        ssm_k: vec![0.0f32; d_inner],
+        ssm_v: vec![0.0f32; d_inner],
+        ssm_proj: vec![0.0f32; d_inner],
+        ssm_kv_mem: vec![0.0f32; d_inner],
+        ssm_delta: vec![0.0f32; d_inner],
+    })
+}
+
+#[inline]
+fn siluf(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn sigmoidf(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+#[inline]
+fn softplusf(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+}
+
+#[inline]
+fn finite_or_zero(x: f32) -> f32 {
+    if x.is_finite() { x } else { 0.0 }
+}
+
+fn ssm_norm_silu_head(out_h: &mut [f32], z_h: &[f32], norm: &[f32], eps: f32) {
+    let head_dim = out_h.len();
+    let mut ss = 0.0f32;
+    for i in 0..head_dim {
+        ss += out_h[i] * out_h[i];
+    }
+    let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+    for i in 0..head_dim {
+        let gate = z_h[i] / (1.0 + (-z_h[i]).exp());
+        out_h[i] = out_h[i] * inv * norm[i] * gate;
+    }
+}
+
+fn worker_ssm_state_head_step(
+    state_h: &mut [f32],
+    out_h: &mut [f32],
+    kv_mem: &mut [f32],
+    delta: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g: f32,
+    beta: f32,
+) {
+    let head_dim = q.len();
+    // Scale state by gate
+    for s in state_h.iter_mut() {
+        *s *= g;
+    }
+    // kv_mem = state^T @ k  (linear attention retrieval)
+    kv_mem.fill(0.0);
+    for j in 0..head_dim {
+        let kj = k[j];
+        if kj == 0.0 { continue; }
+        let col = &state_h[j * head_dim..(j + 1) * head_dim];
+        for i in 0..head_dim {
+            kv_mem[i] += kj * col[i];
+        }
+    }
+    for i in 0..head_dim {
+        kv_mem[i] = finite_or_zero(kv_mem[i]);
+        delta[i] = finite_or_zero((v[i] - kv_mem[i]) * beta);
+    }
+    // state update: state += k outer delta
+    for j in 0..head_dim {
+        let kj = k[j];
+        if kj == 0.0 { continue; }
+        let col = &mut state_h[j * head_dim..(j + 1) * head_dim];
+        for i in 0..head_dim {
+            col[i] += kj * delta[i];
+        }
+    }
+    // output: out = state^T @ q
+    out_h.fill(0.0);
+    for j in 0..head_dim {
+        let qj = q[j];
+        if qj == 0.0 { continue; }
+        let col = &state_h[j * head_dim..(j + 1) * head_dim];
+        for i in 0..head_dim {
+            out_h[i] += qj * col[i];
+        }
+    }
+    for v in out_h.iter_mut() {
+        if !v.is_finite() { *v = 0.0; }
+    }
+}
+
+fn worker_ssm_step(
+    ssm: &mut WorkerSsmSession,
+    layer: usize,
+    xb: &[f32],
+    mapped: &[u8],
+) -> Result<Vec<f32>, String> {
+    let d_inner = ssm.d_inner;
+    let n_k_heads = ssm.n_k_heads;
+    let n_v_heads = ssm.n_v_heads;
+    let head_dim = ssm.head_dim;
+    let conv_kernel = ssm.conv_kernel;
+    let eps = ssm.eps;
+    let dim = ssm.dim;
+    let conv_dim = d_inner + 2 * n_k_heads * head_dim;
+
+    if layer >= ssm.n_layers {
+        return Err(format!("SSM layer {layer} out of range (n_layers={})", ssm.n_layers));
+    }
+
+    let layer_w = ssm.layers[layer].as_ref()
+        .ok_or_else(|| format!("SSM layer {layer} has no weights on this worker"))?;
+
+    // Input projections
+    matmul_quantized_rows(
+        &mut ssm.ssm_qkv[..conv_dim],
+        &xb[..dim],
+        &layer_w.qkv_in,
+        0,
+        conv_dim,
+        mapped,
+    )?;
+    matmul_quantized_rows(
+        &mut ssm.ssm_z[..d_inner],
+        &xb[..dim],
+        &layer_w.gate,
+        0,
+        d_inner,
+        mapped,
+    )?;
+
+    let has_fused_ba = layer_w.ba.is_some();
+
+    if has_fused_ba {
+        let ba_t = layer_w.ba.as_ref().unwrap();
+        matmul_quantized_rows(
+            &mut ssm.ssm_ba_scratch[..2 * n_v_heads],
+            &xb[..dim],
+            ba_t,
+            0,
+            2 * n_v_heads,
+            mapped,
+        )?;
+    } else {
+        let alpha_t = layer_w.alpha.as_ref()
+            .ok_or_else(|| format!("SSM layer {layer}: missing alpha tensor"))?;
+        let beta_t = layer_w.beta.as_ref()
+            .ok_or_else(|| format!("SSM layer {layer}: missing beta tensor"))?;
+        matmul_quantized_rows(
+            &mut ssm.ssm_gate_exp[..n_v_heads],
+            &xb[..dim],
+            alpha_t,
+            0,
+            n_v_heads,
+            mapped,
+        )?;
+        matmul_quantized_rows(
+            &mut ssm.ssm_beta_scratch[..n_v_heads],
+            &xb[..dim],
+            beta_t,
+            0,
+            n_v_heads,
+            mapped,
+        )?;
+    }
+
+    // Convolution
+    let hist_steps = conv_kernel - 1;
+    let conv_stride = hist_steps * conv_dim;
+    let conv_hist_off = layer * conv_stride;
+
+    {
+        let conv_hist = &mut ssm.conv_state[conv_hist_off..conv_hist_off + conv_stride];
+        let conv_w = &layer_w.conv1d;
+        let qkv_snap: Vec<f32> = ssm.ssm_qkv[..conv_dim].to_vec();
+
+        for c in 0..conv_dim {
+            let mut acc = qkv_snap[c] * conv_w[c * conv_kernel + hist_steps];
+            for t in 0..hist_steps {
+                acc += conv_hist[t * conv_dim + c] * conv_w[c * conv_kernel + t];
+            }
+            if !acc.is_finite() { acc = 0.0; }
+            ssm.ssm_conv[c] = siluf(acc);
+        }
+
+        if hist_steps > 0 {
+            if hist_steps > 1 {
+                conv_hist.copy_within(conv_dim.., 0);
+            }
+            let tail = (hist_steps - 1) * conv_dim;
+            conv_hist[tail..tail + conv_dim].copy_from_slice(&qkv_snap);
+        }
+    }
+
+    // Q/K/V split + norm
+    let q_off = 0usize;
+    let k_off = n_k_heads * head_dim;
+    let v_off = 2 * n_k_heads * head_dim;
+    let inv_scale_q = 1.0 / (head_dim as f32).sqrt();
+
+    for h in 0..n_v_heads {
+        let src_h = h % n_k_heads;
+        let q_src_start = q_off + src_h * head_dim;
+        let k_src_start = k_off + src_h * head_dim;
+        let v_src_start = v_off + h * head_dim;
+
+        let mut q_ss = 0.0f32;
+        let mut k_ss = 0.0f32;
+        for i in 0..head_dim {
+            let q_v = ssm.ssm_conv[q_src_start + i];
+            let k_v = ssm.ssm_conv[k_src_start + i];
+            q_ss += q_v * q_v;
+            k_ss += k_v * k_v;
+        }
+        let q_inv = 1.0 / (q_ss + eps).sqrt();
+        let k_inv = 1.0 / (k_ss + eps).sqrt();
+        for i in 0..head_dim {
+            ssm.ssm_q[h * head_dim + i] = finite_or_zero(ssm.ssm_conv[q_src_start + i] * q_inv * inv_scale_q);
+            ssm.ssm_k[h * head_dim + i] = finite_or_zero(ssm.ssm_conv[k_src_start + i] * k_inv);
+            ssm.ssm_v[h * head_dim + i] = finite_or_zero(ssm.ssm_conv[v_src_start + i]);
+        }
+    }
+
+    // Compute gate/beta for each head
+    let heads_per_group = n_v_heads / n_k_heads;
+    for h in 0..n_v_heads {
+        let (beta_val, alpha_val) = if has_fused_ba {
+            let group = h / heads_per_group;
+            let idx = h % heads_per_group;
+            let base = group * (2 * heads_per_group);
+            (
+                sigmoidf(ssm.ssm_ba_scratch[base + idx]),
+                ssm.ssm_ba_scratch[base + heads_per_group + idx] + layer_w.dt_bias[h],
+            )
+        } else {
+            (
+                sigmoidf(ssm.ssm_beta_scratch[h]),
+                ssm.ssm_gate_exp[h] + layer_w.dt_bias[h],
+            )
+        };
+        let mut gate = softplusf(alpha_val) * layer_w.a[h];
+        if !gate.is_finite() { gate = 0.0; }
+        ssm.ssm_beta_scratch[h] = finite_or_zero(beta_val);
+        ssm.ssm_gate_exp[h] = finite_or_zero(gate.exp());
+    }
+
+    // State update
+    let state_stride = n_v_heads * head_dim * head_dim;
+    let state_off = layer * state_stride;
+
+    let gate_all: Vec<f32> = ssm.ssm_gate_exp[..n_v_heads].to_vec();
+    let beta_all: Vec<f32> = ssm.ssm_beta_scratch[..n_v_heads].to_vec();
+
+    if n_v_heads >= par_qwen3next_min_heads() {
+        let state = &mut ssm.ssm_state[state_off..state_off + state_stride];
+        let proj_all = &mut ssm.ssm_proj[..d_inner];
+        let kv_mem_all = &mut ssm.ssm_kv_mem[..d_inner];
+        let delta_all = &mut ssm.ssm_delta[..d_inner];
+        let q_all = &ssm.ssm_q[..d_inner];
+        let k_all = &ssm.ssm_k[..d_inner];
+        let v_all = &ssm.ssm_v[..d_inner];
+
+        state
+            .par_chunks_mut(head_dim * head_dim)
+            .zip(proj_all.par_chunks_mut(head_dim))
+            .zip(kv_mem_all.par_chunks_mut(head_dim))
+            .zip(delta_all.par_chunks_mut(head_dim))
+            .enumerate()
+            .for_each(|(h, (((state_h, out_h), kv_mem), delta))| {
+                let q = &q_all[h * head_dim..(h + 1) * head_dim];
+                let k = &k_all[h * head_dim..(h + 1) * head_dim];
+                let v = &v_all[h * head_dim..(h + 1) * head_dim];
+                worker_ssm_state_head_step(
+                    state_h, out_h, kv_mem, delta, q, k, v,
+                    gate_all[h], beta_all[h],
+                );
+            });
+    } else {
+        for h in 0..n_v_heads {
+            let q: Vec<f32> = ssm.ssm_q[h * head_dim..(h + 1) * head_dim].to_vec();
+            let k: Vec<f32> = ssm.ssm_k[h * head_dim..(h + 1) * head_dim].to_vec();
+            let v: Vec<f32> = ssm.ssm_v[h * head_dim..(h + 1) * head_dim].to_vec();
+            let mut kv_mem = vec![0.0f32; head_dim];
+            let mut delta = vec![0.0f32; head_dim];
+            let state_h = &mut ssm.ssm_state[state_off + h * head_dim * head_dim..state_off + (h + 1) * head_dim * head_dim];
+            let out_h = &mut ssm.ssm_proj[h * head_dim..(h + 1) * head_dim];
+            worker_ssm_state_head_step(
+                state_h, out_h, &mut kv_mem, &mut delta, &q, &k, &v,
+                gate_all[h], beta_all[h],
+            );
+        }
+    }
+
+    // Norm + gate
+    let norm = &layer_w.norm.clone();
+    if n_v_heads >= par_qwen3next_min_heads() {
+        ssm.ssm_proj[..d_inner]
+            .par_chunks_mut(head_dim)
+            .zip(ssm.ssm_z[..d_inner].par_chunks(head_dim))
+            .for_each(|(out_h, z_h)| {
+                ssm_norm_silu_head(out_h, z_h, norm, eps);
+            });
+    } else {
+        let z_snap: Vec<f32> = ssm.ssm_z[..d_inner].to_vec();
+        for h in 0..n_v_heads {
+            let out_h = &mut ssm.ssm_proj[h * head_dim..(h + 1) * head_dim];
+            let z_h = &z_snap[h * head_dim..(h + 1) * head_dim];
+            ssm_norm_silu_head(out_h, z_h, norm, eps);
+        }
+    }
+
+    // Output projection
+    let layer_w = ssm.layers[layer].as_ref().unwrap();
+    let proj_snap: Vec<f32> = ssm.ssm_proj[..d_inner].to_vec();
+    let mut xb2 = vec![0.0f32; dim];
+    matmul_quantized(
+        &mut xb2[..dim],
+        &proj_snap,
+        &layer_w.out_proj,
+        mapped,
+    )?;
+    for v in &mut xb2[..dim] {
+        if !v.is_finite() { *v = 0.0; }
+    }
+    Ok(xb2)
+}
+
 pub(crate) fn run_worker_server(bind_address: &str) -> Result<(), String> {
     let runtime = WorkerRuntime {
         bind_address: bind_address.to_string(),
@@ -302,7 +787,7 @@ fn handle_worker_connection(
         FrameKind::Hello => {
             let hello = decode_hello_frame(&first_message.payload)?;
             match runtime.prepare_session(&hello, connection) {
-                Ok((ready, session)) => {
+                Ok((ready, mut session)) => {
                     let payload = encode_ready_frame(&ready)?;
                     connection.send_message(
                         FrameKind::Ready,
@@ -342,6 +827,38 @@ fn handle_worker_connection(
                                             &payload,
                                         )?;
                                     }
+                                }
+                            }
+                            FrameKind::SsmLayerRequest => {
+                                let mapped = session._shard.as_slice();
+                                if let Some(ssm) = &mut session.ssm_session {
+                                    let req = decode_ssm_layer_request(&message.payload)?;
+                                    match worker_ssm_step(ssm, req.layer, &req.xb, mapped) {
+                                        Ok(xb2) => {
+                                            let resp = SsmLayerResponse { layer: req.layer, xb2 };
+                                            let payload = encode_ssm_layer_response(&resp);
+                                            connection.send_message(
+                                                FrameKind::SsmLayerResponse,
+                                                message.request_id,
+                                                &payload,
+                                            )?;
+                                        }
+                                        Err(e) => {
+                                            let payload = encode_error_frame(&e)?;
+                                            connection.send_message(
+                                                FrameKind::Error,
+                                                message.request_id,
+                                                &payload,
+                                            )?;
+                                        }
+                                    }
+                                } else {
+                                    let payload = encode_error_frame("worker has no SSM session")?;
+                                    connection.send_message(
+                                        FrameKind::Error,
+                                        message.request_id,
+                                        &payload,
+                                    )?;
                                 }
                             }
                             FrameKind::Shutdown => break,

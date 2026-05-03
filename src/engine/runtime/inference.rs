@@ -1975,7 +1975,14 @@ fn transformer_inner(
 
         let is_qwen3next_ssm_layer = p.is_qwen3next && w.attn_qkv[l].rows > 0;
         if is_qwen3next_ssm_layer {
-            qwen3next_linear_attention_autoregressive(l, p, s, w, mapped, eps)?;
+            let offloaded = if let Some(exec) = moe_executor.as_deref_mut() {
+                exec.try_compute_ssm_layer(l, &s.xb[..dim], &mut s.xb2[..dim])?
+            } else {
+                false
+            };
+            if !offloaded {
+                qwen3next_linear_attention_autoregressive(l, p, s, w, mapped, eps)?;
+            }
         } else {
             let attn_prof = prof_start();
             let mut qwen3next_packed_q_gate = false;

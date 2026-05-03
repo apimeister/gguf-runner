@@ -3,9 +3,10 @@ use crate::engine::distributed::placement::{
 };
 use crate::engine::distributed::protocol::{
     ActivationDtype, DiscoverResponseFrame, ExpertBatchRequest, FrameKind, HelloFrame,
-    ReadyFrame, decode_discover_response_frame, decode_error_frame,
-    decode_expert_batch_response, decode_ready_frame, encode_expert_batch_request,
-    encode_hello_frame, encode_model_shard_header,
+    ReadyFrame, SsmLayerRequest, decode_discover_response_frame, decode_error_frame,
+    decode_expert_batch_response, decode_ready_frame, decode_ssm_layer_response,
+    encode_expert_batch_request, encode_hello_frame, encode_model_shard_header,
+    encode_ssm_layer_request,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
@@ -15,7 +16,7 @@ use crate::engine::profiling::{
     record_distributed_remote_request, record_distributed_transport_bytes,
 };
 use crate::engine::types::{Config, GGUFFile, QuantizedTensor, TransformerWeights, WorkerExpertTensors};
-use crate::engine::weights::collect_expert_shard_ranges;
+use crate::engine::weights::{collect_expert_shard_ranges, collect_ssm_shard_data};
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
@@ -153,6 +154,10 @@ pub(crate) trait MoeExpertExecutor {
         weights: &TransformerWeights,
         mapped: &[u8],
     ) -> Result<(), String>;
+
+    fn try_compute_ssm_layer(&mut self, _layer: usize, _xb: &[f32], _xb2: &mut [f32]) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,6 +432,7 @@ pub(crate) struct DistributedMoeCoordinator {
     activation_dtype: ActivationDtype,
     remote_workers: Vec<RemoteWorkerClient>,
     activation_buffer_pool: ActivationBufferPool,
+    ssm_worker_index: Option<usize>,
 }
 
 /// Pre-allocated activation buffers to avoid per-batch `input.to_vec()` allocations.
@@ -634,6 +640,40 @@ impl DistributedMoeCoordinator {
             });
         }
 
+        // SSM shard for first worker only
+        if let Some(first_setup) = setups.first_mut() {
+            if let Some(ssm_data) = collect_ssm_shard_data(gguf, config, 0)? {
+                // Parse the existing header so we can update it
+                let mut existing_header = crate::engine::distributed::protocol::decode_model_shard_header(&first_setup.shard_header_payload)
+                    .map_err(|e| format!("failed to re-decode shard header: {e}"))?;
+                let expert_total_bytes = existing_header.total_bytes;
+
+                // Shift SSM entry byte_offsets by the expert shard size and append
+                for mut entry in ssm_data.entries {
+                    entry.byte_offset += expert_total_bytes;
+                    existing_header.entries.push(entry);
+                }
+
+                // Append SSM ranges data
+                for (offset, len) in &ssm_data.ranges {
+                    first_setup.shard_data.extend_from_slice(&mapped[*offset..*offset + *len]);
+                }
+
+                // Update total_bytes and SSM fields
+                existing_header.total_bytes = expert_total_bytes + ssm_data.total_bytes;
+                existing_header.ssm_inner_size = ssm_data.ssm_inner_size;
+                existing_header.ssm_group_count = ssm_data.ssm_group_count;
+                existing_header.ssm_time_step_rank = ssm_data.ssm_time_step_rank;
+                existing_header.ssm_state_size = ssm_data.ssm_state_size;
+                existing_header.ssm_conv_kernel = ssm_data.ssm_conv_kernel;
+                existing_header.ssm_eps = ssm_data.eps;
+                existing_header.ssm_float_payload = ssm_data.float_payload;
+
+                // Re-encode
+                first_setup.shard_header_payload = encode_model_shard_header(&existing_header)?;
+            }
+        }
+
         // Phase 2: connect and transfer shards to all workers in parallel.
         // Each worker has its own dedicated network link so transfers overlap fully.
         let connections: Vec<Result<(FramedConnection, usize, usize), String>> =
@@ -681,11 +721,13 @@ impl DistributedMoeCoordinator {
 
         let dim = plan.inventory.dim;
         let max_concurrent = remote_workers.len().max(1);
+        let ssm_worker_index = if remote_workers.is_empty() { None } else { Some(0) };
         Ok(Self {
             plan,
             activation_dtype,
             remote_workers,
             activation_buffer_pool: ActivationBufferPool::new(dim, max_concurrent),
+            ssm_worker_index,
         })
     }
 
@@ -900,6 +942,30 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
             );
         }
         Ok(())
+    }
+
+    fn try_compute_ssm_layer(&mut self, layer: usize, xb: &[f32], xb2: &mut [f32]) -> Result<bool, String> {
+        let Some(ssm_idx) = self.ssm_worker_index else { return Ok(false); };
+        let dim = xb.len();
+        let request = SsmLayerRequest { layer, xb: xb.to_vec() };
+        let payload = encode_ssm_layer_request(&request);
+        let worker = &mut self.remote_workers[ssm_idx];
+        worker.connection.send_message(FrameKind::SsmLayerRequest, 0, &payload)
+            .map_err(|e| format!("SSM send to worker '{}' failed: {e}", worker.address))?;
+        let msg = worker.connection.recv_message()
+            .map_err(|e| format!("SSM recv from worker '{}' failed: {e}", worker.address))?;
+        match msg.kind {
+            FrameKind::SsmLayerResponse => {
+                let resp = decode_ssm_layer_response(&msg.payload)?;
+                if resp.xb2.len() != dim {
+                    return Err(format!("SSM response dim mismatch: got {}, expected {dim}", resp.xb2.len()));
+                }
+                xb2[..dim].copy_from_slice(&resp.xb2);
+                Ok(true)
+            }
+            FrameKind::Error => Err(format!("SSM worker error: {}", decode_error_frame(&msg.payload)?)),
+            other => Err(format!("unexpected SSM response frame {:?}", other)),
+        }
     }
 }
 

@@ -2,7 +2,7 @@ use crate::engine::io::{bf16_to_fp32, fp16_to_fp32};
 use crate::engine::kernels::{encode_bf16_vector, encode_fp16_vector};
 
 pub(crate) const DISTRIBUTED_PROTOCOL_MAGIC: u32 = 0x444D_4F45;
-pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 3;
+pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
@@ -16,6 +16,8 @@ pub(crate) enum FrameKind {
     DiscoverRequest = 7,
     DiscoverResponse = 8,
     ModelShardHeader = 9,
+    SsmLayerRequest = 10,
+    SsmLayerResponse = 11,
 }
 
 impl FrameKind {
@@ -30,10 +32,19 @@ impl FrameKind {
             7 => Ok(Self::DiscoverRequest),
             8 => Ok(Self::DiscoverResponse),
             9 => Ok(Self::ModelShardHeader),
+            10 => Ok(Self::SsmLayerRequest),
+            11 => Ok(Self::SsmLayerResponse),
             _ => Err(format!("unknown distributed frame kind {value}")),
         }
     }
 }
+
+pub(crate) const SHARD_KIND_SSM_QKV_IN: u8 = 3;
+pub(crate) const SHARD_KIND_SSM_GATE: u8 = 4;
+pub(crate) const SHARD_KIND_SSM_OUT: u8 = 5;
+pub(crate) const SHARD_KIND_SSM_BA: u8 = 6;
+pub(crate) const SHARD_KIND_SSM_ALPHA: u8 = 7;
+pub(crate) const SHARD_KIND_SSM_BETA: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
@@ -111,6 +122,24 @@ pub(crate) struct ExpertBatchResponse {
     pub(crate) dim: usize,
     pub(crate) expert_ids: Vec<usize>,
     pub(crate) outputs: Vec<Vec<f32>>,
+}
+
+fn write_f32_le(dst: &mut Vec<u8>, value: f32) {
+    dst.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_f32_le(src: &[u8], offset: &mut usize) -> Result<f32, String> {
+    if *offset + 4 > src.len() {
+        return Err("truncated f32 payload".to_string());
+    }
+    let value = f32::from_le_bytes([
+        src[*offset],
+        src[*offset + 1],
+        src[*offset + 2],
+        src[*offset + 3],
+    ]);
+    *offset += 4;
+    Ok(value)
 }
 
 fn write_u16_le(dst: &mut Vec<u8>, value: u16) {
@@ -648,6 +677,13 @@ pub(crate) struct ModelShardHeaderFrame {
     pub(crate) dim: usize,
     pub(crate) expert_hidden_dim: usize,
     pub(crate) entries: Vec<ShardTensorEntry>,
+    pub(crate) ssm_inner_size: usize,
+    pub(crate) ssm_group_count: usize,
+    pub(crate) ssm_time_step_rank: usize,
+    pub(crate) ssm_state_size: usize,
+    pub(crate) ssm_conv_kernel: usize,
+    pub(crate) ssm_eps: f32,
+    pub(crate) ssm_float_payload: Vec<u8>,
 }
 
 pub(crate) fn encode_model_shard_header(frame: &ModelShardHeaderFrame) -> Result<Vec<u8>, String> {
@@ -723,6 +759,52 @@ pub(crate) fn encode_model_shard_header(frame: &ModelShardHeaderFrame) -> Result
         write_u64_le(&mut out, entry.byte_offset);
         write_u64_le(&mut out, entry.byte_len);
     }
+    // SSM extension fields
+    write_u32_le(
+        &mut out,
+        frame
+            .ssm_inner_size
+            .try_into()
+            .map_err(|_| "ssm_inner_size overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .ssm_group_count
+            .try_into()
+            .map_err(|_| "ssm_group_count overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .ssm_time_step_rank
+            .try_into()
+            .map_err(|_| "ssm_time_step_rank overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .ssm_state_size
+            .try_into()
+            .map_err(|_| "ssm_state_size overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .ssm_conv_kernel
+            .try_into()
+            .map_err(|_| "ssm_conv_kernel overflow".to_string())?,
+    );
+    write_f32_le(&mut out, frame.ssm_eps);
+    write_u64_le(
+        &mut out,
+        frame
+            .ssm_float_payload
+            .len()
+            .try_into()
+            .map_err(|_| "ssm_float_payload length overflow".to_string())?,
+    );
+    out.extend_from_slice(&frame.ssm_float_payload);
     Ok(out)
 }
 
@@ -768,6 +850,39 @@ pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHead
             byte_len,
         });
     }
+    // SSM extension fields (optional for backward compat)
+    let (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload) =
+        if offset + 4 <= payload.len() {
+            let ssm_inner_size = read_u32_le(payload, &mut offset)? as usize;
+            let ssm_group_count = if offset + 4 <= payload.len() {
+                read_u32_le(payload, &mut offset)? as usize
+            } else { 0 };
+            let ssm_time_step_rank = if offset + 4 <= payload.len() {
+                read_u32_le(payload, &mut offset)? as usize
+            } else { 0 };
+            let ssm_state_size = if offset + 4 <= payload.len() {
+                read_u32_le(payload, &mut offset)? as usize
+            } else { 0 };
+            let ssm_conv_kernel = if offset + 4 <= payload.len() {
+                read_u32_le(payload, &mut offset)? as usize
+            } else { 0 };
+            let ssm_eps = if offset + 4 <= payload.len() {
+                read_f32_le(payload, &mut offset)?
+            } else { 1e-6 };
+            let ssm_float_payload = if offset + 8 <= payload.len() {
+                let payload_len = read_u64_le(payload, &mut offset)? as usize;
+                let end = offset.checked_add(payload_len)
+                    .ok_or_else(|| "ssm_float_payload overflow".to_string())?;
+                if end > payload.len() {
+                    return Err("truncated ssm_float_payload".to_string());
+                }
+                payload[offset..end].to_vec()
+            } else { Vec::new() };
+            (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload)
+        } else {
+            (0, 0, 0, 0, 0, 1e-6f32, Vec::new())
+        };
+
     Ok(ModelShardHeaderFrame {
         total_bytes,
         n_layers,
@@ -775,6 +890,13 @@ pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHead
         dim,
         expert_hidden_dim,
         entries,
+        ssm_inner_size,
+        ssm_group_count,
+        ssm_time_step_rank,
+        ssm_state_size,
+        ssm_conv_kernel,
+        ssm_eps,
+        ssm_float_payload,
     })
 }
 
@@ -789,6 +911,68 @@ pub(crate) fn decode_error_frame(payload: &[u8]) -> Result<String, String> {
     }
     String::from_utf8(payload[offset..end].to_vec())
         .map_err(|e| format!("distributed error payload was not valid utf-8: {e}"))
+}
+
+pub(crate) struct SsmLayerRequest {
+    pub(crate) layer: usize,
+    pub(crate) xb: Vec<f32>,
+}
+
+pub(crate) struct SsmLayerResponse {
+    pub(crate) layer: usize,
+    pub(crate) xb2: Vec<f32>,
+}
+
+pub(crate) fn encode_ssm_layer_request(frame: &SsmLayerRequest) -> Vec<u8> {
+    let dim = frame.xb.len();
+    let mut out = Vec::with_capacity(8 + dim * 4);
+    write_u32_le(&mut out, frame.layer as u32);
+    write_u32_le(&mut out, dim as u32);
+    for &v in &frame.xb {
+        write_f32_le(&mut out, v);
+    }
+    out
+}
+
+pub(crate) fn decode_ssm_layer_request(payload: &[u8]) -> Result<SsmLayerRequest, String> {
+    let mut offset = 0usize;
+    let layer = read_u32_le(payload, &mut offset)? as usize;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let expected = offset + dim * 4;
+    if expected > payload.len() {
+        return Err("truncated SSM layer request xb".to_string());
+    }
+    let mut xb = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        xb.push(read_f32_le(payload, &mut offset)?);
+    }
+    Ok(SsmLayerRequest { layer, xb })
+}
+
+pub(crate) fn encode_ssm_layer_response(frame: &SsmLayerResponse) -> Vec<u8> {
+    let dim = frame.xb2.len();
+    let mut out = Vec::with_capacity(8 + dim * 4);
+    write_u32_le(&mut out, frame.layer as u32);
+    write_u32_le(&mut out, dim as u32);
+    for &v in &frame.xb2 {
+        write_f32_le(&mut out, v);
+    }
+    out
+}
+
+pub(crate) fn decode_ssm_layer_response(payload: &[u8]) -> Result<SsmLayerResponse, String> {
+    let mut offset = 0usize;
+    let layer = read_u32_le(payload, &mut offset)? as usize;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let expected = offset + dim * 4;
+    if expected > payload.len() {
+        return Err("truncated SSM layer response xb2".to_string());
+    }
+    let mut xb2 = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        xb2.push(read_f32_le(payload, &mut offset)?);
+    }
+    Ok(SsmLayerResponse { layer, xb2 })
 }
 
 #[cfg(test)]

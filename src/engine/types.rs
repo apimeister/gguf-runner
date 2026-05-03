@@ -458,6 +458,46 @@ pub(crate) struct WorkerExpertWeights {
     pub(crate) experts: Vec<Vec<Option<WorkerExpertTensors>>>,
 }
 
+pub(crate) struct WorkerSsmLayerWeights {
+    pub(crate) qkv_in: QuantizedTensor,
+    pub(crate) gate: QuantizedTensor,
+    pub(crate) out_proj: QuantizedTensor,
+    pub(crate) ba: Option<QuantizedTensor>,
+    pub(crate) alpha: Option<QuantizedTensor>,
+    pub(crate) beta: Option<QuantizedTensor>,
+    pub(crate) conv1d: Vec<f32>,
+    pub(crate) a: Vec<f32>,
+    pub(crate) dt_bias: Vec<f32>,
+    pub(crate) norm: Vec<f32>,
+}
+
+pub(crate) struct WorkerSsmSession {
+    pub(crate) layers: Vec<Option<WorkerSsmLayerWeights>>,
+    pub(crate) conv_state: Vec<f32>,
+    pub(crate) ssm_state: Vec<f32>,
+    pub(crate) dim: usize,
+    pub(crate) d_inner: usize,
+    pub(crate) n_k_heads: usize,
+    pub(crate) n_v_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) conv_kernel: usize,
+    pub(crate) n_layers: usize,
+    pub(crate) eps: f32,
+    // scratch buffers (pre-allocated):
+    pub(crate) ssm_qkv: Vec<f32>,
+    pub(crate) ssm_z: Vec<f32>,
+    pub(crate) ssm_ba_scratch: Vec<f32>,
+    pub(crate) ssm_gate_exp: Vec<f32>,
+    pub(crate) ssm_beta_scratch: Vec<f32>,
+    pub(crate) ssm_conv: Vec<f32>,
+    pub(crate) ssm_q: Vec<f32>,
+    pub(crate) ssm_k: Vec<f32>,
+    pub(crate) ssm_v: Vec<f32>,
+    pub(crate) ssm_proj: Vec<f32>,
+    pub(crate) ssm_kv_mem: Vec<f32>,
+    pub(crate) ssm_delta: Vec<f32>,
+}
+
 pub(crate) struct RunState {
     pub(crate) x: Vec<f32>,
     pub(crate) xb: Vec<f32>,
