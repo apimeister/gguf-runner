@@ -9,7 +9,6 @@ use crate::cli::CliOptions;
 use crate::engine::distributed::{
     ClusterConfig, ClusterNodeConfig, ClusterNodeRole, MoePlacementPlan,
 };
-use crate::engine::io::parse_gguf_file;
 use crate::engine::profiling::{print_profile_report, profiling_reset, set_profiling_enabled};
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::aarch64_matmul_prefetch_rows;
@@ -369,9 +368,7 @@ fn run_distributed_worker_mode(cli: &CliOptions) -> Result<(), String> {
     println!("Distributed worker bootstrap");
     println!("bind: {}", bind_address);
     println!("resource discovery: assignment and placement are provided by the coordinator");
-    let gguf = parse_gguf_file(&cli.model, cli.debug)?;
-    let config = crate::vendors::build_config_from_gguf(&gguf, cli.debug)?;
-    crate::engine::distributed::worker::run_worker_server(gguf, config, bind_address)
+    crate::engine::distributed::worker::run_worker_server(bind_address)
 }
 
 fn run_oneshot_mode(

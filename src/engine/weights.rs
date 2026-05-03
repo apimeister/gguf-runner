@@ -823,6 +823,92 @@ pub(crate) fn init_weights_from_gguf_with_local_experts(
     })
 }
 
+pub(crate) fn collect_expert_shard_ranges(
+    gguf: &GGUFFile,
+    config: &Config,
+    assigned_by_layer: &[Vec<usize>],
+) -> Result<
+    (
+        crate::engine::distributed::protocol::ModelShardHeaderFrame,
+        Vec<(usize, usize)>,
+    ),
+    String,
+> {
+    use crate::engine::distributed::protocol::{ModelShardHeaderFrame, ShardTensorEntry};
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut entries: Vec<ShardTensorEntry> = Vec::new();
+    let mut shard_offset: u64 = 0;
+
+    for (layer, layer_experts) in assigned_by_layer.iter().enumerate() {
+        for &expert_idx in layer_experts {
+            let gate_row_start = expert_idx * config.expert_hidden_dim;
+            let down_row_start = expert_idx * config.dim;
+
+            for &(kind, suffix, row_start, n_rows, cols) in &[
+                (
+                    0u8,
+                    "ffn_gate_exps.weight",
+                    gate_row_start,
+                    config.expert_hidden_dim,
+                    config.dim,
+                ),
+                (
+                    1u8,
+                    "ffn_up_exps.weight",
+                    gate_row_start,
+                    config.expert_hidden_dim,
+                    config.dim,
+                ),
+                (
+                    2u8,
+                    "ffn_down_exps.weight",
+                    down_row_start,
+                    config.dim,
+                    config.expert_hidden_dim,
+                ),
+            ] {
+                let name = format!("blk.{layer}.{suffix}");
+                let tensor = find_gguf_tensor(gguf, &name)
+                    .ok_or_else(|| format!("tensor not found: {name}"))?;
+                let block_size = get_block_size(tensor.ttype);
+                if block_size == 0 || cols % block_size != 0 {
+                    return Err(format!(
+                        "cols {cols} not divisible by block_size {block_size} for {name}"
+                    ));
+                }
+                let row_size = get_type_size(tensor.ttype) * (cols / block_size);
+                let mmap_offset = tensor.data_offset + row_start * row_size;
+                let byte_len = n_rows * row_size;
+                entries.push(ShardTensorEntry {
+                    layer,
+                    expert_idx,
+                    kind,
+                    ttype: tensor.ttype.0,
+                    rows: n_rows,
+                    cols,
+                    byte_offset: shard_offset,
+                    byte_len: byte_len as u64,
+                });
+                ranges.push((mmap_offset, byte_len));
+                shard_offset += byte_len as u64;
+            }
+        }
+    }
+
+    Ok((
+        ModelShardHeaderFrame {
+            total_bytes: shard_offset,
+            n_layers: config.n_layers,
+            n_experts: config.n_experts,
+            dim: config.dim,
+            expert_hidden_dim: config.expert_hidden_dim,
+            entries,
+        },
+        ranges,
+    ))
+}
+
 pub(crate) fn init_worker_expert_weights_from_gguf(
     gguf: &GGUFFile,
     p: &Config,

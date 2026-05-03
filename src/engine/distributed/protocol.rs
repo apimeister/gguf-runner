@@ -2,7 +2,7 @@ use crate::engine::io::{bf16_to_fp32, fp16_to_fp32};
 use crate::engine::kernels::{encode_bf16_vector, encode_fp16_vector};
 
 pub(crate) const DISTRIBUTED_PROTOCOL_MAGIC: u32 = 0x444D_4F45;
-pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 2;
+pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
@@ -15,6 +15,7 @@ pub(crate) enum FrameKind {
     Shutdown = 6,
     DiscoverRequest = 7,
     DiscoverResponse = 8,
+    ModelShardHeader = 9,
 }
 
 impl FrameKind {
@@ -28,6 +29,7 @@ impl FrameKind {
             6 => Ok(Self::Shutdown),
             7 => Ok(Self::DiscoverRequest),
             8 => Ok(Self::DiscoverResponse),
+            9 => Ok(Self::ModelShardHeader),
             _ => Err(format!("unknown distributed frame kind {value}")),
         }
     }
@@ -626,6 +628,154 @@ pub(crate) fn encode_error_frame(message: &str) -> Result<Vec<u8>, String> {
     write_u32_le(&mut out, len);
     out.extend_from_slice(bytes);
     Ok(out)
+}
+
+pub(crate) struct ShardTensorEntry {
+    pub(crate) layer: usize,
+    pub(crate) expert_idx: usize,
+    pub(crate) kind: u8, // 0=gate, 1=up, 2=down
+    pub(crate) ttype: i32,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: u64,
+}
+
+pub(crate) struct ModelShardHeaderFrame {
+    pub(crate) total_bytes: u64,
+    pub(crate) n_layers: usize,
+    pub(crate) n_experts: usize,
+    pub(crate) dim: usize,
+    pub(crate) expert_hidden_dim: usize,
+    pub(crate) entries: Vec<ShardTensorEntry>,
+}
+
+pub(crate) fn encode_model_shard_header(frame: &ModelShardHeaderFrame) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    write_u64_le(&mut out, frame.total_bytes);
+    write_u32_le(
+        &mut out,
+        frame
+            .n_layers
+            .try_into()
+            .map_err(|_| "n_layers overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .n_experts
+            .try_into()
+            .map_err(|_| "n_experts overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .dim
+            .try_into()
+            .map_err(|_| "dim overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .expert_hidden_dim
+            .try_into()
+            .map_err(|_| "expert_hidden_dim overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .entries
+            .len()
+            .try_into()
+            .map_err(|_| "entries count overflow".to_string())?,
+    );
+    for entry in &frame.entries {
+        write_u32_le(
+            &mut out,
+            entry
+                .layer
+                .try_into()
+                .map_err(|_| "entry layer overflow".to_string())?,
+        );
+        write_u32_le(
+            &mut out,
+            entry
+                .expert_idx
+                .try_into()
+                .map_err(|_| "entry expert_idx overflow".to_string())?,
+        );
+        out.push(entry.kind);
+        out.extend_from_slice(&entry.ttype.to_le_bytes());
+        write_u32_le(
+            &mut out,
+            entry
+                .rows
+                .try_into()
+                .map_err(|_| "entry rows overflow".to_string())?,
+        );
+        write_u32_le(
+            &mut out,
+            entry
+                .cols
+                .try_into()
+                .map_err(|_| "entry cols overflow".to_string())?,
+        );
+        write_u64_le(&mut out, entry.byte_offset);
+        write_u64_le(&mut out, entry.byte_len);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHeaderFrame, String> {
+    let mut offset = 0usize;
+    let total_bytes = read_u64_le(payload, &mut offset)?;
+    let n_layers = read_u32_le(payload, &mut offset)? as usize;
+    let n_experts = read_u32_le(payload, &mut offset)? as usize;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let expert_hidden_dim = read_u32_le(payload, &mut offset)? as usize;
+    let n_entries = read_u32_le(payload, &mut offset)? as usize;
+    let mut entries = Vec::with_capacity(n_entries);
+    for _ in 0..n_entries {
+        let layer = read_u32_le(payload, &mut offset)? as usize;
+        let expert_idx = read_u32_le(payload, &mut offset)? as usize;
+        if offset >= payload.len() {
+            return Err("truncated shard header entry kind".to_string());
+        }
+        let kind = payload[offset];
+        offset += 1;
+        if offset + 4 > payload.len() {
+            return Err("truncated shard header entry ttype".to_string());
+        }
+        let ttype = i32::from_le_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]);
+        offset += 4;
+        let rows = read_u32_le(payload, &mut offset)? as usize;
+        let cols = read_u32_le(payload, &mut offset)? as usize;
+        let byte_offset = read_u64_le(payload, &mut offset)?;
+        let byte_len = read_u64_le(payload, &mut offset)?;
+        entries.push(ShardTensorEntry {
+            layer,
+            expert_idx,
+            kind,
+            ttype,
+            rows,
+            cols,
+            byte_offset,
+            byte_len,
+        });
+    }
+    Ok(ModelShardHeaderFrame {
+        total_bytes,
+        n_layers,
+        n_experts,
+        dim,
+        expert_hidden_dim,
+        entries,
+    })
 }
 
 pub(crate) fn decode_error_frame(payload: &[u8]) -> Result<String, String> {

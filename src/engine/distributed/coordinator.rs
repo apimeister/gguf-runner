@@ -2,9 +2,10 @@ use crate::engine::distributed::placement::{
     ClusterConfig, ClusterNodeConfig, ClusterNodeRole, MoePlacementPlan,
 };
 use crate::engine::distributed::protocol::{
-    ActivationDtype, DiscoverResponseFrame, ExpertBatchRequest, FrameKind, HelloFrame, ReadyFrame,
-    decode_discover_response_frame, decode_error_frame, decode_expert_batch_response,
-    decode_ready_frame, encode_expert_batch_request, encode_hello_frame,
+    ActivationDtype, DiscoverResponseFrame, ExpertBatchRequest, FrameKind, HelloFrame,
+    ReadyFrame, decode_discover_response_frame, decode_error_frame,
+    decode_expert_batch_response, decode_ready_frame, encode_expert_batch_request,
+    encode_hello_frame, encode_model_shard_header,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
@@ -13,7 +14,8 @@ use crate::engine::profiling::{
     profiling_enabled, record_distributed_coordinator_timing, record_distributed_local_experts,
     record_distributed_remote_request, record_distributed_transport_bytes,
 };
-use crate::engine::types::{Config, QuantizedTensor, TransformerWeights, WorkerExpertTensors};
+use crate::engine::types::{Config, GGUFFile, QuantizedTensor, TransformerWeights, WorkerExpertTensors};
+use crate::engine::weights::collect_expert_shard_ranges;
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
@@ -109,9 +111,10 @@ pub(crate) fn discover_cluster_resources(
                     node.address, response.node_address
                 ));
             }
-            if response.dim != config.dim
-                || response.n_layers != config.n_layers
-                || response.n_experts != config.n_experts
+            if response.dim != 0
+                && (response.dim != config.dim
+                    || response.n_layers != config.n_layers
+                    || response.n_experts != config.n_experts)
             {
                 return Err(format!(
                     "worker '{}' reported mismatched model metadata during discovery",
@@ -366,6 +369,8 @@ struct RemoteWorkerClient {
     timeout: Duration,
     connection: FramedConnection,
     stats: RemoteWorkerStats,
+    shard_header_payload: Vec<u8>,
+    shard_data: Vec<u8>,
 }
 
 #[allow(dead_code)]
@@ -376,8 +381,14 @@ impl RemoteWorkerClient {
     }
 
     fn reconnect(&mut self) -> Result<(), String> {
-        let (connection, bytes_sent, bytes_received) =
-            connect_worker_with_hello(&self.address, self.timeout, &self.hello, &self.address)?;
+        let (connection, bytes_sent, bytes_received) = connect_worker_with_hello(
+            &self.address,
+            self.timeout,
+            &self.hello,
+            &self.address,
+            &self.shard_header_payload,
+            &self.shard_data,
+        )?;
         self.connection = connection;
         record_distributed_transport_bytes(bytes_sent, bytes_received);
         Ok(())
@@ -459,8 +470,11 @@ fn connect_worker_with_hello(
     timeout: Duration,
     hello: &HelloFrame,
     worker_address: &str,
+    shard_header_payload: &[u8],
+    shard_data: &[u8],
 ) -> Result<(FramedConnection, usize, usize), String> {
     let hello_payload = encode_hello_frame(hello)?;
+    let total_mb = shard_data.len() as f64 / (1024.0 * 1024.0);
     let mut last_transport_error = None;
     for attempt in 0..DEFAULT_REMOTE_RETRY_ATTEMPTS {
         let mut connection = match FramedConnection::connect(address, timeout) {
@@ -484,6 +498,38 @@ fn connect_worker_with_hello(
                 ));
                 continue;
             }
+            break;
+        }
+        // Send shard header frame and raw shard data before waiting for Ready
+        if let Err(err) =
+            connection.send_message(FrameKind::ModelShardHeader, 0, shard_header_payload)
+        {
+            last_transport_error = Some(err);
+            if attempt + 1 < DEFAULT_REMOTE_RETRY_ATTEMPTS {
+                sleep(Duration::from_millis(
+                    DEFAULT_REMOTE_RETRY_BACKOFF_MS * (attempt as u64 + 1),
+                ));
+                continue;
+            }
+            break;
+        }
+        // Switch to long timeout for the raw data transfer
+        if let Err(err) = connection.set_timeout(Duration::from_secs(600)) {
+            last_transport_error = Some(err);
+            break;
+        }
+        println!(
+            "Sending model shard to worker '{}': {:.1} MiB",
+            worker_address, total_mb
+        );
+        // Send raw bytes: write u64 length then data
+        if let Err(err) = connection.send_raw_slices(shard_data, &[(0, shard_data.len())]) {
+            last_transport_error = Some(err);
+            break;
+        }
+        // Restore normal timeout
+        if let Err(err) = connection.set_timeout(timeout) {
+            last_transport_error = Some(err);
             break;
         }
         let message = match connection.recv_message() {
@@ -537,6 +583,9 @@ impl DistributedMoeCoordinator {
     pub(crate) fn connect(
         plan: MoePlacementPlan,
         activation_dtype: ActivationDtype,
+        gguf: &GGUFFile,
+        mapped: &[u8],
+        config: &Config,
     ) -> Result<Self, String> {
         let timeout = Duration::from_secs(DEFAULT_REMOTE_TIMEOUT_SECS);
         let mut remote_workers = Vec::new();
@@ -547,6 +596,20 @@ impl DistributedMoeCoordinator {
             let assigned_experts = plan
                 .assigned_experts_for_node(node_index)
                 .collect::<Vec<_>>();
+            // Build assigned_by_layer for this worker
+            let mut assigned_by_layer = vec![Vec::new(); config.n_layers];
+            for &(layer, expert_idx) in &assigned_experts {
+                assigned_by_layer[layer].push(expert_idx);
+            }
+            let (shard_header, shard_ranges) =
+                collect_expert_shard_ranges(gguf, config, &assigned_by_layer)?;
+            // Build shard data bytes from the mapped file ranges
+            let mut shard_data: Vec<u8> =
+                Vec::with_capacity(shard_header.total_bytes as usize);
+            for (offset, len) in &shard_ranges {
+                shard_data.extend_from_slice(&mapped[*offset..*offset + *len]);
+            }
+            let shard_header_payload = encode_model_shard_header(&shard_header)?;
             let hello = HelloFrame {
                 node_address: node.address.clone(),
                 dim: plan.inventory.dim,
@@ -555,8 +618,14 @@ impl DistributedMoeCoordinator {
                 activation_dtype,
                 assigned_experts,
             };
-            let (connection, bytes_sent, bytes_received) =
-                connect_worker_with_hello(&node.address, timeout, &hello, &node.address)?;
+            let (connection, bytes_sent, bytes_received) = connect_worker_with_hello(
+                &node.address,
+                timeout,
+                &hello,
+                &node.address,
+                &shard_header_payload,
+                &shard_data,
+            )?;
             record_distributed_transport_bytes(bytes_sent, bytes_received);
             remote_workers.push(RemoteWorkerClient {
                 node_index,
@@ -565,6 +634,8 @@ impl DistributedMoeCoordinator {
                 timeout,
                 connection,
                 stats: RemoteWorkerStats::default(),
+                shard_header_payload,
+                shard_data,
             });
         }
         let dim = plan.inventory.dim;
