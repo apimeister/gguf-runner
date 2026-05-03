@@ -124,6 +124,9 @@ impl WorkerRuntime {
         let mut tensor_map: std::collections::HashMap<(usize, usize), [Option<QuantizedTensor>; 3]> =
             Default::default();
         for entry in &shard_header.entries {
+            if entry.kind > 2 {
+                continue; // SSM entries (kind 3-8) are handled by build_ssm_session
+            }
             let t = QuantizedTensor {
                 data_offset: entry.byte_offset as usize,
                 ttype: GgmlType(entry.ttype),
