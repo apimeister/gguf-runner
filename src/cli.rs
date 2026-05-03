@@ -595,7 +595,7 @@ fn normalize_description_text(raw: String) -> Option<String> {
 struct Cli {
     #[arg(
         long,
-        required_unless_present = "show_features",
+        required_unless_present_any = ["show_features", "distributed_worker"],
         default_value = "",
         value_name = "model.gguf"
     )]
