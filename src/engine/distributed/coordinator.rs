@@ -16,7 +16,7 @@ use crate::engine::profiling::{
     record_distributed_remote_request, record_distributed_transport_bytes,
 };
 use crate::engine::types::{Config, GGUFFile, QuantizedTensor, TransformerWeights, WorkerExpertTensors};
-use crate::engine::weights::{collect_expert_shard_ranges, collect_ssm_shard_data};
+use crate::engine::weights::{collect_expert_shard_ranges, collect_gate_routing_data, collect_ssm_shard_data};
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
@@ -671,6 +671,37 @@ impl DistributedMoeCoordinator {
 
                 // Re-encode
                 first_setup.shard_header_payload = encode_model_shard_header(&existing_header)?;
+            }
+        }
+
+        // Gate routing tensors for all workers (enables speculative routing)
+        // Collect once; byte offsets are shifted per-worker relative to each worker's current shard end.
+        let gate_data_opt = collect_gate_routing_data(gguf, config, 0)?;
+        if let Some(ref gate_data) = gate_data_opt {
+            for setup in setups.iter_mut() {
+                let mut hdr = crate::engine::distributed::protocol::decode_model_shard_header(
+                    &setup.shard_header_payload,
+                )
+                .map_err(|e| format!("failed to re-decode shard header for gate merge: {e}"))?;
+                let base = hdr.total_bytes;
+                for entry in &gate_data.entries {
+                    hdr.entries.push(crate::engine::distributed::protocol::ShardTensorEntry {
+                        layer: entry.layer,
+                        expert_idx: entry.expert_idx,
+                        kind: entry.kind,
+                        ttype: entry.ttype,
+                        rows: entry.rows,
+                        cols: entry.cols,
+                        byte_offset: entry.byte_offset + base,
+                        byte_len: entry.byte_len,
+                    });
+                }
+                for (offset, len) in &gate_data.ranges {
+                    setup.shard_data.extend_from_slice(&mapped[*offset..*offset + *len]);
+                }
+                hdr.total_bytes = base + gate_data.total_bytes;
+                hdr.n_experts_per_tok = config.n_experts_used;
+                setup.shard_header_payload = encode_model_shard_header(&hdr)?;
             }
         }
 
