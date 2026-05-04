@@ -912,6 +912,8 @@ pub(crate) fn collect_expert_shard_ranges(
             ssm_eps: 1e-6,
             ssm_float_payload: Vec::new(),
             n_experts_per_tok: 0,
+            moe_n_group: 0,
+            moe_topk_group: 0,
         },
         ranges,
     ))

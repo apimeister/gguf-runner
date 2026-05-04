@@ -701,6 +701,8 @@ impl DistributedMoeCoordinator {
                 }
                 hdr.total_bytes = base + gate_data.total_bytes;
                 hdr.n_experts_per_tok = config.n_experts_used;
+                hdr.moe_n_group = config.moe_n_group;
+                hdr.moe_topk_group = config.moe_topk_group;
                 setup.shard_header_payload = encode_model_shard_header(&hdr)?;
             }
         }

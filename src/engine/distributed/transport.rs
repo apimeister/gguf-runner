@@ -23,6 +23,9 @@ impl FramedConnection {
         let stream = TcpStream::connect(address)
             .map_err(|e| format!("failed to connect to '{address}': {e}"))?;
         stream
+            .set_nodelay(true)
+            .map_err(|e| format!("failed to set TCP_NODELAY for '{address}': {e}"))?;
+        stream
             .set_read_timeout(Some(timeout))
             .map_err(|e| format!("failed to set read timeout for '{address}': {e}"))?;
         stream
@@ -32,6 +35,9 @@ impl FramedConnection {
     }
 
     pub(crate) fn from_stream(stream: TcpStream, timeout: Duration) -> Result<Self, String> {
+        stream
+            .set_nodelay(true)
+            .map_err(|e| format!("failed to set TCP_NODELAY: {e}"))?;
         stream
             .set_read_timeout(Some(timeout))
             .map_err(|e| format!("failed to set read timeout: {e}"))?;

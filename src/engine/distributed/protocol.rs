@@ -686,6 +686,8 @@ pub(crate) struct ModelShardHeaderFrame {
     pub(crate) ssm_eps: f32,
     pub(crate) ssm_float_payload: Vec<u8>,
     pub(crate) n_experts_per_tok: usize,
+    pub(crate) moe_n_group: usize,
+    pub(crate) moe_topk_group: usize,
 }
 
 pub(crate) fn encode_model_shard_header(frame: &ModelShardHeaderFrame) -> Result<Vec<u8>, String> {
@@ -814,6 +816,20 @@ pub(crate) fn encode_model_shard_header(frame: &ModelShardHeaderFrame) -> Result
             .try_into()
             .map_err(|_| "n_experts_per_tok overflow".to_string())?,
     );
+    write_u32_le(
+        &mut out,
+        frame
+            .moe_n_group
+            .try_into()
+            .map_err(|_| "moe_n_group overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .moe_topk_group
+            .try_into()
+            .map_err(|_| "moe_topk_group overflow".to_string())?,
+    );
     Ok(out)
 }
 
@@ -860,7 +876,7 @@ pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHead
         });
     }
     // SSM extension fields (optional for backward compat)
-    let (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload, n_experts_per_tok) =
+    let (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload, n_experts_per_tok, moe_n_group, moe_topk_group) =
         if offset + 4 <= payload.len() {
             let ssm_inner_size = read_u32_le(payload, &mut offset)? as usize;
             let ssm_group_count = if offset + 4 <= payload.len() {
@@ -890,9 +906,15 @@ pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHead
             let n_experts_per_tok = if offset + 4 <= payload.len() {
                 read_u32_le(payload, &mut offset)? as usize
             } else { 0 };
-            (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload, n_experts_per_tok)
+            let moe_n_group = if offset + 4 <= payload.len() {
+                read_u32_le(payload, &mut offset)? as usize
+            } else { 0 };
+            let moe_topk_group = if offset + 4 <= payload.len() {
+                read_u32_le(payload, &mut offset)? as usize
+            } else { 0 };
+            (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload, n_experts_per_tok, moe_n_group, moe_topk_group)
         } else {
-            (0, 0, 0, 0, 0, 1e-6f32, Vec::new(), 0)
+            (0, 0, 0, 0, 0, 1e-6f32, Vec::new(), 0, 0, 0)
         };
 
     Ok(ModelShardHeaderFrame {
@@ -910,6 +932,8 @@ pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHead
         ssm_eps,
         ssm_float_payload,
         n_experts_per_tok,
+        moe_n_group,
+        moe_topk_group,
     })
 }
 

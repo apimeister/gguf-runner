@@ -47,9 +47,12 @@ struct WorkerSession {
     gate_layers: Vec<Option<WorkerGateLayerData>>,
     moe_layer_indices: Vec<usize>,
     n_experts_per_tok: usize,
+    moe_n_group: usize,
+    moe_topk_group: usize,
     speculation: Option<SpeculationCache>,
     last_activation: Vec<f32>,
     spec_logits: Vec<f32>,
+    spec_group_scores: Vec<f32>,
 }
 
 fn shard_temp_path(bind_address: &str) -> PathBuf {
@@ -185,6 +188,8 @@ impl WorkerRuntime {
             .filter(|&l| gate_layers[l].is_some())
             .collect();
         let n_experts_per_tok = shard_header.n_experts_per_tok;
+        let moe_n_group = shard_header.moe_n_group;
+        let moe_topk_group = shard_header.moe_topk_group;
         let dim = shard_header.dim;
         let n_experts = shard_header.n_experts;
 
@@ -212,9 +217,12 @@ impl WorkerRuntime {
                 gate_layers,
                 moe_layer_indices,
                 n_experts_per_tok,
+                moe_n_group,
+                moe_topk_group,
                 speculation: None,
                 last_activation: vec![0.0f32; dim],
                 spec_logits: vec![0.0f32; n_experts],
+                spec_group_scores: vec![0.0f32; moe_n_group.max(1)],
             },
         ))
     }
@@ -473,20 +481,6 @@ fn build_gate_layers(
         });
     }
     layers
-}
-
-fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
-    let k = k.min(logits.len());
-    if k == 0 {
-        return Vec::new();
-    }
-    let mut indices: Vec<usize> = (0..logits.len()).collect();
-    indices.select_nth_unstable_by(k - 1, |&a, &b| {
-        logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut top = indices[..k].to_vec();
-    top.sort_unstable();
-    top
 }
 
 #[inline]
@@ -849,8 +843,66 @@ fn speculate_next_layer(session: &mut WorkerSession, completed_layer: usize) {
         }
     }
 
-    // Select top-k predicted expert indices (sorted for stable comparison)
-    let predicted = top_k_indices(&session.spec_logits[..n_experts], n_top);
+    // Select top-k experts using group-based routing to match select_topk_softmax.
+    let predicted = {
+        let logits = &session.spec_logits[..n_experts];
+        // 1. Softmax over all logits
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut scores: Vec<f32> = logits.iter().map(|&v| (v - max_l).exp()).collect();
+        let sum: f32 = scores.iter().sum();
+        let inv = 1.0 / sum.max(f32::MIN_POSITIVE);
+        for s in &mut scores { *s *= inv; }
+
+        // 2. Group-based filtering (matches select_topk_softmax with moe_n_group/moe_topk_group)
+        let moe_n_group = session.moe_n_group;
+        let moe_topk_group = session.moe_topk_group;
+        let use_groups = moe_n_group > 1 && moe_topk_group < moe_n_group
+            && n_experts % moe_n_group == 0;
+        let group_size = if use_groups { n_experts / moe_n_group } else { n_experts };
+
+        let group_scores = &mut session.spec_group_scores[..moe_n_group.max(1)];
+        let mut selected_group = vec![true; moe_n_group.max(1)];
+
+        if use_groups {
+            // Per-group score = top-1 + top-2 softmax values within group
+            for g in 0..moe_n_group {
+                let start = g * group_size;
+                let end = start + group_size;
+                let mut top1 = f32::NEG_INFINITY;
+                let mut top2 = f32::NEG_INFINITY;
+                for &s in &scores[start..end] {
+                    if s > top1 { top2 = top1; top1 = s; } else if s > top2 { top2 = s; }
+                }
+                group_scores[g] = top1 + top2.max(0.0);
+            }
+            // Select top moe_topk_group groups; zero-out experts in non-selected groups
+            let mut g_indices: Vec<usize> = (0..moe_n_group).collect();
+            g_indices.select_nth_unstable_by(moe_topk_group - 1, |&a, &b| {
+                group_scores[b].partial_cmp(&group_scores[a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for g in &g_indices[moe_topk_group..] {
+                selected_group[*g] = false;
+                let start = g * group_size;
+                for s in &mut scores[start..start + group_size] { *s = 0.0; }
+            }
+        }
+
+        // 3. Top-n_top from remaining (selected group) experts
+        let mut candidates: Vec<(f32, usize)> = scores.iter()
+            .enumerate()
+            .filter(|&(i, _)| selected_group[i / group_size])
+            .map(|(i, &s)| (s, i))
+            .collect();
+        let n_take = n_top.min(candidates.len());
+        if n_take > 0 {
+            candidates.select_nth_unstable_by(n_take - 1, |&a, &b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let mut top: Vec<usize> = candidates[..n_take].iter().map(|&(_, i)| i).collect();
+        top.sort_unstable();
+        top
+    };
 
     // Filter to experts actually assigned to this worker
     let my_ids: Vec<usize> = predicted.iter()
