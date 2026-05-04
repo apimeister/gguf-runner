@@ -342,15 +342,7 @@ fn build_moe_placement_plan_from_inventory(
         // This keeps the same set of local experts across consecutive layers, reducing remote traffic.
         let stride = inventory.placement_rotation_stride.max(1);
         let rotation_group = layer / stride; // 0, 0, 0, 0, 1, 1, 1, 1, ... for stride=4
-        let local_bonus = nodes[coordinator_index]
-            .logical_cpu_count
-            .max(1)
-            .min(inventory.n_experts_used);
-        let local_target = inventory
-            .n_experts_used
-            .saturating_add(local_bonus)
-            .max(1)
-            .min(inventory.n_experts);
+        let local_target = inventory.n_experts_used.max(1).min(inventory.n_experts);
         let local_offset = if inventory.n_experts == 0 {
             0
         } else {

@@ -295,7 +295,7 @@ src/
 ### `src/engine/distributed/placement.rs`
 
 - Metadata-driven routed-MoE inventory and placement planning.
-- Defines distributed node config domain types, validates coordinator/worker roles, and builds a memory-aware expert-to-node assignment summary with CPU-capped coordinator-local expert windows and capacity-weighted worker balancing.
+- Defines distributed node config domain types, validates coordinator/worker roles, and builds a memory-aware expert-to-node assignment summary with coordinator-local expert windows and capacity-weighted worker balancing.
 
 ### `src/engine/distributed/protocol.rs`
 
@@ -323,7 +323,7 @@ src/
 
 - Worker-side expert serving logic.
 - Owns the TCP listener loop, bind-address-based worker identity, discovery responses, assignment-on-HELLO validation, row-sliced expert tensor loading, and remote expert batch execution against GGUF-backed expert tensors.
-- Maintains speculation for future MoE layers on an isolated background thread, consuming coordinator-provided routing hints when available, adaptively pushing a bounded ranked subset of completed speculative outputs while retaining wider cached candidates locally, and accepting non-blocking speculation-advance control frames after coordinator push hits.
+- Maintains speculation for future MoE layers, consuming coordinator-provided routing hints when available, pushing a bounded ranked subset of completed speculative outputs while retaining wider cached candidates locally, and accepting non-blocking speculation-advance control frames after coordinator push hits.
 
 ### `src/engine/types.rs`
 

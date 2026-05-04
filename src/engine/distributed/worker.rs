@@ -20,7 +20,6 @@ use rayon::prelude::{
 };
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 30;
@@ -75,8 +74,6 @@ struct WorkerSession {
     hint_for_layer: Option<(usize, Vec<usize>)>,
     activation_dtype: ActivationDtype,
     speculative_push: bool,
-    push_extra_experts: usize,
-    spec_executor: SpeculationExecutor,
 }
 
 fn shard_temp_path(bind_address: &str) -> PathBuf {
@@ -257,8 +254,6 @@ impl WorkerRuntime {
                 hint_for_layer: None,
                 activation_dtype: hello.activation_dtype,
                 speculative_push: hello.speculative_push,
-                push_extra_experts: SPEC_PUSH_EXTRA_EXPERTS,
-                spec_executor: SpeculationExecutor::new(),
             },
         ))
     }
@@ -884,33 +879,6 @@ fn worker_ssm_step(
 struct SendRawSlice(usize, usize); // (ptr as usize, len)
 unsafe impl Send for SendRawSlice {}
 
-type SpeculationJob = Box<dyn FnOnce() + Send + 'static>;
-
-struct SpeculationExecutor {
-    sender: std::sync::mpsc::Sender<SpeculationJob>,
-}
-
-impl SpeculationExecutor {
-    fn new() -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel::<SpeculationJob>();
-        let _ = thread::Builder::new()
-            .name("distributed-moe-spec".to_string())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    job();
-                }
-            });
-        Self { sender }
-    }
-
-    fn schedule<F>(&self, job: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        let _ = self.sender.send(Box::new(job));
-    }
-}
-
 /// How many MoE layers ahead to speculatively pre-compute.
 const SPEC_DEPTH: usize = 2;
 
@@ -920,7 +888,6 @@ const SPEC_DEPTH: usize = 2;
 /// Pushing a small margin lets partial-hit consumption avoid more one-off
 /// missing-expert requests without increasing speculative expert compute.
 const SPEC_PUSH_EXTRA_EXPERTS: usize = 2;
-const SPEC_PUSH_MAX_EXTRA_EXPERTS_MULTIPLIER: usize = 2;
 
 /// Predict routing and launch a sequential background chain for uncovered future layers.
 ///
@@ -1123,7 +1090,7 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
             }
             let push_width = session
                 .n_experts_per_tok
-                .saturating_add(session.push_extra_experts)
+                .saturating_add(SPEC_PUSH_EXTRA_EXPERTS)
                 .min(predicted.len());
             let push_expert_ids = predicted
                 .iter()
@@ -1152,51 +1119,50 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     }
 
     let raw = SendRawSlice(shard_ptr, shard_len);
-    session.spec_executor.schedule(move || {
+    rayon::spawn(move || {
         let mapped: &[u8] = unsafe { std::slice::from_raw_parts(raw.0 as *const u8, raw.1) };
         for (next_layer, my_experts, push_expert_ids, tx) in work_items {
             let start = Instant::now();
-            let mut outputs = Vec::with_capacity(my_experts.len());
-            let mut failed = false;
-            for (expert_idx, tensors) in &my_experts {
-                let mut gate_scratch = vec![0.0f32; hidden];
-                let mut up_scratch = vec![0.0f32; hidden];
-                let mut output = vec![0.0f32; dim];
-                if matmul_quantized_rows(&mut gate_scratch, &act, &tensors.gate, 0, hidden, mapped)
-                    .is_err()
-                {
-                    failed = true;
-                    break;
+            let outputs: Result<Vec<(usize, Vec<f32>)>, String> = my_experts
+                .par_iter()
+                .map(|(expert_idx, tensors)| {
+                    let mut gate_scratch = vec![0.0f32; hidden];
+                    let mut up_scratch = vec![0.0f32; hidden];
+                    let mut output = vec![0.0f32; dim];
+                    matmul_quantized_rows(
+                        &mut gate_scratch,
+                        &act,
+                        &tensors.gate,
+                        0,
+                        hidden,
+                        mapped,
+                    )?;
+                    matmul_quantized_rows(&mut up_scratch, &act, &tensors.up, 0, hidden, mapped)?;
+                    silu_and_mul_inplace(&mut gate_scratch, &up_scratch);
+                    matmul_quantized_rows(
+                        &mut output,
+                        &gate_scratch,
+                        &tensors.down,
+                        0,
+                        dim,
+                        mapped,
+                    )?;
+                    Ok((*expert_idx, output))
+                })
+                .collect::<Result<Vec<_>, _>>();
+            if let Ok(pairs) = outputs {
+                let compute_ns = start.elapsed().as_nanos() as u64;
+                let mut map = std::collections::HashMap::with_capacity(pairs.len());
+                for (id, out) in pairs {
+                    map.insert(id, out);
                 }
-                if matmul_quantized_rows(&mut up_scratch, &act, &tensors.up, 0, hidden, mapped)
-                    .is_err()
-                {
-                    failed = true;
-                    break;
-                }
-                silu_and_mul_inplace(&mut gate_scratch, &up_scratch);
-                if matmul_quantized_rows(&mut output, &gate_scratch, &tensors.down, 0, dim, mapped)
-                    .is_err()
-                {
-                    failed = true;
-                    break;
-                }
-                outputs.push((*expert_idx, output));
+                let _ = tx.send(SpeculationCache {
+                    layer: next_layer,
+                    outputs: map,
+                    push_expert_ids,
+                    compute_ns,
+                });
             }
-            if failed {
-                continue;
-            }
-            let compute_ns = start.elapsed().as_nanos() as u64;
-            let mut map = std::collections::HashMap::with_capacity(outputs.len());
-            for (id, out) in outputs {
-                map.insert(id, out);
-            }
-            let _ = tx.send(SpeculationCache {
-                layer: next_layer,
-                outputs: map,
-                push_expert_ids,
-                compute_ns,
-            });
         }
     });
 }
@@ -1408,15 +1374,6 @@ fn handle_worker_connection(
                                 let response = if spec_hit {
                                     session.spec_hits += 1;
                                     session.spec_local_only_hits += 1;
-                                    session.push_extra_experts =
-                                        session.push_extra_experts.saturating_add(1).min(
-                                            session
-                                                .n_experts_per_tok
-                                                .saturating_mul(
-                                                    SPEC_PUSH_MAX_EXTRA_EXPERTS_MULTIPLIER,
-                                                )
-                                                .max(SPEC_PUSH_EXTRA_EXPERTS),
-                                        );
                                     let spec = spec_cache.unwrap();
                                     let outputs: Result<Vec<Vec<f32>>, String> = request
                                         .expert_ids
@@ -1441,15 +1398,11 @@ fn handle_worker_connection(
                                             session.spec_local_only_hits =
                                                 session.spec_local_only_hits.saturating_sub(1);
                                             session.spec_misses += 1;
-                                            session.push_extra_experts =
-                                                session.push_extra_experts.saturating_sub(1);
                                             runtime.handle_request(&session, request.clone())
                                         }
                                     }
                                 } else {
                                     session.spec_misses += 1;
-                                    session.push_extra_experts =
-                                        session.push_extra_experts.saturating_sub(1);
                                     runtime.handle_request(&session, request.clone())
                                 };
 
@@ -1571,7 +1524,7 @@ fn handle_worker_connection(
                         0.0
                     };
                     eprintln!(
-                        "[SPEC] speculation hits={} misses={} total={} hit_rate={:.1}% local_only_hits={} compute={:.3} ms experts={} pushed_experts={} push_extra={}",
+                        "[SPEC] speculation hits={} misses={} total={} hit_rate={:.1}% local_only_hits={} compute={:.3} ms experts={} pushed_experts={}",
                         session.spec_hits,
                         session.spec_misses,
                         total,
@@ -1579,8 +1532,7 @@ fn handle_worker_connection(
                         session.spec_local_only_hits,
                         session.spec_compute_ns as f64 / 1_000_000.0,
                         session.spec_compute_experts,
-                        session.spec_pushed_experts,
-                        session.push_extra_experts
+                        session.spec_pushed_experts
                     );
                 }
                 Err(err) => {
