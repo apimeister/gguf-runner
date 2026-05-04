@@ -295,7 +295,7 @@ src/
 ### `src/engine/distributed/placement.rs`
 
 - Metadata-driven routed-MoE inventory and placement planning.
-- Defines distributed node config domain types, validates coordinator/worker roles, and builds a memory-aware expert-to-node assignment summary with coordinator-local expert windows and capacity-weighted worker balancing.
+- Defines distributed node config domain types, validates coordinator/worker roles, and builds a memory-aware expert-to-node assignment summary with CPU-capped coordinator-local expert windows and capacity-weighted worker balancing.
 
 ### `src/engine/distributed/protocol.rs`
 
@@ -316,14 +316,14 @@ src/
 
 - Coordinator-side distributed expert execution.
 - Defines the generic routed-expert executor trait used by `engine::runtime::inference`.
-- Owns cluster resource discovery, local routed-expert execution helpers, and the distributed coordinator client that partitions experts by host, computes widened next-layer routing hints from coordinator-local gate tensors, runs a background reader per worker for responses and speculative pushes, consumes partial pushed expert outputs before requesting only missing experts, accumulates results, prefers coordinator-owned sliced local experts when present, and tracks per-worker distributed profiling summaries.
+- Owns cluster resource discovery, local routed-expert execution helpers, and the distributed coordinator client that partitions experts by host, computes widened next-layer routing hints from coordinator-local gate tensors, runs a background reader per worker for responses and speculative pushes, consumes partial pushed expert outputs before briefly waiting for small late-push misses and requesting only remaining experts, accumulates results, prefers coordinator-owned sliced local experts when present, and tracks per-worker distributed/push profiling summaries.
 - Includes `ActivationBufferPool` for reusing per-worker activation buffers during remote expert requests.
 
 ### `src/engine/distributed/worker.rs`
 
 - Worker-side expert serving logic.
 - Owns the TCP listener loop, bind-address-based worker identity, discovery responses, assignment-on-HELLO validation, row-sliced expert tensor loading, and remote expert batch execution against GGUF-backed expert tensors.
-- Maintains speculation for future MoE layers, consuming coordinator-provided routing hints when available, pushing a bounded ranked subset of completed speculative outputs while retaining wider cached candidates locally, and accepting non-blocking speculation-advance control frames after coordinator push hits.
+- Maintains speculation for future MoE layers on an isolated background thread, consuming coordinator-provided routing hints when available, adaptively pushing a bounded ranked subset of completed speculative outputs while retaining wider cached candidates locally, and accepting non-blocking speculation-advance control frames after coordinator push hits.
 
 ### `src/engine/types.rs`
 
