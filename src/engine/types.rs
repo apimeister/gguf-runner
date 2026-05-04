@@ -448,6 +448,7 @@ pub(crate) struct TransformerWeights {
     pub(crate) ffn_post_norm_bias: Vec<f32>,
 }
 
+#[derive(Clone)]
 pub(crate) struct WorkerExpertTensors {
     pub(crate) gate: QuantizedTensor,
     pub(crate) up: QuantizedTensor,
