@@ -1037,19 +1037,29 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         let worker = &mut self.remote_workers[ssm_idx];
         worker.connection.send_message(FrameKind::SsmLayerRequest, 0, &payload)
             .map_err(|e| format!("SSM send to worker '{}' failed: {e}", worker.address))?;
-        let msg = worker.connection.recv_message()
-            .map_err(|e| format!("SSM recv from worker '{}' failed: {e}", worker.address))?;
-        match msg.kind {
-            FrameKind::SsmLayerResponse => {
-                let resp = decode_ssm_layer_response(&msg.payload)?;
-                if resp.xb2.len() != dim {
-                    return Err(format!("SSM response dim mismatch: got {}, expected {dim}", resp.xb2.len()));
+        loop {
+            let msg = worker.connection.recv_message()
+                .map_err(|e| format!("SSM recv from worker '{}' failed: {e}", worker.address))?;
+            match msg.kind {
+                FrameKind::ProposedExpertBatch => {
+                    if let Ok(frame) = decode_proposed_expert_batch(&msg.payload) {
+                        let lm = worker.push_buffer.entry(frame.layer).or_default();
+                        for (id, out) in frame.expert_ids.into_iter().zip(frame.outputs) {
+                            lm.insert(id, out);
+                        }
+                    }
                 }
-                xb2[..dim].copy_from_slice(&resp.xb2);
-                Ok(true)
+                FrameKind::SsmLayerResponse => {
+                    let resp = decode_ssm_layer_response(&msg.payload)?;
+                    if resp.xb2.len() != dim {
+                        return Err(format!("SSM response dim mismatch: got {}, expected {dim}", resp.xb2.len()));
+                    }
+                    xb2[..dim].copy_from_slice(&resp.xb2);
+                    return Ok(true);
+                }
+                FrameKind::Error => return Err(format!("SSM worker error: {}", decode_error_frame(&msg.payload)?)),
+                other => return Err(format!("unexpected SSM response frame {:?}", other)),
             }
-            FrameKind::Error => Err(format!("SSM worker error: {}", decode_error_frame(&msg.payload)?)),
-            other => Err(format!("unexpected SSM response frame {:?}", other)),
         }
     }
 }
