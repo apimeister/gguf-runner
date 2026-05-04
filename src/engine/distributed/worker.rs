@@ -31,7 +31,6 @@ struct WorkerGateLayerData {
 
 struct SpeculationCache {
     layer: usize,
-    expert_ids: Vec<usize>,
     outputs: std::collections::HashMap<usize, Vec<f32>>,
 }
 
@@ -53,6 +52,8 @@ struct WorkerSession {
     last_activation: Vec<f32>,
     spec_logits: Vec<f32>,
     spec_group_scores: Vec<f32>,
+    spec_hits: u64,
+    spec_misses: u64,
 }
 
 fn shard_temp_path(bind_address: &str) -> PathBuf {
@@ -223,6 +224,8 @@ impl WorkerRuntime {
                 last_activation: vec![0.0f32; dim],
                 spec_logits: vec![0.0f32; n_experts],
                 spec_group_scores: vec![0.0f32; moe_n_group.max(1)],
+                spec_hits: 0,
+                spec_misses: 0,
             },
         ))
     }
@@ -820,7 +823,10 @@ fn speculate_next_layer(session: &mut WorkerSession, completed_layer: usize) {
     };
 
     let n_experts = session.n_experts;
-    let n_top = session.n_experts_per_tok;
+    // Predict 2× as many experts as will actually be selected. The extra coverage
+    // makes it much more likely the actual request is a subset of what we cached,
+    // enabling the superset hit check below at the cost of ~2× speculative compute.
+    let n_top = (session.n_experts_per_tok * 2).min(n_experts);
     let dim = session.dim;
     let hidden = session.expert_hidden_dim;
 
@@ -951,7 +957,6 @@ fn speculate_next_layer(session: &mut WorkerSession, completed_layer: usize) {
         }
         session.speculation = Some(SpeculationCache {
             layer: next_layer,
-            expert_ids: my_ids,
             outputs: map,
         });
     }
@@ -1026,17 +1031,21 @@ fn handle_worker_connection(
                                 let completed_layer = request.layer;
                                 let dim = session.dim;
 
-                                // Check speculation cache: sorted expert IDs for stable comparison.
+                                // Superset hit check: all requested experts must be in the cache.
+                                // We speculatively computed 2× as many experts, so the actual
+                                // (smaller) request set is often a subset of what we cached.
                                 let mut req_ids_sorted = request.expert_ids.clone();
                                 req_ids_sorted.sort_unstable();
 
                                 let spec_hit = session.speculation.as_ref().map_or(false, |spec| {
-                                    spec.layer == request.layer && spec.expert_ids == req_ids_sorted
+                                    spec.layer == request.layer
+                                        && req_ids_sorted.iter().all(|id| spec.outputs.contains_key(id))
                                 });
 
                                 let response = if spec_hit {
+                                    session.spec_hits += 1;
                                     let spec = session.speculation.take().unwrap();
-                                    // Build output vec in request.expert_ids order
+                                    // Build output vec in request.expert_ids order from cache
                                     let outputs: Result<Vec<Vec<f32>>, String> = request.expert_ids.iter()
                                         .map(|id| spec.outputs.get(id)
                                             .cloned()
@@ -1051,11 +1060,13 @@ fn handle_worker_connection(
                                             outputs: outs,
                                         }),
                                         Err(_) => {
-                                            // Fallback: compute normally
+                                            session.spec_hits -= 1;
+                                            session.spec_misses += 1;
                                             runtime.handle_request(&session, request.clone())
                                         }
                                     }
                                 } else {
+                                    session.spec_misses += 1;
                                     session.speculation = None;
                                     runtime.handle_request(&session, request.clone())
                                 };
@@ -1119,7 +1130,17 @@ fn handle_worker_connection(
                                     )?;
                                 }
                             }
-                            FrameKind::Shutdown => break,
+                            FrameKind::Shutdown => {
+                                let total = session.spec_hits + session.spec_misses;
+                                let hit_pct = if total > 0 {
+                                    100.0 * session.spec_hits as f64 / total as f64
+                                } else { 0.0 };
+                                eprintln!(
+                                    "[SPEC] speculation hits={} misses={} total={} hit_rate={:.1}%",
+                                    session.spec_hits, session.spec_misses, total, hit_pct
+                                );
+                                break;
+                            }
                             FrameKind::Error => {
                                 return Err(format!(
                                     "worker received coordinator error: {}",
