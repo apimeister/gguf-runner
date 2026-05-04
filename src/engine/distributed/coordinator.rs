@@ -36,9 +36,6 @@ const DEFAULT_REMOTE_TIMEOUT_SECS: u64 = 30;
 const DISTRIBUTED_FRAME_HEADER_LEN: usize = 20;
 const DEFAULT_REMOTE_RETRY_ATTEMPTS: usize = 3;
 const DEFAULT_REMOTE_RETRY_BACKOFF_MS: u64 = 200;
-const LATE_PUSH_GRACE_WAIT: Duration = Duration::from_micros(150);
-const LATE_PUSH_MAX_MISSING_EXPERTS: usize = 2;
-
 fn discover_remote_node_resources(address: &str) -> Result<DiscoverResponseFrame, String> {
     let timeout = Duration::from_secs(DEFAULT_REMOTE_TIMEOUT_SECS);
     let mut last_transport_error = None;
@@ -1110,28 +1107,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                 worker
                     .stats
                     .record_request(pushed.hit_expert_ids.len(), 0, 0, 0, true);
-                record_distributed_push_hit(pushed.hit_expert_ids.len(), false);
-                push_hit_experts += pushed.hit_expert_ids.len();
-                push_hit_nodes.push(*node_index);
-                for (expert_idx, values) in pushed.hit_expert_ids.into_iter().zip(pushed.outputs) {
-                    remote_outputs.insert(expert_idx, values);
-                }
-                missing_expert_ids = pushed.missing_expert_ids;
-            }
-
-            if !missing_expert_ids.is_empty()
-                && missing_expert_ids.len() <= LATE_PUSH_MAX_MISSING_EXPERTS
-                && let Some(pushed) = wait_for_pushed_outputs(
-                    worker,
-                    layer,
-                    &missing_expert_ids,
-                    LATE_PUSH_GRACE_WAIT,
-                )
-            {
-                worker
-                    .stats
-                    .record_request(pushed.hit_expert_ids.len(), 0, 0, 0, true);
-                record_distributed_push_hit(pushed.hit_expert_ids.len(), true);
+                record_distributed_push_hit(pushed.hit_expert_ids.len());
                 push_hit_experts += pushed.hit_expert_ids.len();
                 push_hit_nodes.push(*node_index);
                 for (expert_idx, values) in pushed.hit_expert_ids.into_iter().zip(pushed.outputs) {
@@ -1490,38 +1466,6 @@ fn take_pushed_outputs(
         .retain(|&l, _| l >= layer.saturating_sub(1));
     let (buf_ids, buf_outputs) = state.push_buffer.remove(&layer)?;
     collect_pushed_outputs(buf_ids, buf_outputs, expert_ids)
-}
-
-fn wait_for_pushed_outputs(
-    worker: &RemoteWorkerClient,
-    layer: usize,
-    expert_ids: &[usize],
-    timeout: Duration,
-) -> Option<PushedExpertOutputs> {
-    let start = Instant::now();
-    let (lock, cvar) = &*worker.inbound;
-    let mut state = lock.lock().unwrap();
-    loop {
-        state
-            .push_buffer
-            .retain(|&l, _| l >= layer.saturating_sub(1));
-        if let Some((buf_ids, buf_outputs)) = state.push_buffer.remove(&layer) {
-            return collect_pushed_outputs(buf_ids, buf_outputs, expert_ids);
-        }
-        if state.transport_error.is_some() {
-            return None;
-        }
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
-            return None;
-        }
-        let remaining = timeout.saturating_sub(elapsed);
-        let (next_state, wait_result) = cvar.wait_timeout(state, remaining).unwrap();
-        state = next_state;
-        if wait_result.timed_out() {
-            return None;
-        }
-    }
 }
 
 fn collect_pushed_outputs(
