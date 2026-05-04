@@ -31,11 +31,12 @@ On `worker-a`:
 gguf-runner \
   --model ./Qwen3.5-122B-A10B-Q4.gguf \
   --distributed-worker \
-  --distributed-bind-address 192.168.10.11:7000 \
-  --distributed-transport-dtype bf16
+  --distributed-bind-address 192.168.10.11:7000
 ```
 
 Repeat on `worker-b`, `worker-c`, changing only `--distributed-bind-address`.
+
+Workers do not need `--distributed-transport-dtype`; the coordinator sends the transport dtype in the distributed handshake and request frames.
 
 ## Start Coordinator
 
