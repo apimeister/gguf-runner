@@ -2434,7 +2434,7 @@ impl ModelRuntime {
             Some(DistributedMoeCoordinator::connect(
                 plan,
                 transport_dtype,
-                true,
+                false,
                 &gguf,
                 gguf.mapped.as_slice(),
                 &config,

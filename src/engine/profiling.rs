@@ -20,7 +20,6 @@ pub(crate) static PROF_DMOE_COORD_LOCAL_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_DMOE_COORD_REMOTE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_DMOE_PUSH_FRAMES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PROF_DMOE_PUSH_EXPERTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static PROF_DMOE_PUSH_HIT_EXPERTS: AtomicU64 = AtomicU64::new(0);
 
 #[inline(always)]
 pub(crate) fn set_profiling_enabled(enabled: bool) {
@@ -90,11 +89,6 @@ pub(crate) fn record_distributed_push_frame(experts: usize) {
     PROF_DMOE_PUSH_EXPERTS.fetch_add(experts as u64, AtomicOrdering::Relaxed);
 }
 
-#[inline(always)]
-pub(crate) fn record_distributed_push_hit(experts: usize) {
-    PROF_DMOE_PUSH_HIT_EXPERTS.fetch_add(experts as u64, AtomicOrdering::Relaxed);
-}
-
 pub(crate) fn profiling_reset() {
     PROF_TRANSFORMER_NS.store(0, AtomicOrdering::Relaxed);
     PROF_MATMUL_NS.store(0, AtomicOrdering::Relaxed);
@@ -114,7 +108,6 @@ pub(crate) fn profiling_reset() {
     PROF_DMOE_COORD_REMOTE_NS.store(0, AtomicOrdering::Relaxed);
     PROF_DMOE_PUSH_FRAMES.store(0, AtomicOrdering::Relaxed);
     PROF_DMOE_PUSH_EXPERTS.store(0, AtomicOrdering::Relaxed);
-    PROF_DMOE_PUSH_HIT_EXPERTS.store(0, AtomicOrdering::Relaxed);
 }
 
 pub(crate) fn print_profile_report() {
@@ -136,7 +129,6 @@ pub(crate) fn print_profile_report() {
     let distributed_coord_remote_ns = PROF_DMOE_COORD_REMOTE_NS.load(AtomicOrdering::Relaxed);
     let distributed_push_frames = PROF_DMOE_PUSH_FRAMES.load(AtomicOrdering::Relaxed);
     let distributed_push_experts = PROF_DMOE_PUSH_EXPERTS.load(AtomicOrdering::Relaxed);
-    let distributed_push_hit_experts = PROF_DMOE_PUSH_HIT_EXPERTS.load(AtomicOrdering::Relaxed);
 
     let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
     let to_mb = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
@@ -216,8 +208,8 @@ pub(crate) fn print_profile_report() {
             to_ms(distributed_coord_remote_ns)
         );
         eprintln!(
-            "[PROFILE] distributed_moe push_frames={} push_experts={} push_hit_experts={}",
-            distributed_push_frames, distributed_push_experts, distributed_push_hit_experts
+            "[PROFILE] distributed_moe push_frames={} push_experts={}",
+            distributed_push_frames, distributed_push_experts
         );
     }
 }

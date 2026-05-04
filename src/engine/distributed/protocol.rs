@@ -49,7 +49,6 @@ pub(crate) const SHARD_KIND_SSM_OUT: u8 = 5;
 pub(crate) const SHARD_KIND_SSM_BA: u8 = 6;
 pub(crate) const SHARD_KIND_SSM_ALPHA: u8 = 7;
 pub(crate) const SHARD_KIND_SSM_BETA: u8 = 8;
-pub(crate) const SHARD_KIND_GATE_INP: u8 = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
@@ -124,8 +123,9 @@ pub(crate) struct ExpertBatchRequest {
     pub(crate) hint_expert_ids: Vec<usize>,
 }
 
-/// Coordinator -> worker: current-layer activation update after the coordinator
-/// consumes a pushed speculative result instead of sending ExpertBatchRequest.
+/// Coordinator -> worker: legacy speculative-control frame.
+/// Runtime code no longer sends this because future expert outputs require exact
+/// future-layer activations.
 #[derive(Clone, Debug)]
 pub(crate) struct SpeculationAdvanceFrame {
     pub(crate) layer: usize,
@@ -135,7 +135,8 @@ pub(crate) struct SpeculationAdvanceFrame {
     pub(crate) hint_expert_ids: Vec<usize>,
 }
 
-/// Worker -> coordinator: speculative expert outputs pushed proactively.
+/// Worker -> coordinator: legacy proactive expert-output frame.
+/// Runtime code ignores these frames because stale-activation outputs are unsafe.
 #[derive(Clone, Debug)]
 pub(crate) struct ProposedExpertBatchFrame {
     pub(crate) layer: usize,
@@ -646,6 +647,7 @@ pub(crate) fn decode_expert_batch_request(payload: &[u8]) -> Result<ExpertBatchR
     })
 }
 
+#[cfg(test)]
 pub(crate) fn encode_speculation_advance(
     frame: &SpeculationAdvanceFrame,
 ) -> Result<Vec<u8>, String> {
@@ -709,6 +711,7 @@ pub(crate) fn decode_speculation_advance(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn encode_proposed_expert_batch(
     frame: &ProposedExpertBatchFrame,
 ) -> Result<Vec<u8>, String> {

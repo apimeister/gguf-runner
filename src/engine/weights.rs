@@ -1040,54 +1040,6 @@ fn ssm_shard_add_tensor(
     Ok(())
 }
 
-pub(crate) struct GateRoutingShardData {
-    pub(crate) entries: Vec<crate::engine::distributed::protocol::ShardTensorEntry>,
-    pub(crate) ranges: Vec<(usize, usize)>,
-    pub(crate) total_bytes: u64,
-}
-
-pub(crate) fn collect_gate_routing_data(
-    gguf: &GGUFFile,
-    config: &Config,
-    byte_offset_start: u64,
-) -> Result<Option<GateRoutingShardData>, String> {
-    use crate::engine::distributed::protocol::SHARD_KIND_GATE_INP;
-
-    if config.n_experts == 0 {
-        return Ok(None);
-    }
-
-    let mut entries = Vec::new();
-    let mut ranges = Vec::new();
-    let mut shard_offset = byte_offset_start;
-
-    for l in 0..config.n_layers {
-        let name = format!("blk.{l}.ffn_gate_inp.weight");
-        if find_gguf_tensor(gguf, &name).is_none() {
-            continue;
-        }
-        ssm_shard_add_tensor(
-            gguf,
-            l,
-            SHARD_KIND_GATE_INP,
-            &name,
-            &mut entries,
-            &mut ranges,
-            &mut shard_offset,
-        )?;
-    }
-
-    if entries.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(GateRoutingShardData {
-        entries,
-        ranges,
-        total_bytes: shard_offset - byte_offset_start,
-    }))
-}
-
 pub(crate) fn collect_ssm_shard_data(
     gguf: &GGUFFile,
     config: &Config,

@@ -3,25 +3,23 @@ use crate::engine::distributed::placement::{
 };
 use crate::engine::distributed::protocol::{
     ActivationDtype, DiscoverResponseFrame, ExpertBatchRequest, FrameKind, HelloFrame, ReadyFrame,
-    SHARD_KIND_GATE_INP, SsmLayerRequest, decode_discover_response_frame, decode_error_frame,
+    SsmLayerRequest, decode_discover_response_frame, decode_error_frame,
     decode_expert_batch_response, decode_proposed_expert_batch, decode_ready_frame,
     decode_ssm_layer_response, encode_expert_batch_request, encode_hello_frame,
-    encode_model_shard_header, encode_speculation_advance, encode_ssm_layer_request,
+    encode_model_shard_header, encode_ssm_layer_request,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
 use crate::engine::kernels::{axpy_inplace, matmul_quantized_rows, silu_and_mul_inplace};
 use crate::engine::profiling::{
     profiling_enabled, record_distributed_coordinator_timing, record_distributed_local_experts,
-    record_distributed_push_frame, record_distributed_push_hit, record_distributed_remote_request,
+    record_distributed_push_frame, record_distributed_remote_request,
     record_distributed_transport_bytes,
 };
 use crate::engine::types::{
     Config, GGUFFile, QuantizedTensor, TransformerWeights, WorkerExpertTensors,
 };
-use crate::engine::weights::{
-    collect_expert_shard_ranges, collect_gate_routing_data, collect_ssm_shard_data,
-};
+use crate::engine::weights::{collect_expert_shard_ranges, collect_ssm_shard_data};
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
@@ -406,7 +404,6 @@ struct PendingSsmResponse {
 struct WorkerInboundState {
     responses: HashMap<u64, Result<PendingBatchResponse, String>>,
     ssm_responses: HashMap<u64, Result<PendingSsmResponse, String>>,
-    push_buffer: HashMap<usize, (Vec<usize>, Vec<Vec<f32>>)>,
     transport_error: Option<String>,
 }
 
@@ -449,9 +446,12 @@ fn spawn_worker_reader(
                     if let Ok(frame) = decode_proposed_expert_batch(&message.payload) {
                         record_distributed_transport_bytes(0, wire_received);
                         record_distributed_push_frame(frame.expert_ids.len());
-                        state
-                            .push_buffer
-                            .insert(frame.layer, (frame.expert_ids, frame.outputs));
+                        let _ = (
+                            frame.layer,
+                            frame.output_dtype,
+                            frame.dim,
+                            frame.outputs.len(),
+                        );
                         cvar.notify_all();
                     }
                 }
@@ -523,17 +523,9 @@ struct RemoteWorkerStats {
     bytes_sent: u64,
     bytes_received: u64,
     wait_ns: u64,
-    spec_hits: u64,
-    spec_misses: u64,
 }
 
-type RemoteBatchReply = (Vec<Vec<f32>>, usize, usize, u64, bool);
-
-struct PushedExpertOutputs {
-    hit_expert_ids: Vec<usize>,
-    outputs: Vec<Vec<f32>>,
-    missing_expert_ids: Vec<usize>,
-}
+type RemoteBatchReply = (Vec<Vec<f32>>, usize, usize, u64);
 
 struct RemoteDispatch {
     node_index: usize,
@@ -548,18 +540,12 @@ impl RemoteWorkerStats {
         bytes_sent: usize,
         bytes_received: usize,
         wait_ns: u64,
-        spec_hit: bool,
     ) {
         self.request_batches += 1;
         self.expert_count += experts as u64;
         self.bytes_sent += bytes_sent as u64;
         self.bytes_received += bytes_received as u64;
         self.wait_ns += wait_ns;
-        if spec_hit {
-            self.spec_hits += experts as u64;
-        } else {
-            self.spec_misses += experts as u64;
-        }
     }
 }
 
@@ -569,12 +555,6 @@ pub(crate) struct DistributedMoeCoordinator {
     remote_workers: Vec<RemoteWorkerClient>,
     activation_buffer_pool: ActivationBufferPool,
     ssm_worker_index: Option<usize>,
-    /// Gate routing tensors (indexed by layer) for coordinator-side routing prediction.
-    /// These reference the original GGUF mmap via data_offset.
-    gate_routing: Vec<Option<QuantizedTensor>>,
-    n_experts_per_tok: usize,
-    moe_n_group: usize,
-    moe_topk_group: usize,
 }
 
 /// Pre-allocated activation buffers to avoid per-batch `input.to_vec()` allocations.
@@ -823,42 +803,6 @@ impl DistributedMoeCoordinator {
             first_setup.shard_header_payload = encode_model_shard_header(&existing_header)?;
         }
 
-        // Gate routing tensors for all workers (enables speculative routing)
-        // Collect once; byte offsets are shifted per-worker relative to each worker's current shard end.
-        let gate_data_opt = collect_gate_routing_data(gguf, config, 0)?;
-        if let Some(ref gate_data) = gate_data_opt {
-            for setup in setups.iter_mut() {
-                let mut hdr = crate::engine::distributed::protocol::decode_model_shard_header(
-                    &setup.shard_header_payload,
-                )
-                .map_err(|e| format!("failed to re-decode shard header for gate merge: {e}"))?;
-                let base = hdr.total_bytes;
-                for entry in &gate_data.entries {
-                    hdr.entries
-                        .push(crate::engine::distributed::protocol::ShardTensorEntry {
-                            layer: entry.layer,
-                            expert_idx: entry.expert_idx,
-                            kind: entry.kind,
-                            ttype: entry.ttype,
-                            rows: entry.rows,
-                            cols: entry.cols,
-                            byte_offset: entry.byte_offset + base,
-                            byte_len: entry.byte_len,
-                        });
-                }
-                for (offset, len) in &gate_data.ranges {
-                    setup
-                        .shard_data
-                        .extend_from_slice(&mapped[*offset..*offset + *len]);
-                }
-                hdr.total_bytes = base + gate_data.total_bytes;
-                hdr.n_experts_per_tok = config.n_experts_used;
-                hdr.moe_n_group = config.moe_n_group;
-                hdr.moe_topk_group = config.moe_topk_group;
-                setup.shard_header_payload = encode_model_shard_header(&hdr)?;
-            }
-        }
-
         // Phase 2: connect and transfer shards to all workers in parallel.
         // Each worker has its own dedicated network link so transfers overlap fully.
         let connections: Vec<Result<(FramedConnection, usize, usize), String>> =
@@ -908,22 +852,6 @@ impl DistributedMoeCoordinator {
             });
         }
 
-        // Build coordinator-local gate routing tensors for routing prediction (Path 1).
-        // gate_data entries use byte_offset=0 base, so offsets are directly into the GGUF mmap.
-        let mut gate_routing: Vec<Option<QuantizedTensor>> = vec![None; config.n_layers];
-        if let Some(ref gate_data) = gate_data_opt {
-            for entry in &gate_data.entries {
-                if entry.kind == SHARD_KIND_GATE_INP && entry.layer < config.n_layers {
-                    gate_routing[entry.layer] = Some(QuantizedTensor {
-                        data_offset: entry.byte_offset as usize,
-                        ttype: crate::engine::types::GgmlType(entry.ttype),
-                        rows: entry.rows,
-                        cols: entry.cols,
-                    });
-                }
-            }
-        }
-
         let dim = plan.inventory.dim;
         let max_concurrent = remote_workers.len().max(1);
         let ssm_worker_index = if remote_workers.is_empty() {
@@ -937,10 +865,6 @@ impl DistributedMoeCoordinator {
             remote_workers,
             activation_buffer_pool: ActivationBufferPool::new(dim, max_concurrent),
             ssm_worker_index,
-            gate_routing,
-            n_experts_per_tok: config.n_experts_used,
-            moe_n_group: config.moe_n_group,
-            moe_topk_group: config.moe_topk_group,
         })
     }
 
@@ -983,14 +907,8 @@ impl Drop for DistributedMoeCoordinator {
                 if worker.stats.request_batches == 0 {
                     continue;
                 }
-                let spec_total = worker.stats.spec_hits + worker.stats.spec_misses;
-                let spec_pct = if spec_total > 0 {
-                    100.0 * worker.stats.spec_hits as f64 / spec_total as f64
-                } else {
-                    0.0
-                };
                 eprintln!(
-                    "[PROFILE] distributed_moe worker='{}' batches={} experts={} sent={:.3} MiB recv={:.3} MiB wait={:.3} ms ({:.3} ms/batch) spec_expert_hit_rate={:.1}% ({}/{})",
+                    "[PROFILE] distributed_moe worker='{}' batches={} experts={} sent={:.3} MiB recv={:.3} MiB wait={:.3} ms ({:.3} ms/batch)",
                     self.plan.nodes[worker.node_index].address,
                     worker.stats.request_batches,
                     worker.stats.expert_count,
@@ -1003,9 +921,6 @@ impl Drop for DistributedMoeCoordinator {
                         (worker.stats.wait_ns as f64 / 1_000_000.0)
                             / worker.stats.request_batches as f64
                     },
-                    spec_pct,
-                    worker.stats.spec_hits,
-                    spec_total,
                 );
             }
         }
@@ -1057,35 +972,10 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
             }
         }
 
-        // Compute routing hint for layer+1 using the exact current activation (Path 1).
-        // This hint will be sent to workers so they can restart speculation with 0-stale data.
-        let next_layer = layer + 1;
-        let hint_for_next: Vec<usize> = if next_layer < config.n_layers {
-            if let Some(Some(gate)) = self.gate_routing.get(next_layer) {
-                let gate = gate.clone();
-                let hint_count = self.n_experts_per_tok.saturating_mul(2).min(n_experts);
-                predict_moe_routing(
-                    &input[..dim],
-                    &gate,
-                    n_experts,
-                    hint_count,
-                    self.moe_n_group,
-                    self.moe_topk_group,
-                    mapped,
-                )
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
         let remote_start = Instant::now();
         let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
 
-        // Phase 1: consume any asynchronously pushed results, then request only
-        // the missing experts so speculative partial hits do not get recomputed.
-        let mut push_hit_nodes: Vec<usize> = Vec::new();
+        // Phase 1: fire requests at all workers first so they start computing immediately.
         let mut dispatches: Vec<RemoteDispatch> = Vec::with_capacity(remote_selected.len());
 
         for (node_index, expert_ids) in &remote_selected {
@@ -1101,18 +991,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                     )
                 })?;
 
-            let mut missing_expert_ids = expert_ids.clone();
-            if let Some(pushed) = take_pushed_outputs(worker, layer, expert_ids) {
-                worker
-                    .stats
-                    .record_request(pushed.hit_expert_ids.len(), 0, 0, 0, true);
-                record_distributed_push_hit(pushed.hit_expert_ids.len());
-                push_hit_nodes.push(*node_index);
-                for (expert_idx, values) in pushed.hit_expert_ids.into_iter().zip(pushed.outputs) {
-                    remote_outputs.insert(expert_idx, values);
-                }
-                missing_expert_ids = pushed.missing_expert_ids;
-            }
+            let missing_expert_ids = expert_ids.clone();
 
             if missing_expert_ids.is_empty() {
                 dispatches.push(RemoteDispatch {
@@ -1130,7 +1009,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                     dim,
                     &missing_expert_ids,
                     &activation,
-                    &hint_for_next,
+                    &[],
                 );
                 self.activation_buffer_pool.put_buffer(activation);
                 let (request_id, wire_sent, wait_start) = send_result
@@ -1141,38 +1020,6 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                     request: Some((request_id, wire_sent, wait_start)),
                 });
             }
-        }
-
-        for dispatch in dispatches
-            .iter()
-            .filter(|dispatch| dispatch.request.is_none())
-            .filter(|dispatch| push_hit_nodes.contains(&dispatch.node_index))
-        {
-            let node_address = self.plan.nodes[dispatch.node_index].address.clone();
-            let worker = self
-                .remote_workers
-                .iter_mut()
-                .find(|w| w.node_index == dispatch.node_index)
-                .ok_or_else(|| {
-                    format!(
-                        "distributed worker '{}' is missing an active coordinator connection",
-                        node_address
-                    )
-                })?;
-            send_speculation_advance(
-                worker,
-                layer,
-                self.activation_dtype,
-                dim,
-                &input[..dim],
-                &hint_for_next,
-            )
-            .map_err(|err| {
-                format!(
-                    "worker '{}' speculation advance send failed: {}",
-                    node_address, err
-                )
-            })?;
         }
 
         // Overlap: compute local experts while workers run their remote batches.
@@ -1208,7 +1055,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                         node_address
                     )
                 })?;
-            let (outputs, bytes_sent, bytes_received, wait_ns, _spec_hit) = recv_batch_response(
+            let (outputs, bytes_sent, bytes_received, wait_ns) = recv_batch_response(
                 worker,
                 request_id,
                 layer,
@@ -1279,88 +1126,6 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
     }
 }
 
-/// Predict which experts will be selected for a future layer using the coordinator's
-/// local copy of the gate tensor, matching the worker's group top-k softmax logic.
-fn predict_moe_routing(
-    activation: &[f32],
-    gate: &QuantizedTensor,
-    n_experts: usize,
-    n_top: usize,
-    moe_n_group: usize,
-    moe_topk_group: usize,
-    mapped: &[u8],
-) -> Vec<usize> {
-    let mut logits = vec![0.0f32; n_experts];
-    if matmul_quantized_rows(&mut logits, activation, gate, 0, n_experts, mapped).is_err() {
-        return Vec::new();
-    }
-    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut scores: Vec<f32> = logits.iter().map(|&v| (v - max_l).exp()).collect();
-    let sum: f32 = scores.iter().sum();
-    let inv = 1.0 / sum.max(f32::MIN_POSITIVE);
-    for s in &mut scores {
-        *s *= inv;
-    }
-
-    let use_groups =
-        moe_n_group > 1 && moe_topk_group < moe_n_group && n_experts.is_multiple_of(moe_n_group);
-    let group_size = if use_groups {
-        n_experts / moe_n_group
-    } else {
-        n_experts
-    };
-    let n_groups = if use_groups { moe_n_group } else { 1 };
-    let mut selected_group = vec![true; n_groups];
-
-    if use_groups {
-        let mut group_scores = vec![0.0f32; moe_n_group];
-        for (g, group_score) in group_scores.iter_mut().enumerate().take(moe_n_group) {
-            let start = g * group_size;
-            let mut top1 = f32::NEG_INFINITY;
-            let mut top2 = f32::NEG_INFINITY;
-            for &s in &scores[start..start + group_size] {
-                if s > top1 {
-                    top2 = top1;
-                    top1 = s;
-                } else if s > top2 {
-                    top2 = s;
-                }
-            }
-            *group_score = top1 + top2.max(0.0);
-        }
-        let mut g_indices: Vec<usize> = (0..moe_n_group).collect();
-        g_indices.select_nth_unstable_by(moe_topk_group - 1, |&a, &b| {
-            group_scores[b]
-                .partial_cmp(&group_scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for g in &g_indices[moe_topk_group..] {
-            selected_group[*g] = false;
-            let start = g * group_size;
-            for s in &mut scores[start..start + group_size] {
-                *s = 0.0;
-            }
-        }
-    }
-
-    let mut candidates: Vec<(f32, usize)> = scores
-        .iter()
-        .enumerate()
-        .filter(|&(i, _)| selected_group[i / group_size])
-        .map(|(i, &s)| (s, i))
-        .collect();
-    let n_take = n_top.min(candidates.len());
-    if n_take == 0 {
-        return Vec::new();
-    }
-    candidates.select_nth_unstable_by(n_take - 1, |&a, &b| {
-        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut top = candidates[..n_take].to_vec();
-    top.sort_unstable_by(|&a, &b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    top.into_iter().map(|(_, i)| i).collect()
-}
-
 /// Encode and send an expert batch request with an optional routing hint for the next layer.
 /// Retries with reconnect on send failure. Does NOT wait for the response.
 fn send_batch_request_with_hint(
@@ -1408,72 +1173,6 @@ fn send_batch_request_with_hint(
             worker.address
         )
     }))
-}
-
-fn send_speculation_advance(
-    worker: &mut RemoteWorkerClient,
-    layer: usize,
-    activation_dtype: ActivationDtype,
-    dim: usize,
-    activation: &[f32],
-    hint_expert_ids: &[usize],
-) -> Result<(), String> {
-    let frame = crate::engine::distributed::protocol::SpeculationAdvanceFrame {
-        layer,
-        activation_dtype,
-        dim,
-        activation: activation.to_vec(),
-        hint_expert_ids: hint_expert_ids.to_vec(),
-    };
-    let payload = encode_speculation_advance(&frame)
-        .map_err(|err| format!("encode speculation advance: {err}"))?;
-    let wire_sent = DISTRIBUTED_FRAME_HEADER_LEN + payload.len();
-    worker
-        .connection
-        .send_message(FrameKind::SpeculationAdvance, 0, &payload)?;
-    worker.stats.bytes_sent += wire_sent as u64;
-    record_distributed_transport_bytes(wire_sent, 0);
-    Ok(())
-}
-
-fn take_pushed_outputs(
-    worker: &RemoteWorkerClient,
-    layer: usize,
-    expert_ids: &[usize],
-) -> Option<PushedExpertOutputs> {
-    let (lock, _) = &*worker.inbound;
-    let mut state = lock.lock().unwrap();
-    state
-        .push_buffer
-        .retain(|&l, _| l >= layer.saturating_sub(1));
-    let (buf_ids, buf_outputs) = state.push_buffer.remove(&layer)?;
-    collect_pushed_outputs(buf_ids, buf_outputs, expert_ids)
-}
-
-fn collect_pushed_outputs(
-    buf_ids: Vec<usize>,
-    buf_outputs: Vec<Vec<f32>>,
-    expert_ids: &[usize],
-) -> Option<PushedExpertOutputs> {
-    let mut hit_expert_ids = Vec::new();
-    let mut outputs = Vec::new();
-    let mut missing_expert_ids = Vec::new();
-    for &expert_id in expert_ids {
-        if let Some(pos) = buf_ids.iter().position(|buf_id| *buf_id == expert_id) {
-            hit_expert_ids.push(expert_id);
-            outputs.push(buf_outputs[pos].clone());
-        } else {
-            missing_expert_ids.push(expert_id);
-        }
-    }
-    if hit_expert_ids.is_empty() {
-        return None;
-    }
-    Some(PushedExpertOutputs {
-        hit_expert_ids,
-        outputs,
-        missing_expert_ids,
-    })
 }
 
 fn wait_for_batch_response(
@@ -1531,19 +1230,9 @@ fn recv_batch_response(
             response.layer, response.dim
         ))
     } else {
-        worker.stats.record_request(
-            expert_ids.len(),
-            wire_sent,
-            wire_received,
-            wait_ns,
-            response.spec_hit,
-        );
-        Ok((
-            response.outputs,
-            wire_sent,
-            wire_received,
-            wait_ns,
-            response.spec_hit,
-        ))
+        worker
+            .stats
+            .record_request(expert_ids.len(), wire_sent, wire_received, wait_ns);
+        Ok((response.outputs, wire_sent, wire_received, wait_ns))
     }
 }

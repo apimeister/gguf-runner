@@ -300,7 +300,7 @@ src/
 ### `src/engine/distributed/protocol.rs`
 
 - Distributed wire format definitions and activation encoding helpers.
-- Defines fixed request/response frame kinds, discovery/hello/ready and expert-batch payload schemas, optional coordinator routing hints on expert-batch requests, async speculative push/control frames, and fp16/bf16 activation pack/unpack helpers.
+- Defines fixed request/response frame kinds, discovery/hello/ready and expert-batch payload schemas, optional coordinator routing hints on expert-batch requests, legacy speculative push/control frame schemas, and fp16/bf16 activation pack/unpack helpers.
 
 ### `src/engine/distributed/resources.rs`
 
@@ -316,14 +316,14 @@ src/
 
 - Coordinator-side distributed expert execution.
 - Defines the generic routed-expert executor trait used by `engine::runtime::inference`.
-- Owns cluster resource discovery, local routed-expert execution helpers, and the distributed coordinator client that partitions experts by host, computes widened next-layer routing hints from coordinator-local gate tensors, runs a background reader per worker for responses and speculative pushes, consumes partial pushed expert outputs before requesting only missing experts, accumulates results, prefers coordinator-owned sliced local experts when present, and tracks per-worker distributed/push profiling summaries.
+- Owns cluster resource discovery, local routed-expert execution helpers, and the distributed coordinator client that partitions experts by host, runs a background reader per worker for responses, ignores legacy pushed expert outputs because they are unsafe without the exact future activation, accumulates results, prefers coordinator-owned sliced local experts when present, and tracks per-worker distributed/push profiling summaries.
 - Includes `ActivationBufferPool` for reusing per-worker activation buffers during remote expert requests.
 
 ### `src/engine/distributed/worker.rs`
 
 - Worker-side expert serving logic.
 - Owns the TCP listener loop, bind-address-based worker identity, discovery responses, assignment-on-HELLO validation, row-sliced expert tensor loading, and remote expert batch execution against GGUF-backed expert tensors.
-- Maintains speculation for future MoE layers, consuming coordinator-provided routing hints when available, pushing a bounded ranked subset of completed speculative outputs while retaining wider cached candidates locally, and accepting non-blocking speculation-advance control frames after coordinator push hits.
+- Accepts coordinator-provided routing hints on expert requests for protocol compatibility, but does not execute or push speculative future-layer expert outputs because those outputs require the exact future-layer activation to preserve inference correctness.
 
 ### `src/engine/types.rs`
 
