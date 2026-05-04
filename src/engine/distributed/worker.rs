@@ -314,6 +314,7 @@ impl WorkerRuntime {
             dim: session.dim,
             expert_ids: request.expert_ids,
             outputs,
+            spec_hit: false,
         })
     }
 }
@@ -1058,6 +1059,7 @@ fn handle_worker_connection(
                                             dim,
                                             expert_ids: request.expert_ids.clone(),
                                             outputs: outs,
+                                            spec_hit: true,
                                         }),
                                         Err(_) => {
                                             session.spec_hits -= 1;
@@ -1130,17 +1132,7 @@ fn handle_worker_connection(
                                     )?;
                                 }
                             }
-                            FrameKind::Shutdown => {
-                                let total = session.spec_hits + session.spec_misses;
-                                let hit_pct = if total > 0 {
-                                    100.0 * session.spec_hits as f64 / total as f64
-                                } else { 0.0 };
-                                eprintln!(
-                                    "[SPEC] speculation hits={} misses={} total={} hit_rate={:.1}%",
-                                    session.spec_hits, session.spec_misses, total, hit_pct
-                                );
-                                break;
-                            }
+                            FrameKind::Shutdown => break,
                             FrameKind::Error => {
                                 return Err(format!(
                                     "worker received coordinator error: {}",
@@ -1155,6 +1147,14 @@ fn handle_worker_connection(
                             }
                         }
                     }
+                    let total = session.spec_hits + session.spec_misses;
+                    let hit_pct = if total > 0 {
+                        100.0 * session.spec_hits as f64 / total as f64
+                    } else { 0.0 };
+                    eprintln!(
+                        "[SPEC] speculation hits={} misses={} total={} hit_rate={:.1}%",
+                        session.spec_hits, session.spec_misses, total, hit_pct
+                    );
                 }
                 Err(err) => {
                     let payload = encode_error_frame(&err)?;

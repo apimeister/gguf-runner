@@ -123,6 +123,7 @@ pub(crate) struct ExpertBatchResponse {
     pub(crate) dim: usize,
     pub(crate) expert_ids: Vec<usize>,
     pub(crate) outputs: Vec<Vec<f32>>,
+    pub(crate) spec_hit: bool,
 }
 
 fn write_f32_le(dst: &mut Vec<u8>, value: f32) {
@@ -610,6 +611,7 @@ pub(crate) fn encode_expert_batch_response(frame: &ExpertBatchResponse) -> Resul
         }
         out.extend_from_slice(&encode_activation_vector(output, frame.output_dtype));
     }
+    out.push(frame.spec_hit as u8);
     Ok(out)
 }
 
@@ -639,12 +641,14 @@ pub(crate) fn decode_expert_batch_response(payload: &[u8]) -> Result<ExpertBatch
         )?);
         offset = end;
     }
+    let spec_hit = if offset < payload.len() { payload[offset] != 0 } else { false };
     Ok(ExpertBatchResponse {
         layer,
         output_dtype,
         dim,
         expert_ids,
         outputs,
+        spec_hit,
     })
 }
 

@@ -407,9 +407,11 @@ struct RemoteWorkerStats {
     bytes_sent: u64,
     bytes_received: u64,
     wait_ns: u64,
+    spec_hits: u64,
+    spec_misses: u64,
 }
 
-type RemoteBatchReply = (Vec<Vec<f32>>, usize, usize, u64);
+type RemoteBatchReply = (Vec<Vec<f32>>, usize, usize, u64, bool);
 
 impl RemoteWorkerStats {
     fn record_request(
@@ -418,12 +420,14 @@ impl RemoteWorkerStats {
         bytes_sent: usize,
         bytes_received: usize,
         wait_ns: u64,
+        spec_hit: bool,
     ) {
         self.request_batches += 1;
         self.expert_count += experts as u64;
         self.bytes_sent += bytes_sent as u64;
         self.bytes_received += bytes_received as u64;
         self.wait_ns += wait_ns;
+        if spec_hit { self.spec_hits += 1; } else { self.spec_misses += 1; }
     }
 }
 
@@ -794,13 +798,20 @@ impl DistributedMoeCoordinator {
 
 impl Drop for DistributedMoeCoordinator {
     fn drop(&mut self) {
+        for worker in &mut self.remote_workers {
+            worker.shutdown();
+        }
         if profiling_enabled() {
             for worker in &self.remote_workers {
                 if worker.stats.request_batches == 0 {
                     continue;
                 }
+                let spec_total = worker.stats.spec_hits + worker.stats.spec_misses;
+                let spec_pct = if spec_total > 0 {
+                    100.0 * worker.stats.spec_hits as f64 / spec_total as f64
+                } else { 0.0 };
                 eprintln!(
-                    "[PROFILE] distributed_moe worker='{}' batches={} experts={} sent={:.3} MiB recv={:.3} MiB wait={:.3} ms ({:.3} ms/batch)",
+                    "[PROFILE] distributed_moe worker='{}' batches={} experts={} sent={:.3} MiB recv={:.3} MiB wait={:.3} ms ({:.3} ms/batch) spec_hit_rate={:.1}% ({}/{})",
                     self.plan.nodes[worker.node_index].address,
                     worker.stats.request_batches,
                     worker.stats.expert_count,
@@ -812,7 +823,10 @@ impl Drop for DistributedMoeCoordinator {
                     } else {
                         (worker.stats.wait_ns as f64 / 1_000_000.0)
                             / worker.stats.request_batches as f64
-                    }
+                    },
+                    spec_pct,
+                    worker.stats.spec_hits,
+                    spec_total,
                 );
             }
         }
@@ -929,7 +943,7 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                         node_address
                     )
                 })?;
-            let (outputs, bytes_sent, bytes_received, wait_ns) = recv_batch_response(
+            let (outputs, bytes_sent, bytes_received, wait_ns, _spec_hit) = recv_batch_response(
                 worker,
                 layer,
                 dim,
@@ -1064,9 +1078,6 @@ fn recv_batch_response(
         .map_err(|err| format!("recv: {err}"))?;
     let wait_ns = wait_start.elapsed().as_nanos() as u64;
     let wire_received = DISTRIBUTED_FRAME_HEADER_LEN + message.payload.len();
-    worker
-        .stats
-        .record_request(expert_ids.len(), wire_sent, wire_received, wait_ns);
     match message.kind {
         FrameKind::ExpertBatchResponse => {
             let response = decode_expert_batch_response(&message.payload)?;
@@ -1076,7 +1087,8 @@ fn recv_batch_response(
                     response.layer, response.dim
                 ))
             } else {
-                Ok((response.outputs, wire_sent, wire_received, wait_ns))
+                worker.stats.record_request(expert_ids.len(), wire_sent, wire_received, wait_ns, response.spec_hit);
+                Ok((response.outputs, wire_sent, wire_received, wait_ns, response.spec_hit))
             }
         }
         FrameKind::Error => Err(decode_error_frame(&message.payload)?),
