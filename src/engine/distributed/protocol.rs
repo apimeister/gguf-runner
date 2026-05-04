@@ -18,6 +18,8 @@ pub(crate) enum FrameKind {
     ModelShardHeader = 9,
     SsmLayerRequest = 10,
     SsmLayerResponse = 11,
+    LayerAck = 12,
+    ProposedExpertBatch = 13,
 }
 
 impl FrameKind {
@@ -34,6 +36,8 @@ impl FrameKind {
             9 => Ok(Self::ModelShardHeader),
             10 => Ok(Self::SsmLayerRequest),
             11 => Ok(Self::SsmLayerResponse),
+            12 => Ok(Self::LayerAck),
+            13 => Ok(Self::ProposedExpertBatch),
             _ => Err(format!("unknown distributed frame kind {value}")),
         }
     }
@@ -114,6 +118,29 @@ pub(crate) struct ExpertBatchRequest {
     pub(crate) dim: usize,
     pub(crate) expert_ids: Vec<usize>,
     pub(crate) activation: Vec<f32>,
+    /// Coordinator-predicted expert IDs for layer+1 (empty = no hint).
+    pub(crate) hint_expert_ids: Vec<usize>,
+}
+
+/// LayerAck: sent by coordinator to worker when a push-hit is consumed.
+/// Carries the current activation so the worker can keep speculating accurately.
+#[derive(Clone, Debug)]
+pub(crate) struct LayerAckFrame {
+    pub(crate) layer: usize,
+    pub(crate) activation_dtype: ActivationDtype,
+    pub(crate) dim: usize,
+    pub(crate) activation: Vec<f32>,
+    pub(crate) hint_expert_ids: Vec<usize>,
+}
+
+/// Worker → coordinator: speculative expert outputs pushed proactively.
+#[derive(Clone, Debug)]
+pub(crate) struct ProposedExpertBatchFrame {
+    pub(crate) layer: usize,
+    pub(crate) output_dtype: ActivationDtype,
+    pub(crate) dim: usize,
+    pub(crate) expert_ids: Vec<usize>,
+    pub(crate) outputs: Vec<Vec<f32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -540,6 +567,22 @@ pub(crate) fn encode_expert_batch_request(frame: &ExpertBatchRequest) -> Result<
         &frame.activation,
         frame.activation_dtype,
     ));
+    // Append hint (u32 count + u32 expert ids); count=0 means no hint
+    write_u32_le(
+        &mut out,
+        frame
+            .hint_expert_ids
+            .len()
+            .try_into()
+            .map_err(|_| "hint count overflow".to_string())?,
+    );
+    for &id in &frame.hint_expert_ids {
+        write_u32_le(
+            &mut out,
+            id.try_into()
+                .map_err(|_| "hint expert id overflow".to_string())?,
+        );
+    }
     Ok(out)
 }
 
@@ -554,7 +597,26 @@ pub(crate) fn decode_expert_batch_request(payload: &[u8]) -> Result<ExpertBatchR
     for _ in 0..n_experts {
         expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
     }
-    let activation = decode_activation_vector(&payload[offset..], activation_dtype, dim)?;
+    let act_len = activation_vector_encoded_len(dim, activation_dtype);
+    let act_end = offset
+        .checked_add(act_len)
+        .ok_or_else(|| "activation overflow".to_string())?;
+    if act_end > payload.len() {
+        return Err("truncated expert batch request activation".to_string());
+    }
+    let activation = decode_activation_vector(&payload[offset..act_end], activation_dtype, dim)?;
+    offset = act_end;
+    // Hint (optional, backward compat: empty if no bytes remain)
+    let hint_expert_ids = if offset + 4 <= payload.len() {
+        let n_hint = read_u32_le(payload, &mut offset)? as usize;
+        let mut ids = Vec::with_capacity(n_hint);
+        for _ in 0..n_hint {
+            ids.push(read_u32_le(payload, &mut offset)? as usize);
+        }
+        ids
+    } else {
+        Vec::new()
+    };
     Ok(ExpertBatchRequest {
         token_pos,
         layer,
@@ -562,7 +624,105 @@ pub(crate) fn decode_expert_batch_request(payload: &[u8]) -> Result<ExpertBatchR
         dim,
         expert_ids,
         activation,
+        hint_expert_ids,
     })
+}
+
+pub(crate) fn encode_layer_ack(frame: &LayerAckFrame) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    write_u32_le(
+        &mut out,
+        frame.layer.try_into().map_err(|_| "layer overflow".to_string())?,
+    );
+    write_u16_le(&mut out, frame.activation_dtype as u16);
+    write_u32_le(
+        &mut out,
+        frame.dim.try_into().map_err(|_| "dim overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame.hint_expert_ids.len().try_into().map_err(|_| "hint count overflow".to_string())?,
+    );
+    for &id in &frame.hint_expert_ids {
+        write_u32_le(
+            &mut out,
+            id.try_into().map_err(|_| "hint id overflow".to_string())?,
+        );
+    }
+    out.extend_from_slice(&encode_activation_vector(&frame.activation, frame.activation_dtype));
+    Ok(out)
+}
+
+pub(crate) fn decode_layer_ack(payload: &[u8]) -> Result<LayerAckFrame, String> {
+    let mut offset = 0usize;
+    let layer = read_u32_le(payload, &mut offset)? as usize;
+    let activation_dtype = ActivationDtype::from_u16(read_u16_le(payload, &mut offset)?)?;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let n_hint = read_u32_le(payload, &mut offset)? as usize;
+    let mut hint_expert_ids = Vec::with_capacity(n_hint);
+    for _ in 0..n_hint {
+        hint_expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
+    }
+    let activation = decode_activation_vector(&payload[offset..], activation_dtype, dim)?;
+    Ok(LayerAckFrame { layer, activation_dtype, dim, activation, hint_expert_ids })
+}
+
+pub(crate) fn encode_proposed_expert_batch(frame: &ProposedExpertBatchFrame) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    write_u32_le(
+        &mut out,
+        frame.layer.try_into().map_err(|_| "layer overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame.dim.try_into().map_err(|_| "dim overflow".to_string())?,
+    );
+    write_u16_le(&mut out, frame.output_dtype as u16);
+    write_u32_le(
+        &mut out,
+        frame.expert_ids.len().try_into().map_err(|_| "expert count overflow".to_string())?,
+    );
+    for &id in &frame.expert_ids {
+        write_u32_le(
+            &mut out,
+            id.try_into().map_err(|_| "expert id overflow".to_string())?,
+        );
+    }
+    for output in &frame.outputs {
+        if output.len() != frame.dim {
+            return Err(format!(
+                "proposed batch output len mismatch: got {}, expected {}",
+                output.len(), frame.dim
+            ));
+        }
+        out.extend_from_slice(&encode_activation_vector(output, frame.output_dtype));
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_proposed_expert_batch(payload: &[u8]) -> Result<ProposedExpertBatchFrame, String> {
+    let mut offset = 0usize;
+    let layer = read_u32_le(payload, &mut offset)? as usize;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let output_dtype = ActivationDtype::from_u16(read_u16_le(payload, &mut offset)?)?;
+    let n_experts = read_u32_le(payload, &mut offset)? as usize;
+    let mut expert_ids = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
+    }
+    let bytes_per_output = activation_vector_encoded_len(dim, output_dtype);
+    let mut outputs = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        let end = offset
+            .checked_add(bytes_per_output)
+            .ok_or_else(|| "proposed batch payload overflow".to_string())?;
+        if end > payload.len() {
+            return Err("truncated proposed expert batch payload".to_string());
+        }
+        outputs.push(decode_activation_vector(&payload[offset..end], output_dtype, dim)?);
+        offset = end;
+    }
+    Ok(ProposedExpertBatchFrame { layer, output_dtype, dim, expert_ids, outputs })
 }
 
 pub(crate) fn encode_expert_batch_response(frame: &ExpertBatchResponse) -> Result<Vec<u8>, String> {
@@ -1041,6 +1201,7 @@ mod tests {
             dim: 4,
             expert_ids: vec![1, 9],
             activation: vec![0.25, -0.5, 1.0, 2.0],
+            hint_expert_ids: vec![3, 7],
         };
         let payload = encode_expert_batch_request(&request).expect("encode failed");
         let decoded = decode_expert_batch_request(&payload).expect("decode failed");
