@@ -316,7 +316,7 @@ src/
 
 - Coordinator-side distributed expert execution.
 - Defines the generic routed-expert executor trait used by `engine::runtime::inference`.
-- Owns cluster resource discovery, local routed-expert execution helpers, and the distributed coordinator client that partitions experts by host, computes widened next-layer routing hints from coordinator-local gate tensors, runs a background reader per worker for responses and speculative pushes, issues remote batches, accumulates results, prefers coordinator-owned sliced local experts when present, and tracks per-worker distributed profiling summaries.
+- Owns cluster resource discovery, local routed-expert execution helpers, and the distributed coordinator client that partitions experts by host, computes widened next-layer routing hints from coordinator-local gate tensors, runs a background reader per worker for responses and speculative pushes, consumes partial pushed expert outputs before requesting only missing experts, accumulates results, prefers coordinator-owned sliced local experts when present, and tracks per-worker distributed profiling summaries.
 - Includes `ActivationBufferPool` for reusing per-worker activation buffers during remote expert requests.
 
 ### `src/engine/distributed/worker.rs`

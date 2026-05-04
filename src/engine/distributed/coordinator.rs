@@ -528,6 +528,18 @@ struct RemoteWorkerStats {
 
 type RemoteBatchReply = (Vec<Vec<f32>>, usize, usize, u64, bool);
 
+struct PushedExpertOutputs {
+    hit_expert_ids: Vec<usize>,
+    outputs: Vec<Vec<f32>>,
+    missing_expert_ids: Vec<usize>,
+}
+
+struct RemoteDispatch {
+    node_index: usize,
+    expert_ids: Vec<usize>,
+    request: Option<(u64, usize, Instant)>,
+}
+
 impl RemoteWorkerStats {
     fn record_request(
         &mut self,
@@ -543,9 +555,9 @@ impl RemoteWorkerStats {
         self.bytes_received += bytes_received as u64;
         self.wait_ns += wait_ns;
         if spec_hit {
-            self.spec_hits += 1;
+            self.spec_hits += experts as u64;
         } else {
-            self.spec_misses += 1;
+            self.spec_misses += experts as u64;
         }
     }
 }
@@ -977,7 +989,7 @@ impl Drop for DistributedMoeCoordinator {
                     0.0
                 };
                 eprintln!(
-                    "[PROFILE] distributed_moe worker='{}' batches={} experts={} sent={:.3} MiB recv={:.3} MiB wait={:.3} ms ({:.3} ms/batch) spec_hit_rate={:.1}% ({}/{})",
+                    "[PROFILE] distributed_moe worker='{}' batches={} experts={} sent={:.3} MiB recv={:.3} MiB wait={:.3} ms ({:.3} ms/batch) spec_expert_hit_rate={:.1}% ({}/{})",
                     self.plan.nodes[worker.node_index].address,
                     worker.stats.request_batches,
                     worker.stats.expert_count,
@@ -1070,11 +1082,11 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         let remote_start = Instant::now();
         let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
 
-        // Phase 1: consume any asynchronously pushed results, otherwise fire requests
-        // at all workers first so they start computing immediately.
-        let mut push_hit_nodes: Vec<(usize, Vec<usize>, Vec<Vec<f32>>)> = Vec::new();
-        let mut send_info: Vec<Option<(u64, usize, Instant)>> =
-            Vec::with_capacity(remote_selected.len());
+        // Phase 1: consume any asynchronously pushed results, then request only
+        // the missing experts so speculative partial hits do not get recomputed.
+        let mut push_hit_nodes: Vec<usize> = Vec::new();
+        let mut push_hit_experts = 0usize;
+        let mut dispatches: Vec<RemoteDispatch> = Vec::with_capacity(remote_selected.len());
 
         for (node_index, expert_ids) in &remote_selected {
             let node_address = self.plan.nodes[*node_index].address.clone();
@@ -1089,10 +1101,25 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                     )
                 })?;
 
-            if let Some(outputs) = take_pushed_outputs(worker, layer, expert_ids) {
-                worker.stats.record_request(expert_ids.len(), 0, 0, 0, true);
-                push_hit_nodes.push((*node_index, expert_ids.clone(), outputs));
-                send_info.push(None);
+            let mut missing_expert_ids = expert_ids.clone();
+            if let Some(pushed) = take_pushed_outputs(worker, layer, expert_ids) {
+                worker
+                    .stats
+                    .record_request(pushed.hit_expert_ids.len(), 0, 0, 0, true);
+                push_hit_experts += pushed.hit_expert_ids.len();
+                push_hit_nodes.push(*node_index);
+                for (expert_idx, values) in pushed.hit_expert_ids.into_iter().zip(pushed.outputs) {
+                    remote_outputs.insert(expert_idx, values);
+                }
+                missing_expert_ids = pushed.missing_expert_ids;
+            }
+
+            if missing_expert_ids.is_empty() {
+                dispatches.push(RemoteDispatch {
+                    node_index: *node_index,
+                    expert_ids: Vec::new(),
+                    request: None,
+                });
             } else {
                 let mut activation = self.activation_buffer_pool.get_buffer();
                 activation[..dim].copy_from_slice(&input[..dim]);
@@ -1101,24 +1128,22 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                     layer,
                     self.activation_dtype,
                     dim,
-                    expert_ids,
+                    &missing_expert_ids,
                     &activation,
                     &hint_for_next,
                 );
                 self.activation_buffer_pool.put_buffer(activation);
                 let (request_id, wire_sent, wait_start) = send_result
                     .map_err(|err| format!("worker '{}' send failed: {}", node_address, err))?;
-                send_info.push(Some((request_id, wire_sent, wait_start)));
+                dispatches.push(RemoteDispatch {
+                    node_index: *node_index,
+                    expert_ids: missing_expert_ids,
+                    request: Some((request_id, wire_sent, wait_start)),
+                });
             }
         }
 
-        for (_node_index, expert_ids, outputs) in &push_hit_nodes {
-            for (expert_idx, values) in expert_ids.iter().copied().zip(outputs.iter()) {
-                remote_outputs.insert(expert_idx, values.clone());
-            }
-        }
-
-        for (node_index, _expert_ids, _) in &push_hit_nodes {
+        for node_index in &push_hit_nodes {
             let node_address = self.plan.nodes[*node_index].address.clone();
             let worker = self
                 .remote_workers
@@ -1164,17 +1189,15 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         let local_ns = local_start.elapsed().as_nanos() as u64;
 
         // Phase 2: collect responses from workers that have been computing since phase 1.
-        for ((node_index, expert_ids), send_info_opt) in
-            remote_selected.iter().zip(send_info.iter())
-        {
-            let Some((request_id, wire_sent, wait_start)) = send_info_opt else {
+        for dispatch in &dispatches {
+            let Some((request_id, wire_sent, wait_start)) = dispatch.request else {
                 continue;
             };
-            let node_address = self.plan.nodes[*node_index].address.clone();
+            let node_address = self.plan.nodes[dispatch.node_index].address.clone();
             let worker = self
                 .remote_workers
                 .iter_mut()
-                .find(|w| w.node_index == *node_index)
+                .find(|w| w.node_index == dispatch.node_index)
                 .ok_or_else(|| {
                     format!(
                         "distributed worker '{}' is missing an active coordinator connection",
@@ -1183,23 +1206,23 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                 })?;
             let (outputs, bytes_sent, bytes_received, wait_ns, _spec_hit) = recv_batch_response(
                 worker,
-                *request_id,
+                request_id,
                 layer,
                 dim,
-                expert_ids,
-                *wire_sent,
-                *wait_start,
+                &dispatch.expert_ids,
+                wire_sent,
+                wait_start,
             )
             .map_err(|err| format!("worker '{}' batch recv failed: {}", node_address, err))?;
             if bytes_sent > 0 {
                 record_distributed_remote_request(
-                    expert_ids.len(),
+                    dispatch.expert_ids.len(),
                     bytes_sent,
                     bytes_received,
                     wait_ns,
                 );
             }
-            for (expert_idx, values) in expert_ids.iter().copied().zip(outputs) {
+            for (expert_idx, values) in dispatch.expert_ids.iter().copied().zip(outputs) {
                 remote_outputs.insert(expert_idx, values);
             }
         }
@@ -1218,11 +1241,11 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                 layer,
                 local_selected.len(),
                 remote_selected.len(),
-                remote_selected
+                dispatches
                     .iter()
-                    .map(|(_, ids)| ids.len())
+                    .map(|dispatch| dispatch.expert_ids.len())
                     .sum::<usize>(),
-                push_hit_nodes.len(),
+                push_hit_experts,
                 total_ns as f64 / 1_000_000.0,
                 local_ns as f64 / 1_000_000.0,
                 remote_ns as f64 / 1_000_000.0
@@ -1429,25 +1452,32 @@ fn take_pushed_outputs(
     worker: &RemoteWorkerClient,
     layer: usize,
     expert_ids: &[usize],
-) -> Option<Vec<Vec<f32>>> {
+) -> Option<PushedExpertOutputs> {
     let (lock, _) = &*worker.inbound;
     let mut state = lock.lock().unwrap();
     state
         .push_buffer
         .retain(|&l, _| l >= layer.saturating_sub(1));
-    let (buf_ids, buf_outputs) = state.push_buffer.get(&layer)?;
-    if !expert_ids.iter().all(|id| buf_ids.contains(id)) {
+    let (buf_ids, buf_outputs) = state.push_buffer.remove(&layer)?;
+    let mut hit_expert_ids = Vec::new();
+    let mut outputs = Vec::new();
+    let mut missing_expert_ids = Vec::new();
+    for &expert_id in expert_ids {
+        if let Some(pos) = buf_ids.iter().position(|buf_id| *buf_id == expert_id) {
+            hit_expert_ids.push(expert_id);
+            outputs.push(buf_outputs[pos].clone());
+        } else {
+            missing_expert_ids.push(expert_id);
+        }
+    }
+    if hit_expert_ids.is_empty() {
         return None;
     }
-    let outputs = expert_ids
-        .iter()
-        .map(|id| {
-            let pos = buf_ids.iter().position(|buf_id| buf_id == id).unwrap();
-            buf_outputs[pos].clone()
-        })
-        .collect();
-    state.push_buffer.remove(&layer);
-    Some(outputs)
+    Some(PushedExpertOutputs {
+        hit_expert_ids,
+        outputs,
+        missing_expert_ids,
+    })
 }
 
 fn wait_for_batch_response(
