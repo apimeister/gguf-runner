@@ -905,7 +905,9 @@ pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHead
                 if end > payload.len() {
                     return Err("truncated ssm_float_payload".to_string());
                 }
-                payload[offset..end].to_vec()
+                let data = payload[offset..end].to_vec();
+                offset = end;
+                data
             } else { Vec::new() };
             let n_experts_per_tok = if offset + 4 <= payload.len() {
                 read_u32_le(payload, &mut offset)? as usize
