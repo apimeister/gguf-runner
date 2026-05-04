@@ -1009,8 +1009,7 @@ fn ssm_shard_add_tensor(
     shard_offset: &mut u64,
 ) -> Result<(), String> {
     use crate::engine::distributed::protocol::ShardTensorEntry;
-    let tensor = find_gguf_tensor(gguf, name)
-        .ok_or_else(|| format!("tensor not found: {name}"))?;
+    let tensor = find_gguf_tensor(gguf, name).ok_or_else(|| format!("tensor not found: {name}"))?;
     let n_elements = tensor_n_elements(tensor);
     let cols = tensor.ne[0] as usize;
     if cols == 0 {
@@ -1018,7 +1017,7 @@ fn ssm_shard_add_tensor(
     }
     let total_rows = n_elements / cols;
     let block_size = get_block_size(tensor.ttype);
-    if block_size == 0 || cols % block_size != 0 {
+    if block_size == 0 || !cols.is_multiple_of(block_size) {
         return Err(format!(
             "cols {cols} not divisible by block_size {block_size} for {name}"
         ));
@@ -1067,7 +1066,15 @@ pub(crate) fn collect_gate_routing_data(
         if find_gguf_tensor(gguf, &name).is_none() {
             continue;
         }
-        ssm_shard_add_tensor(gguf, l, SHARD_KIND_GATE_INP, &name, &mut entries, &mut ranges, &mut shard_offset)?;
+        ssm_shard_add_tensor(
+            gguf,
+            l,
+            SHARD_KIND_GATE_INP,
+            &name,
+            &mut entries,
+            &mut ranges,
+            &mut shard_offset,
+        )?;
     }
 
     if entries.is_empty() {
@@ -1087,8 +1094,8 @@ pub(crate) fn collect_ssm_shard_data(
     byte_offset_start: u64,
 ) -> Result<Option<SsmShardData>, String> {
     use crate::engine::distributed::protocol::{
-        SHARD_KIND_SSM_QKV_IN, SHARD_KIND_SSM_GATE, SHARD_KIND_SSM_OUT,
-        SHARD_KIND_SSM_BA, SHARD_KIND_SSM_ALPHA, SHARD_KIND_SSM_BETA,
+        SHARD_KIND_SSM_ALPHA, SHARD_KIND_SSM_BA, SHARD_KIND_SSM_BETA, SHARD_KIND_SSM_GATE,
+        SHARD_KIND_SSM_OUT, SHARD_KIND_SSM_QKV_IN,
     };
 
     if config.ssm_inner_size == 0 {
@@ -1104,15 +1111,63 @@ pub(crate) fn collect_ssm_shard_data(
             continue;
         }
 
-        ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_QKV_IN, &format!("blk.{l}.attn_qkv.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
-        ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_GATE, &format!("blk.{l}.attn_gate.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
-        ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_OUT, &format!("blk.{l}.ssm_out.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+        ssm_shard_add_tensor(
+            gguf,
+            l,
+            SHARD_KIND_SSM_QKV_IN,
+            &format!("blk.{l}.attn_qkv.weight"),
+            &mut entries,
+            &mut ranges,
+            &mut shard_offset,
+        )?;
+        ssm_shard_add_tensor(
+            gguf,
+            l,
+            SHARD_KIND_SSM_GATE,
+            &format!("blk.{l}.attn_gate.weight"),
+            &mut entries,
+            &mut ranges,
+            &mut shard_offset,
+        )?;
+        ssm_shard_add_tensor(
+            gguf,
+            l,
+            SHARD_KIND_SSM_OUT,
+            &format!("blk.{l}.ssm_out.weight"),
+            &mut entries,
+            &mut ranges,
+            &mut shard_offset,
+        )?;
 
         if find_gguf_tensor(gguf, &format!("blk.{l}.ssm_ba.weight")).is_some() {
-            ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_BA, &format!("blk.{l}.ssm_ba.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+            ssm_shard_add_tensor(
+                gguf,
+                l,
+                SHARD_KIND_SSM_BA,
+                &format!("blk.{l}.ssm_ba.weight"),
+                &mut entries,
+                &mut ranges,
+                &mut shard_offset,
+            )?;
         } else {
-            ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_ALPHA, &format!("blk.{l}.ssm_alpha.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
-            ssm_shard_add_tensor(gguf, l, SHARD_KIND_SSM_BETA, &format!("blk.{l}.ssm_beta.weight"), &mut entries, &mut ranges, &mut shard_offset)?;
+            ssm_shard_add_tensor(
+                gguf,
+                l,
+                SHARD_KIND_SSM_ALPHA,
+                &format!("blk.{l}.ssm_alpha.weight"),
+                &mut entries,
+                &mut ranges,
+                &mut shard_offset,
+            )?;
+            ssm_shard_add_tensor(
+                gguf,
+                l,
+                SHARD_KIND_SSM_BETA,
+                &format!("blk.{l}.ssm_beta.weight"),
+                &mut entries,
+                &mut ranges,
+                &mut shard_offset,
+            )?;
         }
     }
 
@@ -1139,15 +1194,27 @@ pub(crate) fn collect_ssm_shard_data(
 
         float_payload.extend_from_slice(&(l as u32).to_le_bytes());
         float_payload.extend_from_slice(&(conv1d.len() as u32).to_le_bytes());
-        for &f in &conv1d { float_payload.extend_from_slice(&f.to_le_bytes()); }
+        for &f in &conv1d {
+            float_payload.extend_from_slice(&f.to_le_bytes());
+        }
         float_payload.extend_from_slice(&(a.len() as u32).to_le_bytes());
-        for &f in &a { float_payload.extend_from_slice(&f.to_le_bytes()); }
-        for &f in &dt { float_payload.extend_from_slice(&f.to_le_bytes()); }
+        for &f in &a {
+            float_payload.extend_from_slice(&f.to_le_bytes());
+        }
+        for &f in &dt {
+            float_payload.extend_from_slice(&f.to_le_bytes());
+        }
         float_payload.extend_from_slice(&(norm.len() as u32).to_le_bytes());
-        for &f in &norm { float_payload.extend_from_slice(&f.to_le_bytes()); }
+        for &f in &norm {
+            float_payload.extend_from_slice(&f.to_le_bytes());
+        }
     }
 
-    let eps = if config.rms_norm_eps > 0.0 { config.rms_norm_eps } else { 1e-6 };
+    let eps = if config.rms_norm_eps > 0.0 {
+        config.rms_norm_eps
+    } else {
+        1e-6
+    };
     let total_bytes = shard_offset - byte_offset_start;
 
     Ok(Some(SsmShardData {

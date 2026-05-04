@@ -1,10 +1,9 @@
 use crate::engine::distributed::protocol::{
-    ActivationDtype, DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame,
-    ProposedExpertBatchFrame, ReadyFrame, SHARD_KIND_GATE_INP, SsmLayerResponse,
-    decode_error_frame, decode_expert_batch_request, decode_hello_frame,
-    decode_layer_ack, decode_model_shard_header, decode_ssm_layer_request,
+    DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame, ReadyFrame,
+    SHARD_KIND_GATE_INP, SsmLayerResponse, decode_error_frame, decode_expert_batch_request,
+    decode_hello_frame, decode_model_shard_header, decode_ssm_layer_request,
     encode_discover_response_frame, encode_error_frame, encode_expert_batch_response,
-    encode_proposed_expert_batch, encode_ready_frame, encode_ssm_layer_response,
+    encode_ready_frame, encode_ssm_layer_response,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
@@ -14,7 +13,10 @@ use crate::engine::types::{
     GgmlType, MappedFile, QuantizedTensor, WorkerExpertTensors, WorkerExpertWeights,
     WorkerSsmLayerWeights, WorkerSsmSession,
 };
-use rayon::prelude::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSlice,
+    ParallelSliceMut,
+};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -35,6 +37,9 @@ struct SpeculationCache {
     outputs: std::collections::HashMap<usize, Vec<f32>>,
 }
 
+type SsmFloatPayloadEntry = (usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+type SsmLayerFloatData = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
 struct WorkerSession {
     weights: WorkerExpertWeights,
     assigned_experts: Vec<Vec<bool>>,
@@ -50,18 +55,14 @@ struct WorkerSession {
     moe_n_group: usize,
     moe_topk_group: usize,
     // Non-blocking deep speculation: one in-flight rayon task per future MoE layer.
-    spec_receivers: std::sync::Mutex<std::collections::HashMap<usize, std::sync::mpsc::Receiver<SpeculationCache>>>,
+    spec_receivers: std::sync::Mutex<
+        std::collections::HashMap<usize, std::sync::mpsc::Receiver<SpeculationCache>>,
+    >,
     last_activation: Vec<f32>,
     spec_hits: u64,
     spec_misses: u64,
-    /// Spec results that have been computed and pushed to the coordinator.
-    /// Kept locally as fallback in case the coordinator sends ExpertBatchRequest anyway
-    /// (timing miss: push arrived after coordinator already decided to send request).
-    pushed_cache: std::collections::HashMap<usize, SpeculationCache>,
     /// Coordinator-provided routing hint for a specific future layer.
     hint_for_layer: Option<(usize, Vec<usize>)>,
-    /// Activation dtype used by this session (for encoding ProposedExpertBatch).
-    activation_dtype: ActivationDtype,
 }
 
 fn shard_temp_path(bind_address: &str) -> PathBuf {
@@ -110,9 +111,7 @@ impl WorkerRuntime {
             || shard_header.n_layers != hello.n_layers
             || shard_header.n_experts != hello.n_experts
         {
-            return Err(
-                "shard header dimensions do not match coordinator HELLO".to_string(),
-            );
+            return Err("shard header dimensions do not match coordinator HELLO".to_string());
         }
 
         // Set long timeout for shard receive
@@ -120,8 +119,12 @@ impl WorkerRuntime {
 
         // Write shard to temp file
         let temp_path = shard_temp_path(&self.bind_address);
-        let mut temp_file = std::fs::File::create(&temp_path)
-            .map_err(|e| format!("failed to create shard temp file '{}': {e}", temp_path.display()))?;
+        let mut temp_file = std::fs::File::create(&temp_path).map_err(|e| {
+            format!(
+                "failed to create shard temp file '{}': {e}",
+                temp_path.display()
+            )
+        })?;
 
         let received_bytes = connection.recv_raw_stream_to_file(&mut temp_file)?;
 
@@ -146,11 +149,12 @@ impl WorkerRuntime {
         let mut expert_slots: Vec<Vec<Option<WorkerExpertTensors>>> = (0..shard_header.n_layers)
             .map(|_| (0..shard_header.n_experts).map(|_| None).collect())
             .collect();
-        let mut assigned_mask =
-            vec![vec![false; shard_header.n_experts]; shard_header.n_layers];
+        let mut assigned_mask = vec![vec![false; shard_header.n_experts]; shard_header.n_layers];
 
-        let mut tensor_map: std::collections::HashMap<(usize, usize), [Option<QuantizedTensor>; 3]> =
-            Default::default();
+        let mut tensor_map: std::collections::HashMap<
+            (usize, usize),
+            [Option<QuantizedTensor>; 3],
+        > = Default::default();
         for entry in &shard_header.entries {
             if entry.kind > 2 {
                 continue; // SSM entries (kind 3-8) are handled by build_ssm_session
@@ -167,14 +171,12 @@ impl WorkerRuntime {
             slot[entry.kind as usize] = Some(t);
         }
         for ((layer, expert_idx), [gate_opt, up_opt, down_opt]) in tensor_map {
-            let gate = gate_opt.ok_or_else(|| {
-                format!("missing gate for layer {layer} expert {expert_idx}")
-            })?;
+            let gate = gate_opt
+                .ok_or_else(|| format!("missing gate for layer {layer} expert {expert_idx}"))?;
             let up = up_opt
                 .ok_or_else(|| format!("missing up for layer {layer} expert {expert_idx}"))?;
-            let down = down_opt.ok_or_else(|| {
-                format!("missing down for layer {layer} expert {expert_idx}")
-            })?;
+            let down = down_opt
+                .ok_or_else(|| format!("missing down for layer {layer} expert {expert_idx}"))?;
             expert_slots[layer][expert_idx] = Some(WorkerExpertTensors { gate, up, down });
             assigned_mask[layer][expert_idx] = true;
         }
@@ -212,7 +214,6 @@ impl WorkerRuntime {
             memory_bytes: self.resources.memory_bytes,
             loaded_expert_count,
         };
-        let activation_dtype = hello.activation_dtype;
         Ok((
             ready,
             WorkerSession {
@@ -233,9 +234,7 @@ impl WorkerRuntime {
                 last_activation: vec![0.0f32; dim],
                 spec_hits: 0,
                 spec_misses: 0,
-                pushed_cache: std::collections::HashMap::new(),
                 hint_for_layer: None,
-                activation_dtype,
             },
         ))
     }
@@ -332,7 +331,7 @@ impl WorkerRuntime {
 fn parse_ssm_float_payload(
     payload: &[u8],
     n_layers: usize,
-) -> Result<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>, String> {
+) -> Result<Vec<SsmFloatPayloadEntry>, String> {
     let mut offset = 0usize;
     let mut result = Vec::new();
 
@@ -340,7 +339,7 @@ fn parse_ssm_float_payload(
         if *off + 4 > buf.len() {
             return Err("truncated u32 in float payload".to_string());
         }
-        let v = u32::from_le_bytes([buf[*off], buf[*off+1], buf[*off+2], buf[*off+3]]);
+        let v = u32::from_le_bytes([buf[*off], buf[*off + 1], buf[*off + 2], buf[*off + 3]]);
         *off += 4;
         Ok(v)
     };
@@ -351,7 +350,7 @@ fn parse_ssm_float_payload(
         }
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            let v = f32::from_le_bytes([buf[*off], buf[*off+1], buf[*off+2], buf[*off+3]]);
+            let v = f32::from_le_bytes([buf[*off], buf[*off + 1], buf[*off + 2], buf[*off + 3]]);
             *off += 4;
             out.push(v);
         }
@@ -396,7 +395,7 @@ fn build_ssm_session(
         std::collections::HashMap::new();
     for entry in &shard_header.entries {
         let kind = entry.kind as usize;
-        if kind < 3 || kind > 8 {
+        if !(3..=8).contains(&kind) {
             continue; // not an SSM entry
         }
         let t = QuantizedTensor {
@@ -405,13 +404,15 @@ fn build_ssm_session(
             rows: entry.rows,
             cols: entry.cols,
         };
-        let slot = layer_map.entry(entry.layer).or_insert([None, None, None, None, None, None]);
+        let slot = layer_map
+            .entry(entry.layer)
+            .or_insert([None, None, None, None, None, None]);
         slot[kind - 3] = Some(t);
     }
 
     // Parse float payload
     let float_data = parse_ssm_float_payload(&shard_header.ssm_float_payload, n_layers)?;
-    let mut float_by_layer: std::collections::HashMap<usize, (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> =
+    let mut float_by_layer: std::collections::HashMap<usize, SsmLayerFloatData> =
         std::collections::HashMap::new();
     for (layer, conv1d, a, dt_bias, norm) in float_data {
         float_by_layer.insert(layer, (conv1d, a, dt_bias, norm));
@@ -426,9 +427,11 @@ fn build_ssm_session(
         let [qkv_opt, gate_opt, out_opt, ba_opt, alpha_opt, beta_opt] = tensors;
         let qkv_in = qkv_opt.ok_or_else(|| format!("SSM layer {layer}: missing qkv_in tensor"))?;
         let gate = gate_opt.ok_or_else(|| format!("SSM layer {layer}: missing gate tensor"))?;
-        let out_proj = out_opt.ok_or_else(|| format!("SSM layer {layer}: missing out_proj tensor"))?;
+        let out_proj =
+            out_opt.ok_or_else(|| format!("SSM layer {layer}: missing out_proj tensor"))?;
 
-        let (conv1d, a, dt_bias, norm) = float_by_layer.remove(&layer)
+        let (conv1d, a, dt_bias, norm) = float_by_layer
+            .remove(&layer)
             .ok_or_else(|| format!("SSM layer {layer}: missing float payload"))?;
 
         layers[layer] = Some(WorkerSsmLayerWeights {
@@ -519,10 +522,7 @@ fn finite_or_zero(x: f32) -> f32 {
 
 fn ssm_norm_silu_head(out_h: &mut [f32], z_h: &[f32], norm: &[f32], eps: f32) {
     let head_dim = out_h.len();
-    let mut ss = 0.0f32;
-    for i in 0..head_dim {
-        ss += out_h[i] * out_h[i];
-    }
+    let ss: f32 = out_h.iter().map(|value| value * value).sum();
     let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
     for i in 0..head_dim {
         let gate = z_h[i] / (1.0 + (-z_h[i]).exp());
@@ -530,6 +530,7 @@ fn ssm_norm_silu_head(out_h: &mut [f32], z_h: &[f32], norm: &[f32], eps: f32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_ssm_state_head_step(
     state_h: &mut [f32],
     out_h: &mut [f32],
@@ -550,7 +551,9 @@ fn worker_ssm_state_head_step(
     kv_mem.fill(0.0);
     for j in 0..head_dim {
         let kj = k[j];
-        if kj == 0.0 { continue; }
+        if kj == 0.0 {
+            continue;
+        }
         let col = &state_h[j * head_dim..(j + 1) * head_dim];
         for i in 0..head_dim {
             kv_mem[i] += kj * col[i];
@@ -563,7 +566,9 @@ fn worker_ssm_state_head_step(
     // state update: state += k outer delta
     for j in 0..head_dim {
         let kj = k[j];
-        if kj == 0.0 { continue; }
+        if kj == 0.0 {
+            continue;
+        }
         let col = &mut state_h[j * head_dim..(j + 1) * head_dim];
         for i in 0..head_dim {
             col[i] += kj * delta[i];
@@ -573,14 +578,18 @@ fn worker_ssm_state_head_step(
     out_h.fill(0.0);
     for j in 0..head_dim {
         let qj = q[j];
-        if qj == 0.0 { continue; }
+        if qj == 0.0 {
+            continue;
+        }
         let col = &state_h[j * head_dim..(j + 1) * head_dim];
         for i in 0..head_dim {
             out_h[i] += qj * col[i];
         }
     }
     for v in out_h.iter_mut() {
-        if !v.is_finite() { *v = 0.0; }
+        if !v.is_finite() {
+            *v = 0.0;
+        }
     }
 }
 
@@ -600,10 +609,14 @@ fn worker_ssm_step(
     let conv_dim = d_inner + 2 * n_k_heads * head_dim;
 
     if layer >= ssm.n_layers {
-        return Err(format!("SSM layer {layer} out of range (n_layers={})", ssm.n_layers));
+        return Err(format!(
+            "SSM layer {layer} out of range (n_layers={})",
+            ssm.n_layers
+        ));
     }
 
-    let layer_w = ssm.layers[layer].as_ref()
+    let layer_w = ssm.layers[layer]
+        .as_ref()
         .ok_or_else(|| format!("SSM layer {layer} has no weights on this worker"))?;
 
     // Input projections
@@ -637,9 +650,13 @@ fn worker_ssm_step(
             mapped,
         )?;
     } else {
-        let alpha_t = layer_w.alpha.as_ref()
+        let alpha_t = layer_w
+            .alpha
+            .as_ref()
             .ok_or_else(|| format!("SSM layer {layer}: missing alpha tensor"))?;
-        let beta_t = layer_w.beta.as_ref()
+        let beta_t = layer_w
+            .beta
+            .as_ref()
             .ok_or_else(|| format!("SSM layer {layer}: missing beta tensor"))?;
         matmul_quantized_rows(
             &mut ssm.ssm_gate_exp[..n_v_heads],
@@ -674,7 +691,9 @@ fn worker_ssm_step(
             for t in 0..hist_steps {
                 acc += conv_hist[t * conv_dim + c] * conv_w[c * conv_kernel + t];
             }
-            if !acc.is_finite() { acc = 0.0; }
+            if !acc.is_finite() {
+                acc = 0.0;
+            }
             ssm.ssm_conv[c] = siluf(acc);
         }
 
@@ -710,7 +729,8 @@ fn worker_ssm_step(
         let q_inv = 1.0 / (q_ss + eps).sqrt();
         let k_inv = 1.0 / (k_ss + eps).sqrt();
         for i in 0..head_dim {
-            ssm.ssm_q[h * head_dim + i] = finite_or_zero(ssm.ssm_conv[q_src_start + i] * q_inv * inv_scale_q);
+            ssm.ssm_q[h * head_dim + i] =
+                finite_or_zero(ssm.ssm_conv[q_src_start + i] * q_inv * inv_scale_q);
             ssm.ssm_k[h * head_dim + i] = finite_or_zero(ssm.ssm_conv[k_src_start + i] * k_inv);
             ssm.ssm_v[h * head_dim + i] = finite_or_zero(ssm.ssm_conv[v_src_start + i]);
         }
@@ -734,7 +754,9 @@ fn worker_ssm_step(
             )
         };
         let mut gate = softplusf(alpha_val) * layer_w.a[h];
-        if !gate.is_finite() { gate = 0.0; }
+        if !gate.is_finite() {
+            gate = 0.0;
+        }
         ssm.ssm_beta_scratch[h] = finite_or_zero(beta_val);
         ssm.ssm_gate_exp[h] = finite_or_zero(gate.exp());
     }
@@ -766,8 +788,15 @@ fn worker_ssm_step(
                 let k = &k_all[h * head_dim..(h + 1) * head_dim];
                 let v = &v_all[h * head_dim..(h + 1) * head_dim];
                 worker_ssm_state_head_step(
-                    state_h, out_h, kv_mem, delta, q, k, v,
-                    gate_all[h], beta_all[h],
+                    state_h,
+                    out_h,
+                    kv_mem,
+                    delta,
+                    q,
+                    k,
+                    v,
+                    gate_all[h],
+                    beta_all[h],
                 );
             });
     } else {
@@ -777,11 +806,19 @@ fn worker_ssm_step(
             let v: Vec<f32> = ssm.ssm_v[h * head_dim..(h + 1) * head_dim].to_vec();
             let mut kv_mem = vec![0.0f32; head_dim];
             let mut delta = vec![0.0f32; head_dim];
-            let state_h = &mut ssm.ssm_state[state_off + h * head_dim * head_dim..state_off + (h + 1) * head_dim * head_dim];
+            let state_h = &mut ssm.ssm_state
+                [state_off + h * head_dim * head_dim..state_off + (h + 1) * head_dim * head_dim];
             let out_h = &mut ssm.ssm_proj[h * head_dim..(h + 1) * head_dim];
             worker_ssm_state_head_step(
-                state_h, out_h, &mut kv_mem, &mut delta, &q, &k, &v,
-                gate_all[h], beta_all[h],
+                state_h,
+                out_h,
+                &mut kv_mem,
+                &mut delta,
+                &q,
+                &k,
+                &v,
+                gate_all[h],
+                beta_all[h],
             );
         }
     }
@@ -808,14 +845,11 @@ fn worker_ssm_step(
     let layer_w = ssm.layers[layer].as_ref().unwrap();
     let proj_snap: Vec<f32> = ssm.ssm_proj[..d_inner].to_vec();
     let mut xb2 = vec![0.0f32; dim];
-    matmul_quantized(
-        &mut xb2[..dim],
-        &proj_snap,
-        &layer_w.out_proj,
-        mapped,
-    )?;
+    matmul_quantized(&mut xb2[..dim], &proj_snap, &layer_w.out_proj, mapped)?;
     for v in &mut xb2[..dim] {
-        if !v.is_finite() { *v = 0.0; }
+        if !v.is_finite() {
+            *v = 0.0;
+        }
     }
     Ok(xb2)
 }
@@ -834,9 +868,6 @@ const SPEC_DEPTH: usize = 2;
 /// Path 1: if `session.hint_for_layer` matches the nearest future layer, uses the
 /// coordinator-provided expert IDs (computed from exact x_L) instead of the stale
 /// self-predicted IDs (from x_{L-1}).  The hint is consumed on use.
-///
-/// Path 3: layers already in `pushed_cache` are skipped (they've been pushed to the
-/// coordinator and don't need recomputation).
 fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     if session.n_experts_per_tok == 0 {
         session.spec_receivers.lock().unwrap().clear();
@@ -868,20 +899,31 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     let act = session.last_activation[..dim].to_vec();
 
     // Consume hint if it targets the nearest future layer.
-    let hint_consumed_layer = session.hint_for_layer
+    let hint_consumed_layer = session
+        .hint_for_layer
         .as_ref()
         .filter(|(hl, _)| future_layers.first() == Some(hl))
         .map(|(hl, _)| *hl);
     let hint_ids: Vec<usize> = if hint_consumed_layer.is_some() {
-        session.hint_for_layer.take().map(|(_, ids)| ids).unwrap_or_default()
+        session
+            .hint_for_layer
+            .take()
+            .map(|(_, ids)| ids)
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
 
-    type WorkItem = (usize, Vec<(usize, WorkerExpertTensors)>, std::sync::mpsc::SyncSender<SpeculationCache>);
+    type WorkItem = (
+        usize,
+        Vec<(usize, WorkerExpertTensors)>,
+        std::sync::mpsc::SyncSender<SpeculationCache>,
+    );
     let mut work_items: Vec<WorkItem> = Vec::new();
-    let mut new_receivers: std::collections::HashMap<usize, std::sync::mpsc::Receiver<SpeculationCache>> =
-        std::collections::HashMap::new();
+    let mut new_receivers: std::collections::HashMap<
+        usize,
+        std::sync::mpsc::Receiver<SpeculationCache>,
+    > = std::collections::HashMap::new();
 
     {
         let mut receivers = session.spec_receivers.lock().unwrap();
@@ -892,17 +934,16 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
             if receivers.contains_key(&next_layer) {
                 continue; // already in flight; retain it
             }
-            // Skip layers already computed and pushed to coordinator (Path 3).
-            if session.pushed_cache.contains_key(&next_layer) {
-                continue;
-            }
-
             // Determine which expert IDs to compute for next_layer.
-            let predicted: Vec<usize> = if hint_consumed_layer == Some(next_layer) && !hint_ids.is_empty() {
+            let predicted: Vec<usize> = if hint_consumed_layer == Some(next_layer)
+                && !hint_ids.is_empty()
+            {
                 // Path 1: use coordinator hint (exact current activation, 0-stale).
-                hint_ids.iter()
+                hint_ids
+                    .iter()
                     .filter(|&&id| {
-                        session.assigned_experts
+                        session
+                            .assigned_experts
                             .get(next_layer)
                             .and_then(|v| v.get(id))
                             .copied()
@@ -917,40 +958,57 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
                     None => continue,
                 };
                 let mut logits = vec![0.0f32; n_experts];
-                if matmul_quantized_rows(&mut logits, &act, &gate_inp, 0, n_experts, mapped).is_err() {
+                if matmul_quantized_rows(&mut logits, &act, &gate_inp, 0, n_experts, mapped)
+                    .is_err()
+                {
                     continue;
                 }
                 let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut scores: Vec<f32> = logits.iter().map(|&v| (v - max_l).exp()).collect();
                 let sum: f32 = scores.iter().sum();
                 let inv = 1.0 / sum.max(f32::MIN_POSITIVE);
-                for s in &mut scores { *s *= inv; }
+                for s in &mut scores {
+                    *s *= inv;
+                }
 
                 let use_groups = moe_n_group > 1
                     && moe_topk_group < moe_n_group
-                    && n_experts % moe_n_group == 0;
-                let group_size = if use_groups { n_experts / moe_n_group } else { n_experts };
+                    && n_experts.is_multiple_of(moe_n_group);
+                let group_size = if use_groups {
+                    n_experts / moe_n_group
+                } else {
+                    n_experts
+                };
                 let mut selected_group = vec![true; moe_n_group.max(1)];
 
                 if use_groups {
                     let mut group_scores = vec![0.0f32; moe_n_group];
-                    for g in 0..moe_n_group {
+                    for (g, group_score) in group_scores.iter_mut().enumerate().take(moe_n_group) {
                         let start = g * group_size;
                         let mut top1 = f32::NEG_INFINITY;
                         let mut top2 = f32::NEG_INFINITY;
                         for &s in &scores[start..start + group_size] {
-                            if s > top1 { top2 = top1; top1 = s; } else if s > top2 { top2 = s; }
+                            if s > top1 {
+                                top2 = top1;
+                                top1 = s;
+                            } else if s > top2 {
+                                top2 = s;
+                            }
                         }
-                        group_scores[g] = top1 + top2.max(0.0);
+                        *group_score = top1 + top2.max(0.0);
                     }
                     let mut g_indices: Vec<usize> = (0..moe_n_group).collect();
                     g_indices.select_nth_unstable_by(moe_topk_group - 1, |&a, &b| {
-                        group_scores[b].partial_cmp(&group_scores[a]).unwrap_or(std::cmp::Ordering::Equal)
+                        group_scores[b]
+                            .partial_cmp(&group_scores[a])
+                            .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     for g in &g_indices[moe_topk_group..] {
                         selected_group[*g] = false;
                         let start = g * group_size;
-                        for s in &mut scores[start..start + group_size] { *s = 0.0; }
+                        for s in &mut scores[start..start + group_size] {
+                            *s = 0.0;
+                        }
                     }
                 }
 
@@ -974,14 +1032,17 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
             let my_experts: Vec<(usize, WorkerExpertTensors)> = predicted
                 .iter()
                 .filter(|&&id| {
-                    session.assigned_experts
+                    session
+                        .assigned_experts
                         .get(next_layer)
                         .and_then(|v| v.get(id))
                         .copied()
                         .unwrap_or(false)
                 })
                 .filter_map(|&id| {
-                    session.weights.experts
+                    session
+                        .weights
+                        .experts
                         .get(next_layer)
                         .and_then(|l| l.get(id))
                         .and_then(|slot| slot.as_ref())
@@ -1015,80 +1076,39 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
                     let mut gate_scratch = vec![0.0f32; hidden];
                     let mut up_scratch = vec![0.0f32; hidden];
                     let mut output = vec![0.0f32; dim];
-                    matmul_quantized_rows(&mut gate_scratch, &act, &tensors.gate, 0, hidden, mapped)?;
+                    matmul_quantized_rows(
+                        &mut gate_scratch,
+                        &act,
+                        &tensors.gate,
+                        0,
+                        hidden,
+                        mapped,
+                    )?;
                     matmul_quantized_rows(&mut up_scratch, &act, &tensors.up, 0, hidden, mapped)?;
                     silu_and_mul_inplace(&mut gate_scratch, &up_scratch);
-                    matmul_quantized_rows(&mut output, &gate_scratch, &tensors.down, 0, dim, mapped)?;
+                    matmul_quantized_rows(
+                        &mut output,
+                        &gate_scratch,
+                        &tensors.down,
+                        0,
+                        dim,
+                        mapped,
+                    )?;
                     Ok((*expert_idx, output))
                 })
                 .collect::<Result<Vec<_>, _>>();
             if let Ok(pairs) = outputs {
                 let mut map = std::collections::HashMap::with_capacity(pairs.len());
-                for (id, out) in pairs { map.insert(id, out); }
-                let _ = tx.send(SpeculationCache { layer: next_layer, outputs: map });
+                for (id, out) in pairs {
+                    map.insert(id, out);
+                }
+                let _ = tx.send(SpeculationCache {
+                    layer: next_layer,
+                    outputs: map,
+                });
             }
         }
     });
-}
-
-/// Drain completed spec tasks, push their results to the coordinator, and store in pushed_cache.
-/// This is called after every response so results arrive at the coordinator as early as possible.
-fn drain_and_push_ready_specs(
-    session: &mut WorkerSession,
-    connection: &mut crate::engine::distributed::transport::FramedConnection,
-) {
-    let mut ready: Vec<SpeculationCache> = Vec::new();
-    // Collect ready layer indices first, then remove+drain to avoid borrow conflict.
-    let ready_layers: Vec<usize> = {
-        let receivers = session.spec_receivers.lock().unwrap();
-        receivers
-            .iter()
-            .filter_map(|(&l, rx)| {
-                // peek without consuming — we need the value, so we can't use try_recv here.
-                // Instead we'll iterate and drain in the second pass.
-                // This just identifies candidate layers.
-                let _ = rx; // placeholder: we'll drain below
-                Some(l)
-            })
-            .collect()
-    };
-    {
-        let mut receivers = session.spec_receivers.lock().unwrap();
-        for l in ready_layers {
-            // try_recv: non-blocking check; removes the receiver if the value is available.
-            let entry = receivers.remove(&l);
-            if let Some(rx) = entry {
-                match rx.try_recv() {
-                    Ok(cache) => ready.push(cache),
-                    Err(_) => { receivers.insert(l, rx); } // not ready yet; put back
-                }
-            }
-        }
-    }
-
-    for cache in ready {
-        let layer = cache.layer;
-        // Build ProposedExpertBatch and send to coordinator.
-        let mut expert_ids: Vec<usize> = cache.outputs.keys().copied().collect();
-        expert_ids.sort_unstable();
-        let outputs: Vec<Vec<f32>> = expert_ids.iter().map(|id| cache.outputs[id].clone()).collect();
-        let frame = ProposedExpertBatchFrame {
-            layer,
-            output_dtype: session.activation_dtype,
-            dim: session.dim,
-            expert_ids: expert_ids.clone(),
-            outputs: outputs.clone(),
-        };
-        if let Ok(payload) = encode_proposed_expert_batch(&frame) {
-            let _ = connection.send_message(FrameKind::ProposedExpertBatch, 0, &payload);
-        }
-        // Keep a local copy as fallback in case coordinator missed the push.
-        let mut fallback_outputs = std::collections::HashMap::new();
-        for (id, out) in expert_ids.into_iter().zip(outputs) {
-            fallback_outputs.insert(id, out);
-        }
-        session.pushed_cache.insert(layer, SpeculationCache { layer, outputs: fallback_outputs });
-    }
 }
 
 pub(crate) fn run_worker_server(bind_address: &str) -> Result<(), String> {
@@ -1162,37 +1182,42 @@ fn handle_worker_connection(
 
                                 // Store coordinator routing hint for layer+1 (Path 1).
                                 if !request.hint_expert_ids.is_empty() {
-                                    session.hint_for_layer = Some((completed_layer + 1, request.hint_expert_ids.clone()));
+                                    session.hint_for_layer = Some((
+                                        completed_layer + 1,
+                                        request.hint_expert_ids.clone(),
+                                    ));
                                 }
 
-                                // Check pushed_cache first (fallback for timing misses in Path 3).
-                                let pushed_hit = session.pushed_cache.remove(&request.layer);
-
                                 // Poll the background speculation task for this layer (non-blocking).
-                                let spec_cache: Option<SpeculationCache> = pushed_hit.or_else(|| {
-                                    session
-                                        .spec_receivers
-                                        .lock().unwrap()
-                                        .remove(&request.layer)
-                                        .and_then(|rx| rx.try_recv().ok())
-                                });
+                                let spec_cache: Option<SpeculationCache> = session
+                                    .spec_receivers
+                                    .lock()
+                                    .unwrap()
+                                    .remove(&request.layer)
+                                    .and_then(|rx| rx.try_recv().ok());
 
                                 // Superset hit check: all requested experts must be in the cache.
                                 let mut req_ids_sorted = request.expert_ids.clone();
                                 req_ids_sorted.sort_unstable();
 
-                                let spec_hit = spec_cache.as_ref().map_or(false, |spec| {
+                                let spec_hit = spec_cache.as_ref().is_some_and(|spec| {
                                     spec.layer == request.layer
-                                        && req_ids_sorted.iter().all(|id| spec.outputs.contains_key(id))
+                                        && req_ids_sorted
+                                            .iter()
+                                            .all(|id| spec.outputs.contains_key(id))
                                 });
 
                                 let response = if spec_hit {
                                     session.spec_hits += 1;
                                     let spec = spec_cache.unwrap();
-                                    let outputs: Result<Vec<Vec<f32>>, String> = request.expert_ids.iter()
-                                        .map(|id| spec.outputs.get(id)
-                                            .cloned()
-                                            .ok_or_else(|| format!("spec cache missing expert {id}")))
+                                    let outputs: Result<Vec<Vec<f32>>, String> = request
+                                        .expert_ids
+                                        .iter()
+                                        .map(|id| {
+                                            spec.outputs.get(id).cloned().ok_or_else(|| {
+                                                format!("spec cache missing expert {id}")
+                                            })
+                                        })
                                         .collect();
                                     match outputs {
                                         Ok(outs) => Ok(ExpertBatchResponse {
@@ -1216,7 +1241,8 @@ fn handle_worker_connection(
 
                                 // Update last_activation for next speculation
                                 if request.activation.len() >= dim {
-                                    session.last_activation[..dim].copy_from_slice(&request.activation[..dim]);
+                                    session.last_activation[..dim]
+                                        .copy_from_slice(&request.activation[..dim]);
                                 }
 
                                 match response {
@@ -1229,8 +1255,6 @@ fn handle_worker_connection(
                                         )?;
                                         // Speculate next layers while coordinator does attention/norm.
                                         speculate_ahead(&mut session, completed_layer);
-                                        // Push any newly-ready spec results to coordinator (Path 3).
-                                        drain_and_push_ready_specs(&mut session, connection);
                                     }
                                     Err(err) => {
                                         let payload = encode_error_frame(&err)?;
@@ -1242,35 +1266,16 @@ fn handle_worker_connection(
                                     }
                                 }
                             }
-                            FrameKind::LayerAck => {
-                                // Coordinator consumed a push-hit for this layer; keep speculation
-                                // alive by updating activation state and spawning the next chain.
-                                match decode_layer_ack(&message.payload) {
-                                    Ok(ack) => {
-                                        let dim = session.dim;
-                                        if ack.activation.len() >= dim {
-                                            session.last_activation[..dim]
-                                                .copy_from_slice(&ack.activation[..dim]);
-                                        }
-                                        // Store coordinator hint for next-next layer.
-                                        if !ack.hint_expert_ids.is_empty() {
-                                            session.hint_for_layer = Some((ack.layer + 1, ack.hint_expert_ids));
-                                        }
-                                        speculate_ahead(&mut session, ack.layer);
-                                        drain_and_push_ready_specs(&mut session, connection);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("worker: failed to decode LayerAck: {e}");
-                                    }
-                                }
-                            }
                             FrameKind::SsmLayerRequest => {
                                 let mapped = session._shard.as_slice();
                                 if let Some(ssm) = &mut session.ssm_session {
                                     let req = decode_ssm_layer_request(&message.payload)?;
                                     match worker_ssm_step(ssm, req.layer, &req.xb, mapped) {
                                         Ok(xb2) => {
-                                            let resp = SsmLayerResponse { layer: req.layer, xb2 };
+                                            let resp = SsmLayerResponse {
+                                                layer: req.layer,
+                                                xb2,
+                                            };
                                             let payload = encode_ssm_layer_response(&resp);
                                             connection.send_message(
                                                 FrameKind::SsmLayerResponse,
@@ -1314,7 +1319,9 @@ fn handle_worker_connection(
                     let total = session.spec_hits + session.spec_misses;
                     let hit_pct = if total > 0 {
                         100.0 * session.spec_hits as f64 / total as f64
-                    } else { 0.0 };
+                    } else {
+                        0.0
+                    };
                     eprintln!(
                         "[SPEC] speculation hits={} misses={} total={} hit_rate={:.1}%",
                         session.spec_hits, session.spec_misses, total, hit_pct

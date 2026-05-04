@@ -18,8 +18,6 @@ pub(crate) enum FrameKind {
     ModelShardHeader = 9,
     SsmLayerRequest = 10,
     SsmLayerResponse = 11,
-    LayerAck = 12,
-    ProposedExpertBatch = 13,
 }
 
 impl FrameKind {
@@ -36,8 +34,6 @@ impl FrameKind {
             9 => Ok(Self::ModelShardHeader),
             10 => Ok(Self::SsmLayerRequest),
             11 => Ok(Self::SsmLayerResponse),
-            12 => Ok(Self::LayerAck),
-            13 => Ok(Self::ProposedExpertBatch),
             _ => Err(format!("unknown distributed frame kind {value}")),
         }
     }
@@ -120,27 +116,6 @@ pub(crate) struct ExpertBatchRequest {
     pub(crate) activation: Vec<f32>,
     /// Coordinator-predicted expert IDs for layer+1 (empty = no hint).
     pub(crate) hint_expert_ids: Vec<usize>,
-}
-
-/// LayerAck: sent by coordinator to worker when a push-hit is consumed.
-/// Carries the current activation so the worker can keep speculating accurately.
-#[derive(Clone, Debug)]
-pub(crate) struct LayerAckFrame {
-    pub(crate) layer: usize,
-    pub(crate) activation_dtype: ActivationDtype,
-    pub(crate) dim: usize,
-    pub(crate) activation: Vec<f32>,
-    pub(crate) hint_expert_ids: Vec<usize>,
-}
-
-/// Worker → coordinator: speculative expert outputs pushed proactively.
-#[derive(Clone, Debug)]
-pub(crate) struct ProposedExpertBatchFrame {
-    pub(crate) layer: usize,
-    pub(crate) output_dtype: ActivationDtype,
-    pub(crate) dim: usize,
-    pub(crate) expert_ids: Vec<usize>,
-    pub(crate) outputs: Vec<Vec<f32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -628,103 +603,6 @@ pub(crate) fn decode_expert_batch_request(payload: &[u8]) -> Result<ExpertBatchR
     })
 }
 
-pub(crate) fn encode_layer_ack(frame: &LayerAckFrame) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    write_u32_le(
-        &mut out,
-        frame.layer.try_into().map_err(|_| "layer overflow".to_string())?,
-    );
-    write_u16_le(&mut out, frame.activation_dtype as u16);
-    write_u32_le(
-        &mut out,
-        frame.dim.try_into().map_err(|_| "dim overflow".to_string())?,
-    );
-    write_u32_le(
-        &mut out,
-        frame.hint_expert_ids.len().try_into().map_err(|_| "hint count overflow".to_string())?,
-    );
-    for &id in &frame.hint_expert_ids {
-        write_u32_le(
-            &mut out,
-            id.try_into().map_err(|_| "hint id overflow".to_string())?,
-        );
-    }
-    out.extend_from_slice(&encode_activation_vector(&frame.activation, frame.activation_dtype));
-    Ok(out)
-}
-
-pub(crate) fn decode_layer_ack(payload: &[u8]) -> Result<LayerAckFrame, String> {
-    let mut offset = 0usize;
-    let layer = read_u32_le(payload, &mut offset)? as usize;
-    let activation_dtype = ActivationDtype::from_u16(read_u16_le(payload, &mut offset)?)?;
-    let dim = read_u32_le(payload, &mut offset)? as usize;
-    let n_hint = read_u32_le(payload, &mut offset)? as usize;
-    let mut hint_expert_ids = Vec::with_capacity(n_hint);
-    for _ in 0..n_hint {
-        hint_expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
-    }
-    let activation = decode_activation_vector(&payload[offset..], activation_dtype, dim)?;
-    Ok(LayerAckFrame { layer, activation_dtype, dim, activation, hint_expert_ids })
-}
-
-pub(crate) fn encode_proposed_expert_batch(frame: &ProposedExpertBatchFrame) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    write_u32_le(
-        &mut out,
-        frame.layer.try_into().map_err(|_| "layer overflow".to_string())?,
-    );
-    write_u32_le(
-        &mut out,
-        frame.dim.try_into().map_err(|_| "dim overflow".to_string())?,
-    );
-    write_u16_le(&mut out, frame.output_dtype as u16);
-    write_u32_le(
-        &mut out,
-        frame.expert_ids.len().try_into().map_err(|_| "expert count overflow".to_string())?,
-    );
-    for &id in &frame.expert_ids {
-        write_u32_le(
-            &mut out,
-            id.try_into().map_err(|_| "expert id overflow".to_string())?,
-        );
-    }
-    for output in &frame.outputs {
-        if output.len() != frame.dim {
-            return Err(format!(
-                "proposed batch output len mismatch: got {}, expected {}",
-                output.len(), frame.dim
-            ));
-        }
-        out.extend_from_slice(&encode_activation_vector(output, frame.output_dtype));
-    }
-    Ok(out)
-}
-
-pub(crate) fn decode_proposed_expert_batch(payload: &[u8]) -> Result<ProposedExpertBatchFrame, String> {
-    let mut offset = 0usize;
-    let layer = read_u32_le(payload, &mut offset)? as usize;
-    let dim = read_u32_le(payload, &mut offset)? as usize;
-    let output_dtype = ActivationDtype::from_u16(read_u16_le(payload, &mut offset)?)?;
-    let n_experts = read_u32_le(payload, &mut offset)? as usize;
-    let mut expert_ids = Vec::with_capacity(n_experts);
-    for _ in 0..n_experts {
-        expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
-    }
-    let bytes_per_output = activation_vector_encoded_len(dim, output_dtype);
-    let mut outputs = Vec::with_capacity(n_experts);
-    for _ in 0..n_experts {
-        let end = offset
-            .checked_add(bytes_per_output)
-            .ok_or_else(|| "proposed batch payload overflow".to_string())?;
-        if end > payload.len() {
-            return Err("truncated proposed expert batch payload".to_string());
-        }
-        outputs.push(decode_activation_vector(&payload[offset..end], output_dtype, dim)?);
-        offset = end;
-    }
-    Ok(ProposedExpertBatchFrame { layer, output_dtype, dim, expert_ids, outputs })
-}
-
 pub(crate) fn encode_expert_batch_response(frame: &ExpertBatchResponse) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     if frame.outputs.len() != frame.expert_ids.len() {
@@ -801,7 +679,11 @@ pub(crate) fn decode_expert_batch_response(payload: &[u8]) -> Result<ExpertBatch
         )?);
         offset = end;
     }
-    let spec_hit = if offset < payload.len() { payload[offset] != 0 } else { false };
+    let spec_hit = if offset < payload.len() {
+        payload[offset] != 0
+    } else {
+        false
+    };
     Ok(ExpertBatchResponse {
         layer,
         output_dtype,
@@ -1040,48 +922,88 @@ pub(crate) fn decode_model_shard_header(payload: &[u8]) -> Result<ModelShardHead
         });
     }
     // SSM extension fields (optional for backward compat)
-    let (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload, n_experts_per_tok, moe_n_group, moe_topk_group) =
-        if offset + 4 <= payload.len() {
-            let ssm_inner_size = read_u32_le(payload, &mut offset)? as usize;
-            let ssm_group_count = if offset + 4 <= payload.len() {
-                read_u32_le(payload, &mut offset)? as usize
-            } else { 0 };
-            let ssm_time_step_rank = if offset + 4 <= payload.len() {
-                read_u32_le(payload, &mut offset)? as usize
-            } else { 0 };
-            let ssm_state_size = if offset + 4 <= payload.len() {
-                read_u32_le(payload, &mut offset)? as usize
-            } else { 0 };
-            let ssm_conv_kernel = if offset + 4 <= payload.len() {
-                read_u32_le(payload, &mut offset)? as usize
-            } else { 0 };
-            let ssm_eps = if offset + 4 <= payload.len() {
-                read_f32_le(payload, &mut offset)?
-            } else { 1e-6 };
-            let ssm_float_payload = if offset + 8 <= payload.len() {
-                let payload_len = read_u64_le(payload, &mut offset)? as usize;
-                let end = offset.checked_add(payload_len)
-                    .ok_or_else(|| "ssm_float_payload overflow".to_string())?;
-                if end > payload.len() {
-                    return Err("truncated ssm_float_payload".to_string());
-                }
-                let data = payload[offset..end].to_vec();
-                offset = end;
-                data
-            } else { Vec::new() };
-            let n_experts_per_tok = if offset + 4 <= payload.len() {
-                read_u32_le(payload, &mut offset)? as usize
-            } else { 0 };
-            let moe_n_group = if offset + 4 <= payload.len() {
-                read_u32_le(payload, &mut offset)? as usize
-            } else { 0 };
-            let moe_topk_group = if offset + 4 <= payload.len() {
-                read_u32_le(payload, &mut offset)? as usize
-            } else { 0 };
-            (ssm_inner_size, ssm_group_count, ssm_time_step_rank, ssm_state_size, ssm_conv_kernel, ssm_eps, ssm_float_payload, n_experts_per_tok, moe_n_group, moe_topk_group)
+    let (
+        ssm_inner_size,
+        ssm_group_count,
+        ssm_time_step_rank,
+        ssm_state_size,
+        ssm_conv_kernel,
+        ssm_eps,
+        ssm_float_payload,
+        n_experts_per_tok,
+        moe_n_group,
+        moe_topk_group,
+    ) = if offset + 4 <= payload.len() {
+        let ssm_inner_size = read_u32_le(payload, &mut offset)? as usize;
+        let ssm_group_count = if offset + 4 <= payload.len() {
+            read_u32_le(payload, &mut offset)? as usize
         } else {
-            (0, 0, 0, 0, 0, 1e-6f32, Vec::new(), 0, 0, 0)
+            0
         };
+        let ssm_time_step_rank = if offset + 4 <= payload.len() {
+            read_u32_le(payload, &mut offset)? as usize
+        } else {
+            0
+        };
+        let ssm_state_size = if offset + 4 <= payload.len() {
+            read_u32_le(payload, &mut offset)? as usize
+        } else {
+            0
+        };
+        let ssm_conv_kernel = if offset + 4 <= payload.len() {
+            read_u32_le(payload, &mut offset)? as usize
+        } else {
+            0
+        };
+        let ssm_eps = if offset + 4 <= payload.len() {
+            read_f32_le(payload, &mut offset)?
+        } else {
+            1e-6
+        };
+        let ssm_float_payload = if offset + 8 <= payload.len() {
+            let payload_len = read_u64_le(payload, &mut offset)? as usize;
+            let end = offset
+                .checked_add(payload_len)
+                .ok_or_else(|| "ssm_float_payload overflow".to_string())?;
+            if end > payload.len() {
+                return Err("truncated ssm_float_payload".to_string());
+            }
+            let data = payload[offset..end].to_vec();
+            offset = end;
+            data
+        } else {
+            Vec::new()
+        };
+        let n_experts_per_tok = if offset + 4 <= payload.len() {
+            read_u32_le(payload, &mut offset)? as usize
+        } else {
+            0
+        };
+        let moe_n_group = if offset + 4 <= payload.len() {
+            read_u32_le(payload, &mut offset)? as usize
+        } else {
+            0
+        };
+        let moe_topk_group = if offset + 4 <= payload.len() {
+            read_u32_le(payload, &mut offset)? as usize
+        } else {
+            0
+        };
+        (
+            ssm_inner_size,
+            ssm_group_count,
+            ssm_time_step_rank,
+            ssm_state_size,
+            ssm_conv_kernel,
+            ssm_eps,
+            ssm_float_payload,
+            n_experts_per_tok,
+            moe_n_group,
+            moe_topk_group,
+        )
+    } else {
+        (0, 0, 0, 0, 0, 1e-6f32, Vec::new(), 0, 0, 0)
+    };
 
     Ok(ModelShardHeaderFrame {
         total_bytes,

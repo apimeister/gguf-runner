@@ -2431,7 +2431,13 @@ impl ModelRuntime {
                     transport_dtype.as_str()
                 );
             }
-            Some(DistributedMoeCoordinator::connect(plan, transport_dtype, &gguf, gguf.mapped.as_slice(), &config)?)
+            Some(DistributedMoeCoordinator::connect(
+                plan,
+                transport_dtype,
+                &gguf,
+                gguf.mapped.as_slice(),
+                &config,
+            )?)
         } else {
             None
         };

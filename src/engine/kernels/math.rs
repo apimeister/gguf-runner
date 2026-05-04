@@ -223,9 +223,9 @@ unsafe fn rmsnorm_avx2(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, ep
 
     // Pass 1: sum of squares (dual 8-wide, 16 elements per iteration)
     while i + 16 <= size {
-        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
         let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        acc0 = _mm256_fmadd_ps(xv,  xv,  acc0);
+        acc0 = _mm256_fmadd_ps(xv, xv, acc0);
         acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
         i += 16;
     }
@@ -256,20 +256,23 @@ unsafe fn rmsnorm_avx2(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, ep
     i = 0;
     let scale_vec = _mm256_set1_ps(scale);
     while i + 16 <= size {
-        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
-        let wv  = _mm256_loadu_ps(weight.as_ptr().add(i));
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
         let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
         let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 8));
-        let result  = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv,  wv));
+        let result = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv));
         let result2 = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv2, wv2));
-        _mm256_storeu_ps(o.as_mut_ptr().add(i),     result);
+        _mm256_storeu_ps(o.as_mut_ptr().add(i), result);
         _mm256_storeu_ps(o.as_mut_ptr().add(i + 8), result2);
         i += 16;
     }
     while i + 8 <= size {
         let xv = _mm256_loadu_ps(x.as_ptr().add(i));
         let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
-        _mm256_storeu_ps(o.as_mut_ptr().add(i), _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv)));
+        _mm256_storeu_ps(
+            o.as_mut_ptr().add(i),
+            _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv)),
+        );
         i += 8;
     }
 
@@ -293,9 +296,9 @@ unsafe fn rmsnorm_avx512(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, 
 
     // Pass 1: sum of squares (dual 16-wide, 32 elements per iteration)
     while i + 32 <= size {
-        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
         let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
-        acc0 = _mm512_fmadd_ps(xv,  xv,  acc0);
+        acc0 = _mm512_fmadd_ps(xv, xv, acc0);
         acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
         i += 32;
     }
@@ -326,20 +329,23 @@ unsafe fn rmsnorm_avx512(o: &mut [f32], x: &[f32], weight: &[f32], size: usize, 
     i = 0;
     let scale_vec = _mm512_set1_ps(scale);
     while i + 32 <= size {
-        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
-        let wv  = _mm512_loadu_ps(weight.as_ptr().add(i));
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
         let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
         let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 16));
-        let result  = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv,  wv));
+        let result = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv));
         let result2 = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv2, wv2));
-        _mm512_storeu_ps(o.as_mut_ptr().add(i),      result);
+        _mm512_storeu_ps(o.as_mut_ptr().add(i), result);
         _mm512_storeu_ps(o.as_mut_ptr().add(i + 16), result2);
         i += 32;
     }
     while i + 16 <= size {
         let xv = _mm512_loadu_ps(x.as_ptr().add(i));
         let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
-        _mm512_storeu_ps(o.as_mut_ptr().add(i), _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv)));
+        _mm512_storeu_ps(
+            o.as_mut_ptr().add(i),
+            _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv)),
+        );
         i += 16;
     }
 
@@ -362,9 +368,9 @@ unsafe fn rmsnorm_inplace_avx2(x: &mut [f32], weight: &[f32], size: usize, eps: 
 
     // Pass 1: sum of squares (dual 8-wide, 16 elements per iteration)
     while i + 16 <= size {
-        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
         let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-        acc0 = _mm256_fmadd_ps(xv,  xv,  acc0);
+        acc0 = _mm256_fmadd_ps(xv, xv, acc0);
         acc1 = _mm256_fmadd_ps(xv2, xv2, acc1);
         i += 16;
     }
@@ -392,20 +398,23 @@ unsafe fn rmsnorm_inplace_avx2(x: &mut [f32], weight: &[f32], size: usize, eps: 
     i = 0;
     let scale_vec = _mm256_set1_ps(scale);
     while i + 16 <= size {
-        let xv  = _mm256_loadu_ps(x.as_ptr().add(i));
-        let wv  = _mm256_loadu_ps(weight.as_ptr().add(i));
+        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
         let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
         let wv2 = _mm256_loadu_ps(weight.as_ptr().add(i + 8));
-        let result  = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv,  wv));
+        let result = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv));
         let result2 = _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv2, wv2));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i),     result);
+        _mm256_storeu_ps(x.as_mut_ptr().add(i), result);
         _mm256_storeu_ps(x.as_mut_ptr().add(i + 8), result2);
         i += 16;
     }
     while i + 8 <= size {
         let xv = _mm256_loadu_ps(x.as_ptr().add(i));
         let wv = _mm256_loadu_ps(weight.as_ptr().add(i));
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv)));
+        _mm256_storeu_ps(
+            x.as_mut_ptr().add(i),
+            _mm256_mul_ps(scale_vec, _mm256_mul_ps(xv, wv)),
+        );
         i += 8;
     }
 
@@ -427,9 +436,9 @@ unsafe fn rmsnorm_inplace_avx512(x: &mut [f32], weight: &[f32], size: usize, eps
 
     // Pass 1: sum of squares (dual 16-wide, 32 elements per iteration)
     while i + 32 <= size {
-        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
         let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
-        acc0 = _mm512_fmadd_ps(xv,  xv,  acc0);
+        acc0 = _mm512_fmadd_ps(xv, xv, acc0);
         acc1 = _mm512_fmadd_ps(xv2, xv2, acc1);
         i += 32;
     }
@@ -457,20 +466,23 @@ unsafe fn rmsnorm_inplace_avx512(x: &mut [f32], weight: &[f32], size: usize, eps
     i = 0;
     let scale_vec = _mm512_set1_ps(scale);
     while i + 32 <= size {
-        let xv  = _mm512_loadu_ps(x.as_ptr().add(i));
-        let wv  = _mm512_loadu_ps(weight.as_ptr().add(i));
+        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
         let xv2 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
         let wv2 = _mm512_loadu_ps(weight.as_ptr().add(i + 16));
-        let result  = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv,  wv));
+        let result = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv));
         let result2 = _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv2, wv2));
-        _mm512_storeu_ps(x.as_mut_ptr().add(i),      result);
+        _mm512_storeu_ps(x.as_mut_ptr().add(i), result);
         _mm512_storeu_ps(x.as_mut_ptr().add(i + 16), result2);
         i += 32;
     }
     while i + 16 <= size {
         let xv = _mm512_loadu_ps(x.as_ptr().add(i));
         let wv = _mm512_loadu_ps(weight.as_ptr().add(i));
-        _mm512_storeu_ps(x.as_mut_ptr().add(i), _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv)));
+        _mm512_storeu_ps(
+            x.as_mut_ptr().add(i),
+            _mm512_mul_ps(scale_vec, _mm512_mul_ps(xv, wv)),
+        );
         i += 16;
     }
 
@@ -821,7 +833,7 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
         let ev2 = _mm256_mul_ps(poly2, p2n2);
 
         acc_sum = _mm256_add_ps(acc_sum, _mm256_add_ps(ev, ev2));
-        _mm256_storeu_ps(ptr.add(i),     ev);
+        _mm256_storeu_ps(ptr.add(i), ev);
         _mm256_storeu_ps(ptr.add(i + 8), ev2);
         i += 16;
     }
@@ -848,7 +860,7 @@ unsafe fn softmax_avx2(x: &mut [f32], size: usize) {
     while i + 16 <= size {
         let v0 = _mm256_loadu_ps(ptr.add(i));
         let v1 = _mm256_loadu_ps(ptr.add(i + 8));
-        _mm256_storeu_ps(ptr.add(i),     _mm256_mul_ps(v0, inv_sum_vec));
+        _mm256_storeu_ps(ptr.add(i), _mm256_mul_ps(v0, inv_sum_vec));
         _mm256_storeu_ps(ptr.add(i + 8), _mm256_mul_ps(v1, inv_sum_vec));
         i += 16;
     }
@@ -1007,7 +1019,7 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
         let ev2 = _mm512_mul_ps(poly2, p2n2);
 
         acc_sum = _mm512_add_ps(acc_sum, _mm512_add_ps(ev, ev2));
-        _mm512_storeu_ps(ptr.add(i),      ev);
+        _mm512_storeu_ps(ptr.add(i), ev);
         _mm512_storeu_ps(ptr.add(i + 16), ev2);
         i += 32;
     }
@@ -1033,7 +1045,7 @@ unsafe fn softmax_avx512(x: &mut [f32], size: usize) {
     while i + 32 <= size {
         let v0 = _mm512_loadu_ps(ptr.add(i));
         let v1 = _mm512_loadu_ps(ptr.add(i + 16));
-        _mm512_storeu_ps(ptr.add(i),      _mm512_mul_ps(v0, inv_sum_vec));
+        _mm512_storeu_ps(ptr.add(i), _mm512_mul_ps(v0, inv_sum_vec));
         _mm512_storeu_ps(ptr.add(i + 16), _mm512_mul_ps(v1, inv_sum_vec));
         i += 32;
     }
@@ -1718,7 +1730,7 @@ unsafe fn sanitize_finite_avx2(x: &mut [f32]) {
         let v0_clean = _mm256_blendv_ps(v0, zero, _mm256_castsi256_ps(is_naninf0));
         let v1_clean = _mm256_blendv_ps(v1, zero, _mm256_castsi256_ps(is_naninf1));
 
-        _mm256_storeu_ps(ptr.add(i),     v0_clean);
+        _mm256_storeu_ps(ptr.add(i), v0_clean);
         _mm256_storeu_ps(ptr.add(i + 8), v1_clean);
         i += 16;
     }
@@ -1726,7 +1738,10 @@ unsafe fn sanitize_finite_avx2(x: &mut [f32]) {
         let v0 = _mm256_loadu_ps(ptr.add(i));
         let bits0 = _mm256_castps_si256(v0);
         let is_naninf0 = _mm256_cmpeq_epi32(_mm256_and_si256(bits0, exp_mask), exp_check);
-        _mm256_storeu_ps(ptr.add(i), _mm256_blendv_ps(v0, zero, _mm256_castsi256_ps(is_naninf0)));
+        _mm256_storeu_ps(
+            ptr.add(i),
+            _mm256_blendv_ps(v0, zero, _mm256_castsi256_ps(is_naninf0)),
+        );
         i += 8;
     }
 
@@ -1771,7 +1786,7 @@ unsafe fn sanitize_finite_avx512(x: &mut [f32]) {
         let v0_clean = _mm512_mask_blend_ps(is_naninf0, v0, zero);
         let v1_clean = _mm512_mask_blend_ps(is_naninf1, v1, zero);
 
-        _mm512_storeu_ps(ptr.add(i),      v0_clean);
+        _mm512_storeu_ps(ptr.add(i), v0_clean);
         _mm512_storeu_ps(ptr.add(i + 16), v1_clean);
         i += 32;
     }
