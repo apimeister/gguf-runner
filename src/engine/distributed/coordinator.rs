@@ -1086,7 +1086,6 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         // Phase 1: consume any asynchronously pushed results, then request only
         // the missing experts so speculative partial hits do not get recomputed.
         let mut push_hit_nodes: Vec<usize> = Vec::new();
-        let mut push_hit_experts = 0usize;
         let mut dispatches: Vec<RemoteDispatch> = Vec::with_capacity(remote_selected.len());
 
         for (node_index, expert_ids) in &remote_selected {
@@ -1108,7 +1107,6 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                     .stats
                     .record_request(pushed.hit_expert_ids.len(), 0, 0, 0, true);
                 record_distributed_push_hit(pushed.hit_expert_ids.len());
-                push_hit_experts += pushed.hit_expert_ids.len();
                 push_hit_nodes.push(*node_index);
                 for (expert_idx, values) in pushed.hit_expert_ids.into_iter().zip(pushed.outputs) {
                     remote_outputs.insert(expert_idx, values);
@@ -1241,22 +1239,6 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         }
         let total_ns = total_start.elapsed().as_nanos() as u64;
         record_distributed_coordinator_timing(total_ns, local_ns, remote_ns);
-        if profiling_enabled() {
-            eprintln!(
-                "[PROFILE] distributed_moe layer={} local_experts={} remote_nodes={} remote_experts={} push_hits={} total={:.3} ms local={:.3} ms remote={:.3} ms",
-                layer,
-                local_selected.len(),
-                remote_selected.len(),
-                dispatches
-                    .iter()
-                    .map(|dispatch| dispatch.expert_ids.len())
-                    .sum::<usize>(),
-                push_hit_experts,
-                total_ns as f64 / 1_000_000.0,
-                local_ns as f64 / 1_000_000.0,
-                remote_ns as f64 / 1_000_000.0
-            );
-        }
         Ok(())
     }
 
