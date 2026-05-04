@@ -2,7 +2,7 @@ use crate::engine::io::{bf16_to_fp32, fp16_to_fp32};
 use crate::engine::kernels::{encode_bf16_vector, encode_fp16_vector};
 
 pub(crate) const DISTRIBUTED_PROTOCOL_MAGIC: u32 = 0x444D_4F45;
-pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 4;
+pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
