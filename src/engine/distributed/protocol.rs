@@ -2,7 +2,7 @@ use crate::engine::io::{bf16_to_fp32, fp16_to_fp32};
 use crate::engine::kernels::{encode_bf16_vector, encode_fp16_vector};
 
 pub(crate) const DISTRIBUTED_PROTOCOL_MAGIC: u32 = 0x444D_4F45;
-pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 5;
+pub(crate) const DISTRIBUTED_PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
@@ -86,6 +86,7 @@ pub(crate) struct HelloFrame {
     pub(crate) n_experts: usize,
     pub(crate) activation_dtype: ActivationDtype,
     pub(crate) assigned_experts: Vec<(usize, usize)>,
+    pub(crate) speculative_push: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +96,7 @@ pub(crate) struct ReadyFrame {
     pub(crate) n_layers: usize,
     pub(crate) n_experts: usize,
     pub(crate) activation_dtype: ActivationDtype,
+    pub(crate) speculative_push: bool,
     pub(crate) logical_cpu_count: usize,
     pub(crate) memory_bytes: usize,
     pub(crate) loaded_expert_count: usize,
@@ -371,6 +373,7 @@ pub(crate) fn encode_hello_frame(frame: &HelloFrame) -> Result<Vec<u8>, String> 
                 .map_err(|_| "assigned expert index overflow".to_string())?,
         );
     }
+    out.push(frame.speculative_push as u8);
     Ok(out)
 }
 
@@ -389,6 +392,11 @@ pub(crate) fn decode_hello_frame(payload: &[u8]) -> Result<HelloFrame, String> {
             read_u32_le(payload, &mut offset)? as usize,
         ));
     }
+    let speculative_push = if offset < payload.len() {
+        payload[offset] != 0
+    } else {
+        false
+    };
     Ok(HelloFrame {
         node_address,
         dim,
@@ -396,6 +404,7 @@ pub(crate) fn decode_hello_frame(payload: &[u8]) -> Result<HelloFrame, String> {
         n_experts,
         activation_dtype,
         assigned_experts,
+        speculative_push,
     })
 }
 
@@ -407,6 +416,7 @@ pub(crate) fn encode_ready_frame(frame: &ReadyFrame) -> Result<Vec<u8>, String> 
         n_experts: frame.n_experts,
         activation_dtype: frame.activation_dtype,
         assigned_experts: Vec::new(),
+        speculative_push: frame.speculative_push,
     })?;
     write_u32_le(
         &mut out,
@@ -445,6 +455,13 @@ pub(crate) fn decode_ready_frame(payload: &[u8]) -> Result<ReadyFrame, String> {
         let _ = read_u32_le(payload, &mut offset)?;
         let _ = read_u32_le(payload, &mut offset)?;
     }
+    let speculative_push = if offset < payload.len() {
+        let value = payload[offset] != 0;
+        offset += 1;
+        value
+    } else {
+        false
+    };
     let logical_cpu_count = read_u32_le(payload, &mut offset)? as usize;
     let memory_bytes = read_u64_le(payload, &mut offset)? as usize;
     let loaded_expert_count = read_u32_le(payload, &mut offset)? as usize;
@@ -454,6 +471,7 @@ pub(crate) fn decode_ready_frame(payload: &[u8]) -> Result<ReadyFrame, String> {
         n_layers: hello.n_layers,
         n_experts: hello.n_experts,
         activation_dtype: hello.activation_dtype,
+        speculative_push,
         logical_cpu_count,
         memory_bytes,
         loaded_expert_count,
@@ -1354,11 +1372,13 @@ mod tests {
             n_experts: 16,
             activation_dtype: ActivationDtype::Bf16,
             assigned_experts: vec![(0, 1), (3, 7)],
+            speculative_push: true,
         };
         let payload = encode_hello_frame(&frame).expect("encode failed");
         let decoded = decode_hello_frame(&payload).expect("decode failed");
         assert_eq!(decoded.node_address, frame.node_address);
         assert_eq!(decoded.assigned_experts, frame.assigned_experts);
+        assert_eq!(decoded.speculative_push, frame.speculative_push);
     }
 
     #[test]

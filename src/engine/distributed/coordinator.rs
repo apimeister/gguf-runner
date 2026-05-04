@@ -718,6 +718,7 @@ impl DistributedMoeCoordinator {
     pub(crate) fn connect(
         plan: MoePlacementPlan,
         activation_dtype: ActivationDtype,
+        speculative_push: bool,
         gguf: &GGUFFile,
         mapped: &[u8],
         config: &Config,
@@ -759,6 +760,7 @@ impl DistributedMoeCoordinator {
                 n_experts: plan.inventory.n_experts,
                 activation_dtype,
                 assigned_experts,
+                speculative_push,
             };
             setups.push(WorkerSetup {
                 node_index,
@@ -939,6 +941,7 @@ impl DistributedMoeCoordinator {
             || hello.n_layers != ready.n_layers
             || hello.n_experts != ready.n_experts
             || hello.activation_dtype != ready.activation_dtype
+            || hello.speculative_push != ready.speculative_push
         {
             return Err(format!(
                 "worker '{}' READY frame does not match coordinator HELLO",
@@ -1342,9 +1345,9 @@ fn predict_moe_routing(
     candidates.select_nth_unstable_by(n_take - 1, |&a, &b| {
         b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
     });
-    let mut top: Vec<usize> = candidates[..n_take].iter().map(|&(_, i)| i).collect();
-    top.sort_unstable();
-    top
+    let mut top = candidates[..n_take].to_vec();
+    top.sort_unstable_by(|&a, &b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    top.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Encode and send an expert batch request with an optional routing hint for the next layer.
