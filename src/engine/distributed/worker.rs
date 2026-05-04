@@ -873,6 +873,13 @@ unsafe impl Send for SendRawSlice {}
 /// How many MoE layers ahead to speculatively pre-compute.
 const SPEC_DEPTH: usize = 2;
 
+/// Extra ranked candidates to push for the nearest future MoE layer.
+///
+/// Workers already compute a wider speculative cache (`experts_per_tok * 2`).
+/// Pushing a small margin lets partial-hit consumption avoid more one-off
+/// missing-expert requests without increasing speculative expert compute.
+const SPEC_PUSH_EXTRA_EXPERTS: usize = 2;
+
 /// Predict routing and launch a sequential background chain for uncovered future layers.
 ///
 /// Path 1: if `session.hint_for_layer` matches the nearest future layer, uses the
@@ -1072,9 +1079,13 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
             if my_experts.is_empty() {
                 continue;
             }
+            let push_width = session
+                .n_experts_per_tok
+                .saturating_add(SPEC_PUSH_EXTRA_EXPERTS)
+                .min(predicted.len());
             let push_expert_ids = predicted
                 .iter()
-                .take(session.n_experts_per_tok)
+                .take(push_width)
                 .filter(|&&id| {
                     session
                         .assigned_experts

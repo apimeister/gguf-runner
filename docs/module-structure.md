@@ -323,7 +323,7 @@ src/
 
 - Worker-side expert serving logic.
 - Owns the TCP listener loop, bind-address-based worker identity, discovery responses, assignment-on-HELLO validation, row-sliced expert tensor loading, and remote expert batch execution against GGUF-backed expert tensors.
-- Maintains speculation for future MoE layers, consuming coordinator-provided routing hints when available, pushing a bounded top-k subset of completed speculative outputs while retaining wider cached candidates locally, and accepting non-blocking speculation-advance control frames after coordinator push hits.
+- Maintains speculation for future MoE layers, consuming coordinator-provided routing hints when available, pushing a bounded ranked subset of completed speculative outputs while retaining wider cached candidates locally, and accepting non-blocking speculation-advance control frames after coordinator push hits.
 
 ### `src/engine/types.rs`
 
