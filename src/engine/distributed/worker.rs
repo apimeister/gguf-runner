@@ -1,10 +1,9 @@
 use crate::engine::distributed::protocol::{
-    DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame, ProposedExpertBatchFrame,
+    DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame,
     ReadyFrame, SHARD_KIND_GATE_INP, SsmLayerResponse, decode_error_frame,
     decode_expert_batch_request, decode_hello_frame, decode_model_shard_header,
     decode_ssm_layer_request, encode_discover_response_frame, encode_error_frame,
-    encode_expert_batch_response, encode_proposed_expert_batch, encode_ready_frame,
-    encode_ssm_layer_response,
+    encode_expert_batch_response, encode_ready_frame, encode_ssm_layer_response,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
@@ -52,9 +51,6 @@ struct WorkerSession {
     // Non-blocking deep speculation: one in-flight rayon task per future MoE layer.
     // Mutex makes WorkerSession Sync so it can be referenced inside par_iter closures.
     spec_receivers: std::sync::Mutex<std::collections::HashMap<usize, std::sync::mpsc::Receiver<SpeculationCache>>>,
-    // Completed spec results that were pushed to the coordinator; kept here so that
-    // if the coordinator sends a request anyway (timing miss), we can serve instantly.
-    pushed_cache: std::collections::HashMap<usize, SpeculationCache>,
     last_activation: Vec<f32>,
     spec_hits: u64,
     spec_misses: u64,
@@ -225,7 +221,6 @@ impl WorkerRuntime {
                 moe_n_group,
                 moe_topk_group,
                 spec_receivers: std::sync::Mutex::new(std::collections::HashMap::new()),
-                pushed_cache: std::collections::HashMap::new(),
                 last_activation: vec![0.0f32; dim],
                 spec_hits: 0,
                 spec_misses: 0,
@@ -822,36 +817,6 @@ unsafe impl Send for SendRawSlice {}
 /// How many MoE layers ahead to speculatively pre-compute.
 const SPEC_DEPTH: usize = 2;
 
-/// Drain any speculation channels that have completed results, push them to the coordinator
-/// proactively, and store copies in pushed_cache for serving instant responses if the
-/// coordinator sends a request anyway (drain timing miss).
-fn drain_and_push_ready_specs(session: &mut WorkerSession, connection: &mut FramedConnection) {
-    let mut ready_caches: Vec<SpeculationCache> = Vec::new();
-    {
-        let mut receivers = session.spec_receivers.lock().unwrap();
-        receivers.retain(|_, rx| match rx.try_recv() {
-            Ok(cache) => {
-                ready_caches.push(cache);
-                false
-            }
-            Err(_) => true,
-        });
-    }
-    for cache in ready_caches {
-        let layer = cache.layer;
-        let mut expert_ids: Vec<usize> = cache.outputs.keys().copied().collect();
-        expert_ids.sort_unstable();
-        let outputs: Vec<Vec<f32>> = expert_ids.iter()
-            .map(|id| cache.outputs[id].clone())
-            .collect();
-        let frame = ProposedExpertBatchFrame { layer, dim: outputs.first().map_or(0, |o| o.len()), expert_ids, outputs };
-        if let Ok(payload) = encode_proposed_expert_batch(&frame) {
-            let _ = connection.send_message(FrameKind::ProposedExpertBatch, 0, &payload);
-        }
-        session.pushed_cache.insert(layer, cache);
-    }
-}
-
 /// Predict routing and launch a sequential background chain for uncovered future layers.
 ///
 /// Layers already in flight are RETAINED — in steady state only one new single-item
@@ -1100,10 +1065,7 @@ fn handle_worker_connection(
                                     .spec_receivers
                                     .lock().unwrap()
                                     .remove(&request.layer)
-                                    .and_then(|rx| rx.try_recv().ok())
-                                    // Fallback: coordinator sent a request for a layer we already
-                                    // pushed — serve from pushed_cache to avoid recomputing.
-                                    .or_else(|| session.pushed_cache.remove(&request.layer));
+                                    .and_then(|rx| rx.try_recv().ok());
 
                                 // Superset hit check: all requested experts must be in the cache.
                                 // We speculatively computed 2× as many experts, so the actual
@@ -1149,9 +1111,6 @@ fn handle_worker_connection(
                                     session.last_activation[..dim].copy_from_slice(&request.activation[..dim]);
                                 }
 
-                                // Drop pushed_cache entries for layers already served.
-                                session.pushed_cache.retain(|&l, _| l > completed_layer);
-
                                 match response {
                                     Ok(resp) => {
                                         let payload = encode_expert_batch_response(&resp)?;
@@ -1160,11 +1119,9 @@ fn handle_worker_connection(
                                             message.request_id,
                                             &payload,
                                         )?;
-                                        // Launch background speculation for future layers.
+                                        // Speculatively compute the next layer while coordinator
+                                        // is busy doing attention/SSM/norm for that layer.
                                         speculate_ahead(&mut session, completed_layer);
-                                        // Immediately push any spec results that finished
-                                        // during the previous request's processing window.
-                                        drain_and_push_ready_specs(&mut session, connection);
                                     }
                                     Err(err) => {
                                         let payload = encode_error_frame(&err)?;
