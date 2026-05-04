@@ -1143,12 +1143,16 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
             }
         }
 
-        for node_index in &push_hit_nodes {
-            let node_address = self.plan.nodes[*node_index].address.clone();
+        for dispatch in dispatches
+            .iter()
+            .filter(|dispatch| dispatch.request.is_none())
+            .filter(|dispatch| push_hit_nodes.contains(&dispatch.node_index))
+        {
+            let node_address = self.plan.nodes[dispatch.node_index].address.clone();
             let worker = self
                 .remote_workers
                 .iter_mut()
-                .find(|w| w.node_index == *node_index)
+                .find(|w| w.node_index == dispatch.node_index)
                 .ok_or_else(|| {
                     format!(
                         "distributed worker '{}' is missing an active coordinator connection",
