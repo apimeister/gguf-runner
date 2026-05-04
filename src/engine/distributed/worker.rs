@@ -280,13 +280,11 @@ impl WorkerRuntime {
         let dim = session.dim;
         let hidden = session.expert_hidden_dim;
 
-        // Compute all experts in parallel while reusing per-Rayon-worker scratch buffers.
+        // Compute all experts in parallel — each gets its own scratch buffers.
         let outputs: Vec<Vec<f32>> = request
             .expert_ids
             .par_iter()
-            .map_init(
-                || (vec![0.0f32; hidden], vec![0.0f32; hidden]),
-                |(gate_scratch, up_scratch), &expert_idx| {
+            .map(|&expert_idx| {
                 if expert_idx >= session.n_experts
                     || !session.assigned_experts[layer][expert_idx]
                 {
@@ -307,9 +305,11 @@ impl WorkerRuntime {
                             expert_idx, layer, self.bind_address
                         )
                     })?;
+                let mut gate_scratch = vec![0.0f32; hidden];
+                let mut up_scratch = vec![0.0f32; hidden];
                 let mut output = vec![0.0f32; dim];
                 matmul_quantized_rows(
-                    gate_scratch,
+                    &mut gate_scratch,
                     &request.activation,
                     &tensors.gate,
                     0,
@@ -317,25 +317,24 @@ impl WorkerRuntime {
                     mapped,
                 )?;
                 matmul_quantized_rows(
-                    up_scratch,
+                    &mut up_scratch,
                     &request.activation,
                     &tensors.up,
                     0,
                     hidden,
                     mapped,
                 )?;
-                silu_and_mul_inplace(gate_scratch, up_scratch);
+                silu_and_mul_inplace(&mut gate_scratch, &up_scratch);
                 matmul_quantized_rows(
                     &mut output,
-                    gate_scratch,
+                    &gate_scratch,
                     &tensors.down,
                     0,
                     dim,
                     mapped,
                 )?;
                 Ok(output)
-            },
-            )
+            })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(ExpertBatchResponse {
             layer: request.layer,
@@ -1126,31 +1125,30 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
             let start = Instant::now();
             let outputs: Result<Vec<(usize, Vec<f32>)>, String> = my_experts
                 .par_iter()
-                .map_init(
-                    || (vec![0.0f32; hidden], vec![0.0f32; hidden]),
-                    |(gate_scratch, up_scratch), (expert_idx, tensors)| {
-                        let mut output = vec![0.0f32; dim];
-                        matmul_quantized_rows(
-                            gate_scratch,
-                            &act,
-                            &tensors.gate,
-                            0,
-                            hidden,
-                            mapped,
-                        )?;
-                        matmul_quantized_rows(up_scratch, &act, &tensors.up, 0, hidden, mapped)?;
-                        silu_and_mul_inplace(gate_scratch, up_scratch);
-                        matmul_quantized_rows(
-                            &mut output,
-                            gate_scratch,
-                            &tensors.down,
-                            0,
-                            dim,
-                            mapped,
-                        )?;
-                        Ok((*expert_idx, output))
-                    },
-                )
+                .map(|(expert_idx, tensors)| {
+                    let mut gate_scratch = vec![0.0f32; hidden];
+                    let mut up_scratch = vec![0.0f32; hidden];
+                    let mut output = vec![0.0f32; dim];
+                    matmul_quantized_rows(
+                        &mut gate_scratch,
+                        &act,
+                        &tensors.gate,
+                        0,
+                        hidden,
+                        mapped,
+                    )?;
+                    matmul_quantized_rows(&mut up_scratch, &act, &tensors.up, 0, hidden, mapped)?;
+                    silu_and_mul_inplace(&mut gate_scratch, &up_scratch);
+                    matmul_quantized_rows(
+                        &mut output,
+                        &gate_scratch,
+                        &tensors.down,
+                        0,
+                        dim,
+                        mapped,
+                    )?;
+                    Ok((*expert_idx, output))
+                })
                 .collect::<Result<Vec<_>, _>>();
             if let Ok(pairs) = outputs {
                 let compute_ns = start.elapsed().as_nanos() as u64;
