@@ -1123,7 +1123,16 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     });
 }
 
-fn drain_and_push_ready_specs(session: &mut WorkerSession, connection: &mut FramedConnection) {
+fn drain_and_push_ready_specs(
+    session: &mut WorkerSession,
+    connection: &mut FramedConnection,
+    completed_layer: usize,
+) {
+    let push_layer = session
+        .moe_layer_indices
+        .iter()
+        .copied()
+        .find(|&layer| layer > completed_layer);
     let mut ready = Vec::new();
     {
         let mut receivers = session.spec_receivers.lock().unwrap();
@@ -1144,6 +1153,9 @@ fn drain_and_push_ready_specs(session: &mut WorkerSession, connection: &mut Fram
 
     for cache in ready {
         let layer = cache.layer;
+        if Some(layer) != push_layer {
+            continue;
+        }
         let mut expert_ids: Vec<usize> = cache.outputs.keys().copied().collect();
         expert_ids.sort_unstable();
         let outputs: Vec<Vec<f32>> = expert_ids
@@ -1322,7 +1334,11 @@ fn handle_worker_connection(
                                         )?;
                                         // Speculate next layers while coordinator does attention/norm.
                                         speculate_ahead(&mut session, completed_layer);
-                                        drain_and_push_ready_specs(&mut session, connection);
+                                        drain_and_push_ready_specs(
+                                            &mut session,
+                                            connection,
+                                            completed_layer,
+                                        );
                                     }
                                     Err(err) => {
                                         let payload = encode_error_frame(&err)?;
@@ -1347,7 +1363,11 @@ fn handle_worker_connection(
                                                 Some((advance.layer + 1, advance.hint_expert_ids));
                                         }
                                         speculate_ahead(&mut session, advance.layer);
-                                        drain_and_push_ready_specs(&mut session, connection);
+                                        drain_and_push_ready_specs(
+                                            &mut session,
+                                            connection,
+                                            advance.layer,
+                                        );
                                     }
                                     Err(err) => {
                                         let payload = encode_error_frame(&err)?;
