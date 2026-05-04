@@ -51,9 +51,6 @@ struct WorkerSession {
     // Non-blocking deep speculation: one in-flight rayon task per future MoE layer.
     // Mutex makes WorkerSession Sync so it can be referenced inside par_iter closures.
     spec_receivers: std::sync::Mutex<std::collections::HashMap<usize, std::sync::mpsc::Receiver<SpeculationCache>>>,
-    // Cancellation flag: set to true before replacing a chain so the old rayon task
-    // exits at its next iteration boundary rather than wasting threads on stale work.
-    spec_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_activation: Vec<f32>,
     spec_hits: u64,
     spec_misses: u64,
@@ -224,7 +221,6 @@ impl WorkerRuntime {
                 moe_n_group,
                 moe_topk_group,
                 spec_receivers: std::sync::Mutex::new(std::collections::HashMap::new()),
-                spec_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_activation: vec![0.0f32; dim],
                 spec_hits: 0,
                 spec_misses: 0,
@@ -821,28 +817,15 @@ unsafe impl Send for SendRawSlice {}
 /// How many MoE layers ahead to speculatively pre-compute.
 const SPEC_DEPTH: usize = 3;
 
-/// Predict routing with the freshest available activation and launch a sequential
-/// background chain for the next SPEC_DEPTH MoE layers.
+/// Predict routing and launch a sequential background chain for uncovered future layers.
 ///
-/// Key design decisions:
-/// - **No retain**: every call re-predicts ALL future layers from `last_activation`.
-///   Retaining old receivers locked prediction quality to SPEC_DEPTH-layers-stale
-///   activation (the bug that caused 42% hit rate despite sequential chaining).
-/// - **Cancellation**: old chain is signalled before the new one starts so it exits
-///   at the next iteration boundary, preventing thread-pool contention with the new
-///   chain's first (most time-critical) layer.
-/// - **Single rayon task**: layers processed sequentially so the nearest layer gets
-///   the full thread pool first; deeper layers follow without inter-layer contention.
+/// Layers already in flight are RETAINED — in steady state only one new single-item
+/// chain is spawned per request, keeping worker thread overhead minimal.  All layers
+/// in the chain run sequentially inside a single rayon task so the nearest layer gets
+/// the full thread pool first.
 fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
-    // Signal any running chain to stop at its next iteration boundary.
-    session.spec_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    // Replace with a fresh flag for the new chain.
-    session.spec_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cancel = session.spec_cancel.clone();
-
-    session.spec_receivers.lock().unwrap().clear();
-
     if session.n_experts_per_tok == 0 {
+        session.spec_receivers.lock().unwrap().clear();
         return;
     }
 
@@ -875,7 +858,16 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     let mut new_receivers: std::collections::HashMap<usize, std::sync::mpsc::Receiver<SpeculationCache>> =
         std::collections::HashMap::new();
 
+    {
+        let mut receivers = session.spec_receivers.lock().unwrap();
+        // Drop entries outside the current window (layers already served or too far ahead).
+        receivers.retain(|&layer, _| future_layers.contains(&layer));
+
     for &next_layer in &future_layers {
+        if receivers.contains_key(&next_layer) {
+            continue; // already being computed; retain it
+        }
+
         let gate_inp = match session.gate_layers.get(next_layer).and_then(|g| g.as_ref()) {
             Some(g) => g.gate_inp.clone(),
             None => continue,
@@ -966,7 +958,8 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
         new_receivers.insert(next_layer, rx);
     }
 
-    *session.spec_receivers.lock().unwrap() = new_receivers;
+        receivers.extend(new_receivers);
+    } // drop receivers lock
 
     if work_items.is_empty() {
         return;
@@ -976,10 +969,6 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     rayon::spawn(move || {
         let mapped: &[u8] = unsafe { std::slice::from_raw_parts(raw.0 as *const u8, raw.1) };
         for (next_layer, my_experts, tx) in work_items {
-            // Exit if the session has already replaced this chain.
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
             let outputs: Result<Vec<(usize, Vec<f32>)>, String> = my_experts
                 .par_iter()
                 .map(|(expert_idx, tensors)| {
@@ -993,9 +982,6 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
                     Ok((*expert_idx, output))
                 })
                 .collect::<Result<Vec<_>, _>>();
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
             if let Ok(pairs) = outputs {
                 let mut map = std::collections::HashMap::with_capacity(pairs.len());
                 for (id, out) in pairs { map.insert(id, out); }
