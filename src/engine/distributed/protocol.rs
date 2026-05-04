@@ -18,6 +18,8 @@ pub(crate) enum FrameKind {
     ModelShardHeader = 9,
     SsmLayerRequest = 10,
     SsmLayerResponse = 11,
+    SpeculationAdvance = 12,
+    ProposedExpertBatch = 13,
 }
 
 impl FrameKind {
@@ -34,6 +36,8 @@ impl FrameKind {
             9 => Ok(Self::ModelShardHeader),
             10 => Ok(Self::SsmLayerRequest),
             11 => Ok(Self::SsmLayerResponse),
+            12 => Ok(Self::SpeculationAdvance),
+            13 => Ok(Self::ProposedExpertBatch),
             _ => Err(format!("unknown distributed frame kind {value}")),
         }
     }
@@ -116,6 +120,27 @@ pub(crate) struct ExpertBatchRequest {
     pub(crate) activation: Vec<f32>,
     /// Coordinator-predicted expert IDs for layer+1 (empty = no hint).
     pub(crate) hint_expert_ids: Vec<usize>,
+}
+
+/// Coordinator -> worker: current-layer activation update after the coordinator
+/// consumes a pushed speculative result instead of sending ExpertBatchRequest.
+#[derive(Clone, Debug)]
+pub(crate) struct SpeculationAdvanceFrame {
+    pub(crate) layer: usize,
+    pub(crate) activation_dtype: ActivationDtype,
+    pub(crate) dim: usize,
+    pub(crate) activation: Vec<f32>,
+    pub(crate) hint_expert_ids: Vec<usize>,
+}
+
+/// Worker -> coordinator: speculative expert outputs pushed proactively.
+#[derive(Clone, Debug)]
+pub(crate) struct ProposedExpertBatchFrame {
+    pub(crate) layer: usize,
+    pub(crate) output_dtype: ActivationDtype,
+    pub(crate) dim: usize,
+    pub(crate) expert_ids: Vec<usize>,
+    pub(crate) outputs: Vec<Vec<f32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -600,6 +625,157 @@ pub(crate) fn decode_expert_batch_request(payload: &[u8]) -> Result<ExpertBatchR
         expert_ids,
         activation,
         hint_expert_ids,
+    })
+}
+
+pub(crate) fn encode_speculation_advance(
+    frame: &SpeculationAdvanceFrame,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    write_u32_le(
+        &mut out,
+        frame
+            .layer
+            .try_into()
+            .map_err(|_| "layer overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .dim
+            .try_into()
+            .map_err(|_| "dim overflow".to_string())?,
+    );
+    write_u16_le(&mut out, frame.activation_dtype as u16);
+    write_u32_le(
+        &mut out,
+        frame
+            .hint_expert_ids
+            .len()
+            .try_into()
+            .map_err(|_| "hint count overflow".to_string())?,
+    );
+    for &id in &frame.hint_expert_ids {
+        write_u32_le(
+            &mut out,
+            id.try_into()
+                .map_err(|_| "hint expert id overflow".to_string())?,
+        );
+    }
+    out.extend_from_slice(&encode_activation_vector(
+        &frame.activation,
+        frame.activation_dtype,
+    ));
+    Ok(out)
+}
+
+pub(crate) fn decode_speculation_advance(
+    payload: &[u8],
+) -> Result<SpeculationAdvanceFrame, String> {
+    let mut offset = 0usize;
+    let layer = read_u32_le(payload, &mut offset)? as usize;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let activation_dtype = ActivationDtype::from_u16(read_u16_le(payload, &mut offset)?)?;
+    let n_hint = read_u32_le(payload, &mut offset)? as usize;
+    let mut hint_expert_ids = Vec::with_capacity(n_hint);
+    for _ in 0..n_hint {
+        hint_expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
+    }
+    let activation = decode_activation_vector(&payload[offset..], activation_dtype, dim)?;
+    Ok(SpeculationAdvanceFrame {
+        layer,
+        activation_dtype,
+        dim,
+        activation,
+        hint_expert_ids,
+    })
+}
+
+pub(crate) fn encode_proposed_expert_batch(
+    frame: &ProposedExpertBatchFrame,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    if frame.outputs.len() != frame.expert_ids.len() {
+        return Err("proposed expert output count does not match expert id count".to_string());
+    }
+    write_u32_le(
+        &mut out,
+        frame
+            .layer
+            .try_into()
+            .map_err(|_| "layer overflow".to_string())?,
+    );
+    write_u32_le(
+        &mut out,
+        frame
+            .dim
+            .try_into()
+            .map_err(|_| "dim overflow".to_string())?,
+    );
+    write_u16_le(&mut out, frame.output_dtype as u16);
+    write_u32_le(
+        &mut out,
+        frame
+            .expert_ids
+            .len()
+            .try_into()
+            .map_err(|_| "expert count overflow".to_string())?,
+    );
+    for &expert_id in &frame.expert_ids {
+        write_u32_le(
+            &mut out,
+            expert_id
+                .try_into()
+                .map_err(|_| "expert id overflow".to_string())?,
+        );
+    }
+    for output in &frame.outputs {
+        if output.len() != frame.dim {
+            return Err(format!(
+                "proposed expert vector length mismatch: got {}, expected {}",
+                output.len(),
+                frame.dim
+            ));
+        }
+        out.extend_from_slice(&encode_activation_vector(output, frame.output_dtype));
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_proposed_expert_batch(
+    payload: &[u8],
+) -> Result<ProposedExpertBatchFrame, String> {
+    let mut offset = 0usize;
+    let layer = read_u32_le(payload, &mut offset)? as usize;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let output_dtype = ActivationDtype::from_u16(read_u16_le(payload, &mut offset)?)?;
+    let n_experts = read_u32_le(payload, &mut offset)? as usize;
+    let mut expert_ids = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
+    }
+    let bytes_per_output = activation_vector_encoded_len(dim, output_dtype);
+    let mut outputs = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        let end = offset
+            .checked_add(bytes_per_output)
+            .ok_or_else(|| "proposed expert payload overflow".to_string())?;
+        if end > payload.len() {
+            return Err("truncated proposed expert payload".to_string());
+        }
+        outputs.push(decode_activation_vector(
+            &payload[offset..end],
+            output_dtype,
+            dim,
+        )?);
+        offset = end;
+    }
+    Ok(ProposedExpertBatchFrame {
+        layer,
+        output_dtype,
+        dim,
+        expert_ids,
+        outputs,
     })
 }
 
@@ -1132,6 +1308,41 @@ mod tests {
         assert_eq!(decoded.dim, request.dim);
         assert_eq!(decoded.expert_ids, request.expert_ids);
         assert_eq!(decoded.activation.len(), request.activation.len());
+        assert_eq!(decoded.hint_expert_ids, request.hint_expert_ids);
+    }
+
+    #[test]
+    fn speculation_advance_round_trip() {
+        let frame = SpeculationAdvanceFrame {
+            layer: 5,
+            activation_dtype: ActivationDtype::Bf16,
+            dim: 4,
+            activation: vec![0.25, -0.5, 1.0, 2.0],
+            hint_expert_ids: vec![2, 6, 9],
+        };
+        let payload = encode_speculation_advance(&frame).expect("encode failed");
+        let decoded = decode_speculation_advance(&payload).expect("decode failed");
+        assert_eq!(decoded.layer, frame.layer);
+        assert_eq!(decoded.dim, frame.dim);
+        assert_eq!(decoded.hint_expert_ids, frame.hint_expert_ids);
+        assert_eq!(decoded.activation.len(), frame.activation.len());
+    }
+
+    #[test]
+    fn proposed_expert_batch_round_trip() {
+        let frame = ProposedExpertBatchFrame {
+            layer: 7,
+            output_dtype: ActivationDtype::Bf16,
+            dim: 4,
+            expert_ids: vec![3, 11],
+            outputs: vec![vec![0.25, -0.5, 1.0, 2.0], vec![1.5, 2.5, -3.5, 4.5]],
+        };
+        let payload = encode_proposed_expert_batch(&frame).expect("encode failed");
+        let decoded = decode_proposed_expert_batch(&payload).expect("decode failed");
+        assert_eq!(decoded.layer, frame.layer);
+        assert_eq!(decoded.dim, frame.dim);
+        assert_eq!(decoded.expert_ids, frame.expert_ids);
+        assert_eq!(decoded.outputs.len(), frame.outputs.len());
     }
 
     #[test]

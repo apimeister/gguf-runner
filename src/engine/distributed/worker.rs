@@ -1,8 +1,9 @@
 use crate::engine::distributed::protocol::{
-    DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame, ReadyFrame,
-    SHARD_KIND_GATE_INP, SsmLayerResponse, decode_error_frame, decode_expert_batch_request,
-    decode_hello_frame, decode_model_shard_header, decode_ssm_layer_request,
-    encode_discover_response_frame, encode_error_frame, encode_expert_batch_response,
+    ActivationDtype, DiscoverResponseFrame, ExpertBatchResponse, FrameKind, HelloFrame,
+    ProposedExpertBatchFrame, ReadyFrame, SHARD_KIND_GATE_INP, SsmLayerResponse,
+    decode_error_frame, decode_expert_batch_request, decode_hello_frame, decode_model_shard_header,
+    decode_speculation_advance, decode_ssm_layer_request, encode_discover_response_frame,
+    encode_error_frame, encode_expert_batch_response, encode_proposed_expert_batch,
     encode_ready_frame, encode_ssm_layer_response,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
@@ -61,8 +62,11 @@ struct WorkerSession {
     last_activation: Vec<f32>,
     spec_hits: u64,
     spec_misses: u64,
+    /// Results already pushed to the coordinator, retained as fallback for a timing miss.
+    pushed_cache: std::collections::HashMap<usize, SpeculationCache>,
     /// Coordinator-provided routing hint for a specific future layer.
     hint_for_layer: Option<(usize, Vec<usize>)>,
+    activation_dtype: ActivationDtype,
 }
 
 fn shard_temp_path(bind_address: &str) -> PathBuf {
@@ -234,7 +238,9 @@ impl WorkerRuntime {
                 last_activation: vec![0.0f32; dim],
                 spec_hits: 0,
                 spec_misses: 0,
+                pushed_cache: std::collections::HashMap::new(),
                 hint_for_layer: None,
+                activation_dtype: hello.activation_dtype,
             },
         ))
     }
@@ -886,6 +892,9 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     if future_layers.is_empty() {
         return;
     }
+    session
+        .pushed_cache
+        .retain(|&layer, _| future_layers.contains(&layer));
 
     let n_experts = session.n_experts;
     let n_top = (session.n_experts_per_tok * 2).min(n_experts);
@@ -933,6 +942,9 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
         for &next_layer in &future_layers {
             if receivers.contains_key(&next_layer) {
                 continue; // already in flight; retain it
+            }
+            if session.pushed_cache.contains_key(&next_layer) {
+                continue;
             }
             // Determine which expert IDs to compute for next_layer.
             let predicted: Vec<usize> = if hint_consumed_layer == Some(next_layer)
@@ -1111,6 +1123,57 @@ fn speculate_ahead(session: &mut WorkerSession, completed_layer: usize) {
     });
 }
 
+fn drain_and_push_ready_specs(session: &mut WorkerSession, connection: &mut FramedConnection) {
+    let mut ready = Vec::new();
+    {
+        let mut receivers = session.spec_receivers.lock().unwrap();
+        let ready_layers: Vec<usize> = receivers.keys().copied().collect();
+        for layer in ready_layers {
+            let Some(rx) = receivers.remove(&layer) else {
+                continue;
+            };
+            match rx.try_recv() {
+                Ok(cache) => ready.push(cache),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    receivers.insert(layer, rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+    }
+
+    for cache in ready {
+        let layer = cache.layer;
+        let mut expert_ids: Vec<usize> = cache.outputs.keys().copied().collect();
+        expert_ids.sort_unstable();
+        let outputs: Vec<Vec<f32>> = expert_ids
+            .iter()
+            .filter_map(|id| cache.outputs.get(id).cloned())
+            .collect();
+        if outputs.len() != expert_ids.len() {
+            continue;
+        }
+        let frame = ProposedExpertBatchFrame {
+            layer,
+            output_dtype: session.activation_dtype,
+            dim: session.dim,
+            expert_ids: expert_ids.clone(),
+            outputs: outputs.clone(),
+        };
+        if let Ok(payload) = encode_proposed_expert_batch(&frame) {
+            let _ = connection.send_message(FrameKind::ProposedExpertBatch, 0, &payload);
+        }
+        let fallback_outputs = expert_ids.into_iter().zip(outputs).collect();
+        session.pushed_cache.insert(
+            layer,
+            SpeculationCache {
+                layer,
+                outputs: fallback_outputs,
+            },
+        );
+    }
+}
+
 pub(crate) fn run_worker_server(bind_address: &str) -> Result<(), String> {
     let runtime = WorkerRuntime {
         bind_address: bind_address.to_string(),
@@ -1188,13 +1251,17 @@ fn handle_worker_connection(
                                     ));
                                 }
 
-                                // Poll the background speculation task for this layer (non-blocking).
-                                let spec_cache: Option<SpeculationCache> = session
-                                    .spec_receivers
-                                    .lock()
-                                    .unwrap()
-                                    .remove(&request.layer)
-                                    .and_then(|rx| rx.try_recv().ok());
+                                // Check already-pushed results first, then poll the background
+                                // speculation task for this layer (non-blocking).
+                                let spec_cache: Option<SpeculationCache> =
+                                    session.pushed_cache.remove(&request.layer).or_else(|| {
+                                        session
+                                            .spec_receivers
+                                            .lock()
+                                            .unwrap()
+                                            .remove(&request.layer)
+                                            .and_then(|rx| rx.try_recv().ok())
+                                    });
 
                                 // Superset hit check: all requested experts must be in the cache.
                                 let mut req_ids_sorted = request.expert_ids.clone();
@@ -1255,6 +1322,32 @@ fn handle_worker_connection(
                                         )?;
                                         // Speculate next layers while coordinator does attention/norm.
                                         speculate_ahead(&mut session, completed_layer);
+                                        drain_and_push_ready_specs(&mut session, connection);
+                                    }
+                                    Err(err) => {
+                                        let payload = encode_error_frame(&err)?;
+                                        connection.send_message(
+                                            FrameKind::Error,
+                                            message.request_id,
+                                            &payload,
+                                        )?;
+                                    }
+                                }
+                            }
+                            FrameKind::SpeculationAdvance => {
+                                match decode_speculation_advance(&message.payload) {
+                                    Ok(advance) => {
+                                        let dim = session.dim;
+                                        if advance.activation.len() >= dim {
+                                            session.last_activation[..dim]
+                                                .copy_from_slice(&advance.activation[..dim]);
+                                        }
+                                        if !advance.hint_expert_ids.is_empty() {
+                                            session.hint_for_layer =
+                                                Some((advance.layer + 1, advance.hint_expert_ids));
+                                        }
+                                        speculate_ahead(&mut session, advance.layer);
+                                        drain_and_push_ready_specs(&mut session, connection);
                                     }
                                     Err(err) => {
                                         let payload = encode_error_frame(&err)?;

@@ -47,6 +47,14 @@ impl FramedConnection {
         Ok(Self { stream })
     }
 
+    pub(crate) fn try_clone(&self, timeout: Duration) -> Result<Self, String> {
+        let stream = self
+            .stream
+            .try_clone()
+            .map_err(|e| format!("failed to clone distributed stream: {e}"))?;
+        Self::from_stream(stream, timeout)
+    }
+
     pub(crate) fn send_message(
         &mut self,
         kind: FrameKind,
