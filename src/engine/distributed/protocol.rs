@@ -18,6 +18,7 @@ pub(crate) enum FrameKind {
     ModelShardHeader = 9,
     SsmLayerRequest = 10,
     SsmLayerResponse = 11,
+    ProposedExpertBatch = 12,
 }
 
 impl FrameKind {
@@ -34,6 +35,7 @@ impl FrameKind {
             9 => Ok(Self::ModelShardHeader),
             10 => Ok(Self::SsmLayerRequest),
             11 => Ok(Self::SsmLayerResponse),
+            12 => Ok(Self::ProposedExpertBatch),
             _ => Err(format!("unknown distributed frame kind {value}")),
         }
     }
@@ -1001,6 +1003,54 @@ pub(crate) fn encode_ssm_layer_response(frame: &SsmLayerResponse) -> Vec<u8> {
         write_f32_le(&mut out, v);
     }
     out
+}
+
+/// Worker → coordinator: proactively pushed pre-computed expert outputs.
+/// expert_ids and outputs are parallel arrays.
+pub(crate) struct ProposedExpertBatchFrame {
+    pub(crate) layer: usize,
+    pub(crate) dim: usize,
+    pub(crate) expert_ids: Vec<usize>,
+    pub(crate) outputs: Vec<Vec<f32>>,
+}
+
+pub(crate) fn encode_proposed_expert_batch(frame: &ProposedExpertBatchFrame) -> Result<Vec<u8>, String> {
+    if frame.expert_ids.len() != frame.outputs.len() {
+        return Err("proposed batch expert_ids/outputs length mismatch".to_string());
+    }
+    let mut out = Vec::new();
+    write_u32_le(&mut out, frame.layer.try_into().map_err(|_| "layer overflow".to_string())?);
+    write_u32_le(&mut out, frame.dim.try_into().map_err(|_| "dim overflow".to_string())?);
+    write_u32_le(&mut out, frame.expert_ids.len().try_into().map_err(|_| "expert count overflow".to_string())?);
+    for &id in &frame.expert_ids {
+        write_u32_le(&mut out, id.try_into().map_err(|_| "expert id overflow".to_string())?);
+    }
+    for output in &frame.outputs {
+        for &v in output {
+            write_f32_le(&mut out, v);
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_proposed_expert_batch(payload: &[u8]) -> Result<ProposedExpertBatchFrame, String> {
+    let mut offset = 0usize;
+    let layer = read_u32_le(payload, &mut offset)? as usize;
+    let dim = read_u32_le(payload, &mut offset)? as usize;
+    let n_experts = read_u32_le(payload, &mut offset)? as usize;
+    let mut expert_ids = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        expert_ids.push(read_u32_le(payload, &mut offset)? as usize);
+    }
+    let mut outputs = Vec::with_capacity(n_experts);
+    for _ in 0..n_experts {
+        let mut output = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            output.push(read_f32_le(payload, &mut offset)?);
+        }
+        outputs.push(output);
+    }
+    Ok(ProposedExpertBatchFrame { layer, dim, expert_ids, outputs })
 }
 
 pub(crate) fn decode_ssm_layer_response(payload: &[u8]) -> Result<SsmLayerResponse, String> {

@@ -4,9 +4,9 @@ use crate::engine::distributed::placement::{
 use crate::engine::distributed::protocol::{
     ActivationDtype, DiscoverResponseFrame, ExpertBatchRequest, FrameKind, HelloFrame,
     ReadyFrame, SsmLayerRequest, decode_discover_response_frame, decode_error_frame,
-    decode_expert_batch_response, decode_ready_frame, decode_ssm_layer_response,
-    encode_expert_batch_request, encode_hello_frame, encode_model_shard_header,
-    encode_ssm_layer_request,
+    decode_expert_batch_response, decode_proposed_expert_batch, decode_ready_frame,
+    decode_ssm_layer_response, encode_expert_batch_request, encode_hello_frame,
+    encode_model_shard_header, encode_ssm_layer_request,
 };
 use crate::engine::distributed::resources::{NodeResourceSnapshot, detect_local_node_resources};
 use crate::engine::distributed::transport::FramedConnection;
@@ -376,6 +376,8 @@ struct RemoteWorkerClient {
     stats: RemoteWorkerStats,
     shard_header_payload: Vec<u8>,
     shard_data: Vec<u8>,
+    /// Proactively pushed expert results: layer → expert_id → output vector.
+    push_buffer: HashMap<usize, HashMap<usize, Vec<f32>>>,
 }
 
 #[allow(dead_code)]
@@ -753,6 +755,7 @@ impl DistributedMoeCoordinator {
                 stats: RemoteWorkerStats::default(),
                 shard_header_payload: setup.shard_header_payload,
                 shard_data: setup.shard_data,
+                push_buffer: HashMap::new(),
             });
         }
 
@@ -881,8 +884,21 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         let remote_start = Instant::now();
         let mut remote_outputs: HashMap<usize, Vec<f32>> = HashMap::new();
 
-        // Phase 1: fire requests at all workers first so they start computing immediately.
-        let mut send_info: Vec<(usize, Instant)> = Vec::with_capacity(remote_selected.len());
+        // Drain any proactively-pushed results from workers (non-blocking, ~0.5 µs timeout).
+        // Remove stale push entries for layers already passed at the same time.
+        for worker in &mut self.remote_workers {
+            drain_pushed_frames(worker);
+            worker.push_buffer.retain(|&l, _| l >= layer);
+        }
+
+        // Phase 1: for each remote worker, check the push buffer first.
+        // If the push covers all requested experts, skip sending the request entirely.
+        enum BatchOutcome {
+            PushHit(Vec<Vec<f32>>),
+            Sent(usize, Instant),
+        }
+        let mut outcomes: Vec<BatchOutcome> = Vec::with_capacity(remote_selected.len());
+
         for (node_index, expert_ids) in &remote_selected {
             let node_address = self.plan.nodes[*node_index].address.clone();
             let worker = self
@@ -895,20 +911,35 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
                         node_address
                     )
                 })?;
-            let mut activation = self.activation_buffer_pool.get_buffer();
-            activation[..dim].copy_from_slice(&input[..dim]);
-            let send_result = send_batch_request(
-                worker,
-                layer,
-                self.activation_dtype,
-                dim,
-                expert_ids,
-                &activation,
-            );
-            self.activation_buffer_pool.put_buffer(activation);
-            let (wire_sent, wait_start) = send_result
-                .map_err(|err| format!("worker '{}' send failed: {}", node_address, err))?;
-            send_info.push((wire_sent, wait_start));
+
+            // Check push buffer: all requested experts must be present.
+            let push_covers = worker.push_buffer.get(&layer)
+                .map(|lm| expert_ids.iter().all(|id| lm.contains_key(id)))
+                .unwrap_or(false);
+
+            if push_covers {
+                let layer_map = worker.push_buffer.remove(&layer).unwrap();
+                let outputs: Vec<Vec<f32>> = expert_ids.iter()
+                    .map(|id| layer_map[id].clone())
+                    .collect();
+                worker.stats.record_request(expert_ids.len(), 0, 0, 0, true);
+                outcomes.push(BatchOutcome::PushHit(outputs));
+            } else {
+                let mut activation = self.activation_buffer_pool.get_buffer();
+                activation[..dim].copy_from_slice(&input[..dim]);
+                let send_result = send_batch_request(
+                    worker,
+                    layer,
+                    self.activation_dtype,
+                    dim,
+                    expert_ids,
+                    &activation,
+                );
+                self.activation_buffer_pool.put_buffer(activation);
+                let (wire_sent, wait_start) = send_result
+                    .map_err(|err| format!("worker '{}' send failed: {}", node_address, err))?;
+                outcomes.push(BatchOutcome::Sent(wire_sent, wait_start));
+            }
         }
 
         // Overlap: compute local experts while workers run their remote batches.
@@ -928,40 +959,47 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
         }
         let local_ns = local_start.elapsed().as_nanos() as u64;
 
-        // Phase 2: collect responses — workers have been computing since phase 1 finished.
-        for ((node_index, expert_ids), (wire_sent, wait_start)) in
-            remote_selected.iter().zip(send_info.iter())
-        {
+        // Phase 2: collect responses — push hits are already buffered, others need recv.
+        for ((node_index, expert_ids), outcome) in remote_selected.iter().zip(outcomes.into_iter()) {
             let node_address = self.plan.nodes[*node_index].address.clone();
-            let worker = self
-                .remote_workers
-                .iter_mut()
-                .find(|w| w.node_index == *node_index)
-                .ok_or_else(|| {
-                    format!(
-                        "distributed worker '{}' is missing an active coordinator connection",
-                        node_address
+            match outcome {
+                BatchOutcome::PushHit(outputs) => {
+                    for (expert_idx, values) in expert_ids.iter().copied().zip(outputs) {
+                        remote_outputs.insert(expert_idx, values);
+                    }
+                }
+                BatchOutcome::Sent(wire_sent, wait_start) => {
+                    let worker = self
+                        .remote_workers
+                        .iter_mut()
+                        .find(|w| w.node_index == *node_index)
+                        .ok_or_else(|| {
+                            format!(
+                                "distributed worker '{}' is missing an active coordinator connection",
+                                node_address
+                            )
+                        })?;
+                    let (outputs, bytes_sent, bytes_received, wait_ns, _spec_hit) = recv_batch_response(
+                        worker,
+                        layer,
+                        dim,
+                        expert_ids,
+                        wire_sent,
+                        wait_start,
                     )
-                })?;
-            let (outputs, bytes_sent, bytes_received, wait_ns, _spec_hit) = recv_batch_response(
-                worker,
-                layer,
-                dim,
-                expert_ids,
-                *wire_sent,
-                *wait_start,
-            )
-            .map_err(|err| format!("worker '{}' batch recv failed: {}", node_address, err))?;
-            if bytes_sent > 0 {
-                record_distributed_remote_request(
-                    expert_ids.len(),
-                    bytes_sent,
-                    bytes_received,
-                    wait_ns,
-                );
-            }
-            for (expert_idx, values) in expert_ids.iter().copied().zip(outputs) {
-                remote_outputs.insert(expert_idx, values);
+                    .map_err(|err| format!("worker '{}' batch recv failed: {}", node_address, err))?;
+                    if bytes_sent > 0 {
+                        record_distributed_remote_request(
+                            expert_ids.len(),
+                            bytes_sent,
+                            bytes_received,
+                            wait_ns,
+                        );
+                    }
+                    for (expert_idx, values) in expert_ids.iter().copied().zip(outputs) {
+                        remote_outputs.insert(expert_idx, values);
+                    }
+                }
             }
         }
         let remote_ns = remote_start.elapsed().as_nanos() as u64;
@@ -1016,6 +1054,28 @@ impl MoeExpertExecutor for DistributedMoeCoordinator {
     }
 }
 
+/// Drain any ProposedExpertBatch frames that arrived since the last poll.
+/// Uses a very short read timeout so this is effectively non-blocking.
+fn drain_pushed_frames(worker: &mut RemoteWorkerClient) {
+    if worker.connection.set_timeout(Duration::from_micros(500)).is_err() {
+        return;
+    }
+    loop {
+        match worker.connection.recv_message() {
+            Ok(msg) if msg.kind == FrameKind::ProposedExpertBatch => {
+                if let Ok(frame) = decode_proposed_expert_batch(&msg.payload) {
+                    let layer_map = worker.push_buffer.entry(frame.layer).or_default();
+                    for (id, out) in frame.expert_ids.into_iter().zip(frame.outputs) {
+                        layer_map.insert(id, out);
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    let _ = worker.connection.set_timeout(worker.timeout);
+}
+
 /// Phase 1: encode and send an expert batch request; return (wire_sent, wait_start).
 /// Retries with reconnect on send failure. Does NOT wait for the response.
 fn send_batch_request(
@@ -1064,6 +1124,7 @@ fn send_batch_request(
 
 /// Phase 2: receive and decode the expert batch response from a worker.
 /// `wire_sent` and `wait_start` come from the matching `send_batch_request` call.
+/// Any ProposedExpertBatch frames that arrive while waiting are buffered in push_buffer.
 fn recv_batch_response(
     worker: &mut RemoteWorkerClient,
     layer: usize,
@@ -1072,26 +1133,37 @@ fn recv_batch_response(
     wire_sent: usize,
     wait_start: Instant,
 ) -> Result<RemoteBatchReply, String> {
-    let message = worker
-        .connection
-        .recv_message()
-        .map_err(|err| format!("recv: {err}"))?;
-    let wait_ns = wait_start.elapsed().as_nanos() as u64;
-    let wire_received = DISTRIBUTED_FRAME_HEADER_LEN + message.payload.len();
-    match message.kind {
-        FrameKind::ExpertBatchResponse => {
-            let response = decode_expert_batch_response(&message.payload)?;
-            if response.layer != layer || response.dim != dim {
-                Err(format!(
-                    "invalid response shape: layer {} dim {}",
-                    response.layer, response.dim
-                ))
-            } else {
-                worker.stats.record_request(expert_ids.len(), wire_sent, wire_received, wait_ns, response.spec_hit);
-                Ok((response.outputs, wire_sent, wire_received, wait_ns, response.spec_hit))
+    loop {
+        let message = worker
+            .connection
+            .recv_message()
+            .map_err(|err| format!("recv: {err}"))?;
+        let wire_received = DISTRIBUTED_FRAME_HEADER_LEN + message.payload.len();
+        match message.kind {
+            FrameKind::ProposedExpertBatch => {
+                // A push for a future layer arrived while we were waiting — buffer it.
+                if let Ok(frame) = decode_proposed_expert_batch(&message.payload) {
+                    let layer_map = worker.push_buffer.entry(frame.layer).or_default();
+                    for (id, out) in frame.expert_ids.into_iter().zip(frame.outputs) {
+                        layer_map.insert(id, out);
+                    }
+                }
+                // Keep waiting for the actual ExpertBatchResponse.
             }
+            FrameKind::ExpertBatchResponse => {
+                let wait_ns = wait_start.elapsed().as_nanos() as u64;
+                let response = decode_expert_batch_response(&message.payload)?;
+                if response.layer != layer || response.dim != dim {
+                    return Err(format!(
+                        "invalid response shape: layer {} dim {}",
+                        response.layer, response.dim
+                    ));
+                }
+                worker.stats.record_request(expert_ids.len(), wire_sent, wire_received, wait_ns, response.spec_hit);
+                return Ok((response.outputs, wire_sent, wire_received, wait_ns, response.spec_hit));
+            }
+            FrameKind::Error => return Err(decode_error_frame(&message.payload)?),
+            other => return Err(format!("unexpected frame: {:?}", other)),
         }
-        FrameKind::Error => Err(decode_error_frame(&message.payload)?),
-        other => Err(format!("unexpected frame: {:?}", other)),
     }
 }
