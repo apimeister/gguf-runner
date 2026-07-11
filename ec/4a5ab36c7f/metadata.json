@@ -1,0 +1,32 @@
+{
+  "cli_version": "0.8.42",
+  "checkpoint_id": "ec4a5ab36c7f",
+  "strategy": "manual-commit",
+  "branch": "main",
+  "checkpoints_count": 30,
+  "files_touched": [
+    "Cargo.lock",
+    "README.md",
+    "docs/module-structure.md",
+    "docs/performance.md",
+    "src/engine/kernels/quant.rs",
+    "src/engine/runtime/inference.rs",
+    "src/engine/switches.rs"
+  ],
+  "sessions": [
+    {
+      "metadata": "/ec/4a5ab36c7f/0/metadata.json",
+      "transcript": "/ec/4a5ab36c7f/0/full.jsonl",
+      "compact_transcript": "/ec/4a5ab36c7f/0/transcript.jsonl",
+      "content_hash": "/ec/4a5ab36c7f/0/content_hash.txt",
+      "prompt": "/ec/4a5ab36c7f/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 3188317,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 95213312,
+    "output_tokens": 293187,
+    "api_call_count": 724
+  }
+}

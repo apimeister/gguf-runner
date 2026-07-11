@@ -1,0 +1,133 @@
+can you review the 3bit autoverco\torization and whether manual cpu optimization for x86 would be better?
+
+---
+
+is that also true for the v4 cpu opts? benchmarking on this machine (macos) should not be the reference.
+
+---
+
+ok, so how can we further optimize the inference, especially lower quants, but q4 and higher also is a priority
+
+---
+
+can you write that out as markdown into the docs directory
+
+---
+
+please start implementing this plan
+
+---
+
+ok, lets continue
+
+---
+
+ok, lets continue
+
+---
+
+ok, lets continue
+
+---
+
+any more open points or todos?
+
+---
+
+let skip the benchmarking, and continue on with the other open points
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+any other open points?
+
+---
+
+ok, so lets tackle those
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+please continue
+
+---
+
+can we run local benchmarks now to verify the existing algorithm
+
+---
+
+ok, but next to the prefill we also have performance documents, can you check and verify those
+
+---
+
+ok, but next to the prefill we also have performance documents, can you check and verify those
+
+---
+
+wtf are you doing?
+
+---
+
+no go into the performance document and not edit this but read what is in there performr the same perfromance banchmark, and verify that we are still on track here
+
+---
+
+we are locally not running a apple m4 but the m5, please compare against those
+
+---
+
+can you first roll back your change in the performance document and then cleanly add the m5 result
+
+---
+
+and also remove the quantized-cpu-optimization-plan - since this is now implemented
