@@ -575,6 +575,79 @@ fn sanitize_final_response_text(output: &str) -> String {
     trim_trailing_protocol_markers(output)
 }
 
+/// Hidden-mode reasoning budget: `(think_cap, total_cap)` in decode tokens.
+/// `think_cap` bounds the reasoning block, `total_cap` the whole generation.
+/// `override_cap` (caller-set) replaces the vendor heuristic and its hard
+/// ceilings; only the real decode budget still bounds it.
+fn compute_think_caps(
+    hidden_cap_base: usize,
+    n_layers: usize,
+    seq_len: usize,
+    new_budget: usize,
+    override_cap: Option<usize>,
+) -> (usize, usize) {
+    let hidden_vendor_base = hidden_cap_base.max(256usize);
+    let layer_mult = if n_layers >= 64 {
+        3usize
+    } else if n_layers >= 32 {
+        2usize
+    } else {
+        1usize
+    };
+    let ctx_mult = if seq_len >= 262_144 { 2usize } else { 1usize };
+    let hard_think_cap_max = if n_layers >= 48 || seq_len >= 262_144 {
+        1536usize
+    } else {
+        1024usize
+    };
+    let hard_total_cap_max = hard_think_cap_max.saturating_mul(4);
+    let mut think_cap = hidden_vendor_base
+        .saturating_mul(layer_mult)
+        .saturating_mul(ctx_mult);
+    if new_budget > 0 {
+        let max_cap = hard_think_cap_max.min(new_budget.max(96));
+        think_cap = think_cap.clamp(96, max_cap);
+    } else {
+        think_cap = 64;
+    }
+    if let Some(cap) = override_cap {
+        think_cap = cap.max(1);
+        if new_budget > 0 {
+            think_cap = think_cap.min(new_budget);
+        }
+    }
+    let mut total_cap = think_cap.saturating_mul(4);
+    if override_cap.is_none() {
+        total_cap = total_cap.min(hard_total_cap_max);
+    }
+    if new_budget > 0 {
+        total_cap = total_cap.min(new_budget);
+        let min_total = (think_cap + 64).min(new_budget).max(think_cap + 1);
+        total_cap = total_cap.max(min_total);
+    } else {
+        total_cap = think_cap + 64;
+    }
+    (think_cap, total_cap)
+}
+
+/// Appends `\n</think>\n\n` to `prompt_tokens`, turning the chat template's
+/// trailing `<think>\n` seed into the pre-closed empty think block that
+/// `ThinkMode::No` prompts carry. Used when a hidden-mode generation is
+/// retried without thinking on the already-encoded prompt.
+fn append_think_close_suffix(tokenizer: &mut Tokenizer, prompt_tokens: &mut Vec<i32>) {
+    let mut piece: Vec<i32> = Vec::new();
+    if let Some(close_id) = tokenizer.find_special_token(THINK_CLOSE_TAG) {
+        tokenizer.bpe_encode("\n", &mut piece);
+        prompt_tokens.extend_from_slice(&piece);
+        prompt_tokens.push(close_id);
+        tokenizer.bpe_encode("\n\n", &mut piece);
+        prompt_tokens.extend_from_slice(&piece);
+    } else {
+        tokenizer.bpe_encode("\n</think>\n\n", &mut piece);
+        prompt_tokens.extend_from_slice(&piece);
+    }
+}
+
 fn default_sampling_seed() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1355,6 +1428,9 @@ pub(crate) struct GenerationSettings {
     pub(crate) show_tokens: bool,
     pub(crate) debug_mode: bool,
     pub(crate) think_mode: ThinkMode,
+    /// Caller-set cap on hidden-mode reasoning tokens per generation. `None`
+    /// selects the vendor-derived heuristic in [`compute_think_caps`].
+    pub(crate) hidden_think_token_cap: Option<usize>,
     pub(crate) structured_output_mode: StructuredOutputMode,
     pub(crate) vendor_decode_policy: crate::vendors::VendorDecodePolicy,
     pub(crate) vendor_multimodal_policy: crate::vendors::VendorMultimodalPolicy,
@@ -2415,6 +2491,7 @@ impl ModelRuntime {
             } else {
                 crate::engine::types::ThinkMode::Hidden
             },
+            hidden_think_token_cap: None,
             structured_output_mode: StructuredOutputMode::None,
             vendor_decode_policy,
             vendor_multimodal_policy,
@@ -2510,6 +2587,7 @@ impl ModelRuntime {
             } else {
                 crate::engine::types::ThinkMode::Hidden
             },
+            hidden_think_token_cap: None,
             structured_output_mode: StructuredOutputMode::None,
             vendor_decode_policy,
             vendor_multimodal_policy,
@@ -2735,6 +2813,11 @@ impl ModelRuntime {
             show_tokens: cli.show_tokens,
             debug_mode,
             think_mode: effective_think_mode,
+            hidden_think_token_cap: if cli.hidden_think_token_cap == 0 {
+                None
+            } else {
+                Some(cli.hidden_think_token_cap)
+            },
             structured_output_mode: StructuredOutputMode::None,
             vendor_decode_policy,
             vendor_multimodal_policy,
@@ -3093,6 +3176,10 @@ impl ModelRuntime {
 
     pub(crate) fn set_think_mode_hidden(&mut self) {
         self.settings.think_mode = ThinkMode::Hidden;
+    }
+
+    pub(crate) fn set_hidden_think_token_cap(&mut self, cap: usize) {
+        self.settings.hidden_think_token_cap = if cap == 0 { None } else { Some(cap) };
     }
 
     pub(crate) fn set_think_mode_no(&mut self) {
@@ -3795,44 +3882,13 @@ impl ModelRuntime {
         );
         let think_caps = if decode_policy.parse_think_tags {
             let new_budget = total_limit.saturating_sub(prompt_tokens.len());
-            let hidden_vendor_base = decode_policy.hidden_think_token_cap_base.max(256usize);
-            let layer_mult = if self.config.n_layers >= 64 {
-                3usize
-            } else if self.config.n_layers >= 32 {
-                2usize
-            } else {
-                1usize
-            };
-            let ctx_mult = if self.config.seq_len >= 262_144 {
-                2usize
-            } else {
-                1usize
-            };
-            let hard_think_cap_max = if self.config.n_layers >= 48 || self.config.seq_len >= 262_144
-            {
-                1536usize
-            } else {
-                1024usize
-            };
-            let hard_total_cap_max = hard_think_cap_max.saturating_mul(4);
-            let mut think_cap = hidden_vendor_base
-                .saturating_mul(layer_mult)
-                .saturating_mul(ctx_mult);
-            if new_budget > 0 {
-                let max_cap = hard_think_cap_max.min(new_budget.max(96));
-                think_cap = think_cap.clamp(96, max_cap);
-            } else {
-                think_cap = 64;
-            }
-            let mut total_cap = think_cap.saturating_mul(4).min(hard_total_cap_max);
-            if new_budget > 0 {
-                total_cap = total_cap.min(new_budget);
-                let min_total = (think_cap + 64).min(new_budget).max(think_cap + 1);
-                total_cap = total_cap.max(min_total);
-            } else {
-                total_cap = think_cap + 64;
-            }
-            Some((think_cap, total_cap))
+            Some(compute_think_caps(
+                decode_policy.hidden_think_token_cap_base,
+                self.config.n_layers,
+                self.config.seq_len,
+                new_budget,
+                self.settings.hidden_think_token_cap,
+            ))
         } else {
             None
         };
@@ -4679,9 +4735,17 @@ impl ModelRuntime {
                     ),
                 );
             }
-            if let (Some(retry_prompt_tokens), Some(retry_prefill_embeddings)) =
+            if let (Some(mut retry_prompt_tokens), Some(retry_prefill_embeddings)) =
                 (retry_prompt_tokens, retry_prefill_embeddings)
             {
+                if decode_policy.parse_think_tags {
+                    // The encoded prompt still ends with the template's
+                    // "<think>\n" seed. Close the block so the think=no retry
+                    // decodes in the answer region; otherwise the model keeps
+                    // reasoning and No-mode parsing streams that reasoning as
+                    // the visible response.
+                    append_think_close_suffix(&mut self.tokenizer, &mut retry_prompt_tokens);
+                }
                 let original_think_mode = self.settings.think_mode;
                 let original_max_tokens = self.settings.max_tokens;
                 self.settings.think_mode = ThinkMode::No;
@@ -4863,7 +4927,7 @@ impl ModelRuntime {
 mod tests {
     use super::{
         ModelRuntime, PrefixMatch, append_visible_text_with_stop_literals,
-        extract_first_complete_json_object, finalize_visible_think_tail,
+        compute_think_caps, extract_first_complete_json_object, finalize_visible_think_tail,
         find_first_complete_json_object_span, flush_visible_text_stop_tail,
         has_meaningful_retry_text, is_agent_json_safe_text, match_agent_response_prefix,
         promote_think_only_content, sanitize_final_response_text,
@@ -4940,6 +5004,33 @@ mod tests {
             match_agent_response_prefix("{\"type\":\"tool_call\" 0000"),
             PrefixMatch::Invalid
         );
+    }
+
+    #[test]
+    fn compute_think_caps_uses_vendor_heuristic_without_override() {
+        // qwen35 base 384, small model (28 layers), 16K context, ample budget.
+        assert_eq!(compute_think_caps(384, 28, 16_384, 8_000, None), (384, 1536));
+        // 36 layers doubles the base.
+        assert_eq!(compute_think_caps(384, 36, 16_384, 8_000, None), (768, 3072));
+    }
+
+    #[test]
+    fn compute_think_caps_override_replaces_heuristic_and_hard_ceiling() {
+        // Override wins over the vendor base and the 1024-token hard cap.
+        assert_eq!(
+            compute_think_caps(384, 28, 16_384, 8_000, Some(1024)),
+            (1024, 4096)
+        );
+        assert_eq!(
+            compute_think_caps(384, 28, 16_384, 16_000, Some(2048)),
+            (2048, 8192)
+        );
+    }
+
+    #[test]
+    fn compute_think_caps_override_is_bounded_by_decode_budget() {
+        let (think_cap, _) = compute_think_caps(384, 28, 16_384, 500, Some(2048));
+        assert_eq!(think_cap, 500);
     }
 
     #[test]

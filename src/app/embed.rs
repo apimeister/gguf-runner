@@ -280,6 +280,19 @@ impl EmbeddedRuntime {
         self
     }
 
+    /// Cap the number of hidden-mode reasoning tokens per generation.
+    ///
+    /// Hidden think mode bounds how long the model may reason before its
+    /// visible answer; the default derives from the vendor policy, layer
+    /// count, and context size (roughly 384–1536 tokens). Interactive callers
+    /// keep it tight for latency; background captioning/description workloads
+    /// raise it so long multilingual reasoning is not cut short. `0` restores
+    /// the vendor-derived default.
+    pub fn set_hidden_think_token_cap(&mut self, cap: usize) -> &mut Self {
+        self.inner.set_hidden_think_token_cap(cap);
+        self
+    }
+
     /// Enable verbose debug logging (prompt tokens, top-k logits per step,
     /// stop-token rank). Prints to stderr. Off by default.
     pub fn set_debug(&mut self, enabled: bool) -> &mut Self {

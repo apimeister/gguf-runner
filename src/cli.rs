@@ -680,6 +680,13 @@ struct Cli {
     )]
     think: crate::engine::types::ThinkMode,
 
+    #[arg(
+        long = "think-cap",
+        default_value_t = 0,
+        help = "Cap hidden-mode reasoning tokens per generation; 0 = vendor-derived default"
+    )]
+    think_cap: usize,
+
     #[arg(long)]
     debug: bool,
 
@@ -897,6 +904,7 @@ pub(crate) struct CliOptions {
     pub(crate) show_tokens: bool,
     pub(crate) show_timings: bool,
     pub(crate) think_mode: crate::engine::types::ThinkMode,
+    pub(crate) hidden_think_token_cap: usize,
     pub(crate) debug: bool,
     pub(crate) kv_cache_mode: Option<CliKvCacheMode>,
     pub(crate) par_matmul_min_rows: Option<usize>,
@@ -1018,6 +1026,7 @@ impl CliOptions {
             show_tokens: cli.show_tokens,
             show_timings: cli.show_timings,
             think_mode: cli.think,
+            hidden_think_token_cap: cli.think_cap,
             debug: cli.debug,
             kv_cache_mode: cli.kv_cache_mode,
             par_matmul_min_rows: cli.par_matmul_min_rows,
