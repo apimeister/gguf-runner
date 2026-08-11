@@ -373,7 +373,7 @@ src/
 
 - Numerical and sampling kernels used by inference.
 - `math.rs`: normalization, softmax, vector math, Qwen3Next SSM linear attention helpers.
-- `quant.rs`: quantized dequant/dot/matmul paths, reusable activation scratch and explicit prepared-activation matmul entry points for allocation-free Q8 prequantized fast paths and x86 Q2_K/Q4_K/Q5_K/Q6_K VNNI activation reuse (including half-block activation sums for Q2_K min correction), architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K MR4 dispatch, ARM Q2_K/Q3_K and legacy Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL MR4 NEON coverage, x86 Q2_K/Q3_K plus legacy Q4_0/Q4_1/Q5_0/Q5_1 and IQ4_NL MR4 AVX2/FMA table-shuffle coverage, and x86 Q2_K/Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, AMD-aware x86 MR4 dispatch preference (AVX2-first on AMD), architecture-specific matmul row prefetch helpers (x86 + aarch64), exact batched-prefill helpers including serial and parallel tiled Q2_K/Q3_K/Q4_K/Q5_K/Q6_K scalar-exact dispatch for non-MR4 row windows, and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
+- `quant.rs`: quantized dequant/dot/matmul paths, reusable activation scratch and explicit prepared-activation matmul entry points for allocation-free Q8 prequantized fast paths and x86 Q2_K/Q4_K/Q5_K/Q6_K VNNI activation reuse (including half-block activation sums for Q2_K min correction), architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K MR4 dispatch, ARM Q2_K/Q3_K and legacy Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL MR4 NEON coverage, x86 Q2_K/Q3_K plus legacy Q4_0/Q4_1/Q5_0/Q5_1 and IQ4_NL MR4 AVX2/FMA table-shuffle coverage, and x86 Q2_K/Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation (int8-aware scalar references for the VNNI dispatch paths), architecture-specific matmul row prefetch helpers (x86 + aarch64), exact batched-prefill helpers including serial and parallel tiled Q2_K/Q3_K/Q4_K/Q5_K/Q6_K scalar-exact dispatch for non-MR4 row windows, and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
   - one-time kernel self-check disable warnings are now quiet by default and can be re-enabled with `GGUF_KERNEL_VALIDATION_WARNINGS=1`
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
 
@@ -413,7 +413,6 @@ src/
   - KV cache selection switch (`kv_cache_mode`: `q8` / `turbo`, default `turbo`)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
     - default behavior uses runtime CPU feature detection for architecture fast paths (for example aarch64 `dotprod` Q8 and x86 `AVX512VNNI` Q8), while `RuntimeSwitchConfig`/CLI/env can still force-disable paths
-    - x86 includes a lightweight CPUID vendor probe (`AuthenticAMD`) used to steer selected kernel dispatch choices
   - Layer debug toggles
   - MR4 status atomics
   - `init_runtime_config(&RuntimeSwitchConfig)`.

@@ -15,7 +15,7 @@ use crate::engine::switches::{
 use crate::engine::switches::{
     X86_IQ4_NL_MR4_STATUS, X86_Q2K_MR4_STATUS, X86_Q3K_MR4_STATUS, X86_Q4_0_MR4_STATUS,
     X86_Q4_1_MR4_STATUS, X86_Q4K_MR4_STATUS, X86_Q5_0_MR4_STATUS, X86_Q5_1_MR4_STATUS,
-    X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, is_x86_amd, use_x86_avx_vnni, use_x86_avx2_fma,
+    X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, use_x86_avx_vnni, use_x86_avx2_fma,
     use_x86_avx512_vnni_q8, use_x86_f16c, use_x86_qk_mr4,
 };
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
@@ -4284,38 +4284,19 @@ pub(crate) fn vec_dot_q4_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
-    if is_x86_amd() {
-        // AMD path: prefer stable AVX2/FMA implementation for QK MR4.
-        if use_x86_avx2_fma() {
-            unsafe {
-                return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
-            }
+    if use_x86_avx512_vnni_q8() {
+        unsafe {
+            return vec_dot_q4_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
         }
-        if use_x86_avx_vnni() {
-            unsafe {
-                return vec_dot_q4_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
-            }
+    }
+    if use_x86_avx_vnni() {
+        unsafe {
+            return vec_dot_q4_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
         }
-        if use_x86_avx512_vnni_q8() {
-            unsafe {
-                return vec_dot_q4_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
-            }
-        }
-    } else {
-        if use_x86_avx512_vnni_q8() {
-            unsafe {
-                return vec_dot_q4_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
-            }
-        }
-        if use_x86_avx_vnni() {
-            unsafe {
-                return vec_dot_q4_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
-            }
-        }
-        if use_x86_avx2_fma() {
-            unsafe {
-                return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
-            }
+    }
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
         }
     }
 
@@ -4381,37 +4362,19 @@ pub(crate) fn vec_dot_q5_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
-    if is_x86_amd() {
-        if use_x86_avx2_fma() {
-            unsafe {
-                return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
-            }
+    if use_x86_avx512_vnni_q8() {
+        unsafe {
+            return vec_dot_q5_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
         }
-        if use_x86_avx_vnni() {
-            unsafe {
-                return vec_dot_q5_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
-            }
+    }
+    if use_x86_avx_vnni() {
+        unsafe {
+            return vec_dot_q5_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
         }
-        if use_x86_avx512_vnni_q8() {
-            unsafe {
-                return vec_dot_q5_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
-            }
-        }
-    } else {
-        if use_x86_avx512_vnni_q8() {
-            unsafe {
-                return vec_dot_q5_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
-            }
-        }
-        if use_x86_avx_vnni() {
-            unsafe {
-                return vec_dot_q5_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
-            }
-        }
-        if use_x86_avx2_fma() {
-            unsafe {
-                return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
-            }
+    }
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
         }
     }
 
@@ -4485,37 +4448,19 @@ pub(crate) fn vec_dot_q6_k_4rows_x86(
     r3: &[u8],
     n: usize,
 ) -> [f32; 4] {
-    if is_x86_amd() {
-        if use_x86_avx2_fma() {
-            unsafe {
-                return vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
-            }
+    if use_x86_avx512_vnni_q8() {
+        unsafe {
+            return vec_dot_q6_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
         }
-        if use_x86_avx_vnni() {
-            unsafe {
-                return vec_dot_q6_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
-            }
+    }
+    if use_x86_avx_vnni() {
+        unsafe {
+            return vec_dot_q6_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
         }
-        if use_x86_avx512_vnni_q8() {
-            unsafe {
-                return vec_dot_q6_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
-            }
-        }
-    } else {
-        if use_x86_avx512_vnni_q8() {
-            unsafe {
-                return vec_dot_q6_k_4rows_x86_avx512vnni(x, r0, r1, r2, r3, n);
-            }
-        }
-        if use_x86_avx_vnni() {
-            unsafe {
-                return vec_dot_q6_k_4rows_x86_avxvnni(x, r0, r1, r2, r3, n);
-            }
-        }
-        if use_x86_avx2_fma() {
-            unsafe {
-                return vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
-            }
+    }
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
         }
     }
 
@@ -5976,9 +5921,6 @@ fn x86_qk_mr4_uses_prequant(ttype: i32) -> bool {
     ) {
         return false;
     }
-    if is_x86_amd() && use_x86_avx2_fma() {
-        return false;
-    }
     use_x86_avx_vnni() || use_x86_avx512_vnni_q8()
 }
 
@@ -5994,69 +5936,23 @@ unsafe fn vec_dot_qk_4rows_x86_prequant(
     n: usize,
     ttype: i32,
 ) -> [f32; 4] {
-    if is_x86_amd() {
-        if use_x86_avx2_fma() {
-            return match ttype {
-                GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
-                GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
-                GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
-                GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
-                _ => unreachable!(),
-            };
-        }
-        if use_x86_avx_vnni() {
-            return match ttype {
-                GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                _ => unreachable!(),
-            };
-        }
-        if use_x86_avx512_vnni_q8() {
-            return match ttype {
-                GGML_TYPE_Q2_K => {
-                    vec_dot_q2_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                GGML_TYPE_Q4_K => {
-                    vec_dot_q4_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                GGML_TYPE_Q5_K => {
-                    vec_dot_q5_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                GGML_TYPE_Q6_K => {
-                    vec_dot_q6_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                _ => unreachable!(),
-            };
-        }
-    } else {
-        if use_x86_avx512_vnni_q8() {
-            return match ttype {
-                GGML_TYPE_Q2_K => {
-                    vec_dot_q2_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                GGML_TYPE_Q4_K => {
-                    vec_dot_q4_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                GGML_TYPE_Q5_K => {
-                    vec_dot_q5_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                GGML_TYPE_Q6_K => {
-                    vec_dot_q6_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
-                }
-                _ => unreachable!(),
-            };
-        }
-        if use_x86_avx_vnni() {
-            return match ttype {
-                GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
-                _ => unreachable!(),
-            };
-        }
+    if use_x86_avx512_vnni_q8() {
+        return match ttype {
+            GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        };
+    }
+    if use_x86_avx_vnni() {
+        return match ttype {
+            GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        };
     }
 
     match ttype {
@@ -6358,6 +6254,270 @@ pub(crate) fn mr4_status_x86(ttype: i32) -> &'static AtomicU8 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+fn scalar_dot_u8_i8(a: &[u8], b: &[i8]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut dot = 0i32;
+    for l in 0..a.len() {
+        dot += a[l] as i32 * b[l] as i32;
+    }
+    dot
+}
+
+/// Whether the non-prequant MR4 dispatch for `ttype` resolves to an int8
+/// (VNNI) kernel. Validation must then compare against the int8-aware
+/// references below: int8 kernels deviate from the float reference by the
+/// activation-quantization error alone, which always exceeds the tolerance
+/// (same pitfall as [`vec_dot_q8_0_quantized_ref`] documents for aarch64).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_qk_mr4_dispatch_is_int8(ttype: i32) -> bool {
+    matches!(ttype, GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K)
+        && (use_x86_avx512_vnni_q8() || use_x86_avx_vnni())
+}
+
+/// Int8-aware scalar reference for the Q4_K MR4 VNNI kernels: quantizes
+/// activations per 32-lane block exactly like the kernels and accumulates
+/// exact integer dots, so kernel and reference differ only in float rounding
+/// of the final per-block scaling.
+#[cfg(target_arch = "x86_64")]
+fn vec_dot_q4_k_4rows_i8_ref(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut q_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            q_off[r] = off + 16;
+        }
+
+        let mut is = 0usize;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut x0_q = [0i8; QK8_0];
+            let mut x1_q = [0i8; QK8_0];
+            let x0_scale = quantize_f32_block_i8_32(x0, &mut x0_q);
+            let x1_scale = quantize_f32_block_i8_32(x1, &mut x1_q);
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                let a_lo = d[r] * sc1 as f32;
+                let b_lo = dmin[r] * m1 as f32;
+                let a_hi = d[r] * sc2 as f32;
+                let b_hi = dmin[r] * m2 as f32;
+
+                let q = &rows[r][q_off[r]..q_off[r] + QK8_0];
+                let mut q_lo = [0u8; QK8_0];
+                let mut q_hi = [0u8; QK8_0];
+                unpack_q4_nibbles_32(q, &mut q_lo, &mut q_hi);
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    scalar_dot_u8_i8(&q_lo, &x0_q) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    scalar_dot_u8_i8(&q_hi, &x1_q) as f32 * x1_scale
+                };
+                sums[r] += a_lo * dot_lo - b_lo * x0_sum + a_hi * dot_hi - b_hi * x1_sum;
+                q_off[r] += 32;
+            }
+            is += 2;
+        }
+    }
+    sums
+}
+
+/// Int8-aware scalar reference for the Q5_K MR4 VNNI kernels; see
+/// [`vec_dot_q4_k_4rows_i8_ref`].
+#[cfg(target_arch = "x86_64")]
+fn vec_dot_q5_k_4rows_i8_ref(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut qh = [&[][..]; 4];
+        let mut ql_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            qh[r] = &rows[r][off + 16..off + 16 + QK_K / 8];
+            ql_off[r] = off + 16 + QK_K / 8;
+        }
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in (0..QK_K).step_by(64) {
+            let x0 = &xb[j..j + 32];
+            let x1 = &xb[j + 32..j + 64];
+            let x0_sum = x0.iter().copied().sum::<f32>();
+            let x1_sum = x1.iter().copied().sum::<f32>();
+            let mut x0_q = [0i8; QK8_0];
+            let mut x1_q = [0i8; QK8_0];
+            let x0_scale = quantize_f32_block_i8_32(x0, &mut x0_q);
+            let x1_scale = quantize_f32_block_i8_32(x1, &mut x1_q);
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                let a_lo = d[r] * sc1 as f32;
+                let b_lo = dmin[r] * m1 as f32;
+                let a_hi = d[r] * sc2 as f32;
+                let b_hi = dmin[r] * m2 as f32;
+
+                let ql = &rows[r][ql_off[r]..ql_off[r] + QK8_0];
+                let mut lo_vals = [0u8; QK8_0];
+                let mut hi_vals = [0u8; QK8_0];
+                for l in 0..QK8_0 {
+                    let qv = ql[l];
+                    lo_vals[l] = (qv & 0x0f) + if (qh[r][l] & u1) != 0 { 16 } else { 0 };
+                    hi_vals[l] = (qv >> 4) + if (qh[r][l] & u2) != 0 { 16 } else { 0 };
+                }
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    scalar_dot_u8_i8(&lo_vals, &x0_q) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    scalar_dot_u8_i8(&hi_vals, &x1_q) as f32 * x1_scale
+                };
+                sums[r] += a_lo * dot_lo - b_lo * x0_sum + a_hi * dot_hi - b_hi * x1_sum;
+                ql_off[r] += 32;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    sums
+}
+
+/// Int8-aware scalar reference for the Q6_K MR4 VNNI kernels; see
+/// [`vec_dot_q4_k_4rows_i8_ref`]. Mirrors the kernels' +96 bias trick:
+/// `(v + 96) · xq − 128 · Σxq = (v − 32) · xq` with all lanes kept unsigned
+/// for the u8×i8 dot.
+#[cfg(target_arch = "x86_64")]
+fn vec_dot_q6_k_4rows_i8_ref(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
+    let mut sums = [0.0f32; 4];
+
+    let half_sum = |xq: &[i8; QK8_0], hi: bool| -> i32 {
+        let base = if hi { 16 } else { 0 };
+        xq[base..base + 16].iter().map(|&v| v as i32).sum()
+    };
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let mut d = [0.0f32; 4];
+        let mut ql_off = [0usize; 4];
+        let mut qh_off = [0usize; 4];
+        let mut sc_off = [0usize; 4];
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 2 + QK_K / 4 + QK_K / 16));
+            ql_off[r] = off;
+            qh_off[r] = off + QK_K / 2;
+            sc_off[r] = off + QK_K / 2 + QK_K / 4;
+        }
+
+        for n_outer in (0..QK_K).step_by(128) {
+            let mut xq = [[0i8; QK8_0]; 4];
+            let mut xs = [0.0f32; 4];
+            for (b, half) in xq.iter_mut().enumerate() {
+                let src = &xb[n_outer + b * 32..n_outer + b * 32 + 32];
+                xs[b] = quantize_f32_block_i8_32(src, half);
+            }
+
+            for r in 0..4 {
+                let ql = &rows[r][ql_off[r]..ql_off[r] + 64];
+                let qh = &rows[r][qh_off[r]..qh_off[r] + 32];
+                let sc = &rows[r][sc_off[r]..sc_off[r] + 8];
+                let mut q_u = [[0u8; QK8_0]; 4];
+                for l in 0..QK8_0 {
+                    let ql0 = ql[l];
+                    let ql1 = ql[l + 32];
+                    let qh0 = qh[l];
+                    q_u[0][l] = ((ql0 & 0x0f) | ((qh0 & 0x03) << 4)) + 96;
+                    q_u[1][l] = ((ql1 & 0x0f) | (((qh0 >> 2) & 0x03) << 4)) + 96;
+                    q_u[2][l] = ((ql0 >> 4) | (((qh0 >> 4) & 0x03) << 4)) + 96;
+                    q_u[3][l] = ((ql1 >> 4) | (((qh0 >> 6) & 0x03) << 4)) + 96;
+                }
+
+                let mut acc = 0.0f32;
+                for b in 0..4 {
+                    if xs[b] == 0.0 {
+                        continue;
+                    }
+                    let s_lo = d[r] * sc[b * 2] as i8 as f32;
+                    let s_hi = d[r] * sc[b * 2 + 1] as i8 as f32;
+                    let dot_lo = scalar_dot_u8_i8(&q_u[b][..16], &xq[b][..16])
+                        - 128 * half_sum(&xq[b], false);
+                    let dot_hi = scalar_dot_u8_i8(&q_u[b][16..], &xq[b][16..])
+                        - 128 * half_sum(&xq[b], true);
+                    acc += xs[b] * (s_lo * dot_lo as f32 + s_hi * dot_hi as f32);
+                }
+                sums[r] += acc;
+            }
+            for r in 0..4 {
+                ql_off[r] += 64;
+                qh_off[r] += 32;
+                sc_off[r] += 8;
+            }
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
 pub(crate) fn validate_qk_mr4_once_x86(
     x: &[f32],
     mapped: &[u8],
@@ -6386,6 +6546,35 @@ pub(crate) fn validate_qk_mr4_once_x86(
         GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86(x, r0, r1, r2, r3, n),
         _ => unreachable!(),
     };
+    // Int8 (VNNI) kernels are compared against int8-aware references; the
+    // float references below would fail on activation-quantization error
+    // alone and disable the kernels (that gate is why AMD ran AVX2-float).
+    if x86_qk_mr4_dispatch_is_int8(ttype) {
+        let i8_ref = match ttype {
+            GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_i8_ref(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_i8_ref(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_i8_ref(x, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        };
+        let mut ok = true;
+        for i in 0..4 {
+            let a = mr4[i];
+            let b = i8_ref[i];
+            let tol = 1e-4f32 * b.abs().max(1.0);
+            if (a - b).abs() > tol {
+                ok = false;
+                break;
+            }
+        }
+        status.store(if ok { 1 } else { 2 }, AtomicOrdering::Relaxed);
+        if !ok && kernel_validation_warnings_enabled() {
+            eprintln!(
+                "Warning: disabling x86_64 MR4 kernel for type {} due to validation mismatch",
+                ttype
+            );
+        }
+        return ok;
+    }
     let scalar = match ttype {
         GGML_TYPE_Q2_K => [
             vec_dot_q2_k(x, r0, n),
@@ -9402,6 +9591,121 @@ pub(crate) fn matmul_quantized_batch_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Activations that the kernels' per-32-block Q8 quantization represents
+    // exactly: integers in [-127, 127] with abs-max 127 in every block, so
+    // scale = 1.0 and round(x * 127 / abs_max) == x. Under these inputs the
+    // int8-aware references must agree with the float scalar references to
+    // float-rounding precision, proving they implement the K-quant semantics
+    // rather than merely mirroring the SIMD kernels.
+    #[cfg(target_arch = "x86_64")]
+    fn i8_ref_test_activations(n: usize) -> Vec<f32> {
+        let mut x: Vec<f32> = (0..n)
+            .map(|i| (((i as i32 * 37 + 11) % 255) - 127) as f32)
+            .collect();
+        for b in 0..n / 32 {
+            x[b * 32] = 127.0;
+        }
+        x
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn i8_ref_test_row(len: usize, seed: usize) -> Vec<u8> {
+        (0..len)
+            .map(|k| ((k * 7 + 13 + seed * 31) % 251) as u8)
+            .collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4_k_i8_ref_matches_float_ref_on_exact_activations() {
+        let n = 2 * QK_K;
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+        let rows: Vec<Vec<u8>> = (0..4)
+            .map(|r| {
+                let mut row = i8_ref_test_row(2 * block_sz, r);
+                for blk in 0..2 {
+                    let off = blk * block_sz;
+                    // d = 0.25, dmin = 0.5: powers of two keep the float
+                    // reference exact so the comparison isolates semantics.
+                    row[off..off + 2].copy_from_slice(&0x3400u16.to_le_bytes());
+                    row[off + 2..off + 4].copy_from_slice(&0x3800u16.to_le_bytes());
+                }
+                row
+            })
+            .collect();
+        let x = i8_ref_test_activations(n);
+        let got = vec_dot_q4_k_4rows_i8_ref(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+        for r in 0..4 {
+            let want = vec_dot_q4_k(&x, &rows[r], n);
+            let tol = 1e-4f32 * want.abs().max(1.0);
+            assert!(
+                (got[r] - want).abs() <= tol,
+                "q4_k row {r}: i8_ref={} float_ref={want}",
+                got[r]
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q5_k_i8_ref_matches_float_ref_on_exact_activations() {
+        let n = 2 * QK_K;
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+        let rows: Vec<Vec<u8>> = (0..4)
+            .map(|r| {
+                let mut row = i8_ref_test_row(2 * block_sz, r);
+                for blk in 0..2 {
+                    let off = blk * block_sz;
+                    row[off..off + 2].copy_from_slice(&0x3400u16.to_le_bytes());
+                    row[off + 2..off + 4].copy_from_slice(&0x3800u16.to_le_bytes());
+                }
+                row
+            })
+            .collect();
+        let x = i8_ref_test_activations(n);
+        let got = vec_dot_q5_k_4rows_i8_ref(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+        for r in 0..4 {
+            let want = vec_dot_q5_k(&x, &rows[r], n);
+            let tol = 1e-4f32 * want.abs().max(1.0);
+            assert!(
+                (got[r] - want).abs() <= tol,
+                "q5_k row {r}: i8_ref={} float_ref={want}",
+                got[r]
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q6_k_i8_ref_matches_float_ref_on_exact_activations() {
+        let n = 2 * QK_K;
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
+        let d_off = QK_K / 2 + QK_K / 4 + QK_K / 16;
+        let rows: Vec<Vec<u8>> = (0..4)
+            .map(|r| {
+                let mut row = i8_ref_test_row(2 * block_sz, r);
+                for blk in 0..2 {
+                    let off = blk * block_sz + d_off;
+                    // d = 0.0625: signed i8 scales reach ±128, so a smaller
+                    // power of two keeps the accumulation exactly representable.
+                    row[off..off + 2].copy_from_slice(&0x2C00u16.to_le_bytes());
+                }
+                row
+            })
+            .collect();
+        let x = i8_ref_test_activations(n);
+        let got = vec_dot_q6_k_4rows_i8_ref(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+        for r in 0..4 {
+            let want = vec_dot_q6_k(&x, &rows[r], n);
+            let tol = 1e-4f32 * want.abs().max(1.0);
+            assert!(
+                (got[r] - want).abs() <= tol,
+                "q6_k row {r}: i8_ref={} float_ref={want}",
+                got[r]
+            );
+        }
+    }
 
     #[test]
     fn matmul_quantized_batch_matches_repeated_rows_for_f32_weights() {

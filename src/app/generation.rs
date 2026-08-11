@@ -4926,8 +4926,8 @@ impl ModelRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelRuntime, PrefixMatch, append_visible_text_with_stop_literals,
-        compute_think_caps, extract_first_complete_json_object, finalize_visible_think_tail,
+        ModelRuntime, PrefixMatch, append_visible_text_with_stop_literals, compute_think_caps,
+        extract_first_complete_json_object, finalize_visible_think_tail,
         find_first_complete_json_object_span, flush_visible_text_stop_tail,
         has_meaningful_retry_text, is_agent_json_safe_text, match_agent_response_prefix,
         promote_think_only_content, sanitize_final_response_text,
@@ -5009,9 +5009,15 @@ mod tests {
     #[test]
     fn compute_think_caps_uses_vendor_heuristic_without_override() {
         // qwen35 base 384, small model (28 layers), 16K context, ample budget.
-        assert_eq!(compute_think_caps(384, 28, 16_384, 8_000, None), (384, 1536));
+        assert_eq!(
+            compute_think_caps(384, 28, 16_384, 8_000, None),
+            (384, 1536)
+        );
         // 36 layers doubles the base.
-        assert_eq!(compute_think_caps(384, 36, 16_384, 8_000, None), (768, 3072));
+        assert_eq!(
+            compute_think_caps(384, 36, 16_384, 8_000, None),
+            (768, 3072)
+        );
     }
 
     #[test]

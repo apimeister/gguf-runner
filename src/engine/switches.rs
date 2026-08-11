@@ -105,8 +105,6 @@ static X86_QK_MR4_CFG: OnceLock<bool> = OnceLock::new();
 static X86_AVXVNNI_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_AVX512VNNI_Q8_CFG: OnceLock<bool> = OnceLock::new();
-#[cfg(target_arch = "x86_64")]
-static X86_IS_AMD_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "aarch64")]
 pub(crate) static AARCH64_Q2K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 #[cfg(target_arch = "aarch64")]
@@ -323,22 +321,6 @@ pub(crate) fn use_x86_avx512_vnni_q8() -> bool {
     *X86_AVX512VNNI_Q8_CFG.get_or_init(|| {
         std::arch::is_x86_feature_detected!("avx512vnni")
             && std::arch::is_x86_feature_detected!("avx512vl")
-    })
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-pub(crate) fn is_x86_amd() -> bool {
-    *X86_IS_AMD_CFG.get_or_init(|| {
-        use std::arch::x86_64::__cpuid;
-
-        // CPUID vendor string is EBX, EDX, ECX for leaf 0.
-        let leaf0 = unsafe { __cpuid(0) };
-        let mut vendor = [0u8; 12];
-        vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
-        vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
-        vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
-        vendor == *b"AuthenticAMD"
     })
 }
 
