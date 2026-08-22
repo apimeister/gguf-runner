@@ -1545,6 +1545,13 @@ fn rebuild_rope_cache(p: &Config, s: &mut RunState, pos: usize, is_swa_layer: bo
 }
 
 pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
+    malloc_run_state_with_kv_cache_format(p, None)
+}
+
+pub(crate) fn malloc_run_state_with_kv_cache_format(
+    p: &Config,
+    format_override: Option<KvCacheFormat>,
+) -> Result<RunState, String> {
     let head_size = if p.head_dim > 0 {
         p.head_dim
     } else {
@@ -1630,7 +1637,10 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         .ok_or_else(|| "overflow while computing turbo kv aux size".to_string())?;
     let kv_cache_scale_len = kv_cache_block_scale_len.max(kv_cache_head_aux_len);
 
-    let requested_mode = kv_cache_mode();
+    let requested_format = format_override.unwrap_or_else(|| match kv_cache_mode() {
+        SwitchKvCacheMode::Q8 => KvCacheFormat::Q8,
+        SwitchKvCacheMode::Turbo => KvCacheFormat::Turbo,
+    });
     let (
         kv_cache_format,
         key_cache_q8,
@@ -1639,8 +1649,8 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         value_cache_turbo_base,
         key_cache_turbo_sign,
         value_cache_turbo_sign,
-    ) = match requested_mode {
-        SwitchKvCacheMode::Q8 => {
+    ) = match requested_format {
+        KvCacheFormat::Q8 => {
             let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
             let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
             (
@@ -1653,7 +1663,7 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
                 Vec::new(),
             )
         }
-        SwitchKvCacheMode::Turbo => {
+        KvCacheFormat::Turbo => {
             let key_base = alloc_u8(kv_cache_turbo_base_len, "Turbo key base cache")?;
             let value_base = alloc_u8(kv_cache_turbo_base_len, "Turbo value base cache")?;
             let key_sign = alloc_u8(kv_cache_turbo_sign_len, "Turbo key residual cache")?;
@@ -2661,7 +2671,17 @@ fn bmm_prefill(
     Ok(())
 }
 
-/// Batched prefill: run `tokens` (at positions `base_pos..base_pos + tokens.len()`)
+/// One prefill position: either a vocabulary token or an embedding produced by
+/// a multimodal encoder. Mirrors [`TransformerInput`] so the batched and
+/// sequential paths accept the same prompt shapes — without this, any prompt
+/// carrying audio or image embeddings had to fall back to per-token prefill.
+#[derive(Clone, Copy)]
+pub(crate) enum PrefillInput<'a> {
+    Token(usize),
+    Embedding(&'a [f32]),
+}
+
+/// Batched prefill: run `inputs` (at positions `base_pos..base_pos + inputs.len()`)
 /// through all layers, writing their KV-cache rows. Computes no logits — the
 /// caller runs the final prompt token through the sequential path.
 ///
@@ -2675,8 +2695,12 @@ fn bmm_prefill(
 /// tolerance-level equivalent on K-quant tensors. Causality holds because
 /// token `i`'s K/V row is written inside its own attention step before any
 /// later token attends.
+///
+/// Injected embeddings must already be `p.dim` wide. Deepstack prompts (whose
+/// embeddings carry a per-layer tail) are rejected here and stay on the
+/// sequential path.
 pub(crate) fn transformer_prefill_batch(
-    tokens: &[usize],
+    inputs: &[PrefillInput<'_>],
     base_pos: usize,
     p: &Config,
     s: &mut RunState,
@@ -2684,7 +2708,7 @@ pub(crate) fn transformer_prefill_batch(
     mapped: &[u8],
     scratch: &mut PrefillScratch,
 ) -> Result<(), String> {
-    let m = tokens.len();
+    let m = inputs.len();
     if m == 0 {
         return Ok(());
     }
@@ -2700,12 +2724,28 @@ pub(crate) fn transformer_prefill_batch(
     };
     scratch.ensure(m, dim, q_dim, kv_dim, hidden_dim);
 
-    for (i, &tok) in tokens.iter().enumerate() {
-        if tok >= p.vocab_size {
-            return Err(format!("token id out of bounds: {tok}"));
+    for (i, input) in inputs.iter().enumerate() {
+        let destination = &mut scratch.x[i * dim..(i + 1) * dim];
+        match *input {
+            PrefillInput::Token(tok) => {
+                if tok >= p.vocab_size {
+                    return Err(format!("token id out of bounds: {tok}"));
+                }
+                destination.copy_from_slice(&w.token_embedding_table[tok * dim..(tok + 1) * dim]);
+            }
+            PrefillInput::Embedding(embedding) => {
+                // The sequential path copies a `dim`-wide embedding straight
+                // into the residual stream with no scaling; match it exactly.
+                if embedding.len() != dim {
+                    return Err(format!(
+                        "batched prefill embedding length mismatch at position {}: got {}, expected {dim}",
+                        base_pos + i,
+                        embedding.len()
+                    ));
+                }
+                destination.copy_from_slice(embedding);
+            }
         }
-        scratch.x[i * dim..(i + 1) * dim]
-            .copy_from_slice(&w.token_embedding_table[tok * dim..(tok + 1) * dim]);
     }
 
     let mut matmul_scratch = MatmulActivationScratch::new();

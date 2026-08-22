@@ -1,4 +1,4 @@
-use crate::engine::io::{get_gguf_int_from_map, get_gguf_string_from_map};
+use crate::engine::io::{get_gguf_bool_from_map, get_gguf_int_from_map, get_gguf_string_from_map};
 use crate::engine::types::{
     Config, GGUFFile, GgufValue, LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN, LLAMA3_EOT,
     LLAMA3_START_HEADER, Tokenizer, TokenizerPreType, VendorTokenizerPolicy,
@@ -983,6 +983,8 @@ pub(crate) fn init_tokenizer_from_gguf(
         Some(GgufValue::Int(v)) => *v as i32,
         _ => -1,
     };
+    tokenizer.skip_bos_token =
+        !get_gguf_bool_from_map(&gguf.kv, "tokenizer.ggml.add_bos_token", true);
     tokenizer.eos_token = get_gguf_int_from_map(
         &gguf.kv,
         "tokenizer.ggml.eos_token_id",
@@ -1376,6 +1378,7 @@ mod tests {
             vocab_size: seen.len(),
             max_token_length: 8,
             bos_token: -1,
+            skip_bos_token: false,
             eos_token: -1,
             start_header_token: -1,
             end_header_token: -1,
@@ -1423,6 +1426,7 @@ mod tests {
             vocab_size: seen.len(),
             max_token_length: 8,
             bos_token: -1,
+            skip_bos_token: false,
             eos_token: -1,
             start_header_token: -1,
             end_header_token: -1,

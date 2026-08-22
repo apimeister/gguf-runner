@@ -317,6 +317,68 @@ In REPL mode, attach images with the `/image` command before your prompt:
 
 If required multimodal tensors/components are missing, the runner fails fast with a clear error.
 
+## Audio Transcription
+
+Qwen3-ASR supports offline transcription of finite audio files. Place the matching
+`mmproj-Qwen3-ASR-*.gguf` sidecar next to the text model; it is discovered automatically.
+
+```bash
+gguf-runner \
+  --model ./Qwen3-ASR-0.6B-Q8_0.gguf \
+  --audio ./speech.wav
+```
+
+`--prompt` is treated as transcription context (for names or domain terms), and
+`--audio-language English` optionally forces a supported language. The transcript is written to
+stdout; progress, debug, and timing output stays on stderr.
+
+Input is RIFF/WAVE with integer PCM (8/16/24/32-bit) or IEEE float (32/64-bit) samples, at any
+channel count and sample rate, including the extensible header that writers use above two channels
+or 16 bits. Any other container converts first:
+
+```bash
+ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le speech.wav
+```
+
+For a serial offline batch with one model load, pass a JSONL manifest:
+
+```json
+{"id":"meeting-001","path":"audio/meeting.wav","language":"English","context":"Project names: Everlock, Balder"}
+{"id":"meeting-002","path":"audio/interview.wav"}
+```
+
+```bash
+gguf-runner \
+  --model ./Qwen3-ASR-0.6B-Q8_0.gguf \
+  --audio-batch ./batch.jsonl > results.jsonl
+```
+
+The complete manifest schema is checked before the model is loaded. Audio paths relative to the
+manifest resolve from its directory. Results remain in input order and are flushed one JSON object
+per line; failed items produce `status:"error"`, processing continues, and the command exits
+nonzero after the batch if any item failed. REPL audio is not implemented. Embedded callers can
+reuse one loaded `EmbeddedRuntime` across files via `transcribe_audio(...)`.
+
+### Audio performance notes
+
+Transcription cost is dominated by the language model, not by audio decoding — roughly 80% prefill
+and 20% decode. Qwen3-ASR turns one second of audio into about 13 prompt tokens, and prefill
+attention grows with the square of that token count, so cost per second of audio climbs with file
+length. Past roughly four minutes of audio, attention rather than matmul is the limit.
+
+Two practical consequences:
+
+- **Long files are disproportionately expensive.** Splitting a long recording into shorter files and
+  running them through `--audio-batch` keeps each context small. The trade is duplicated wording at
+  segment boundaries and no cross-segment context, so pick boundaries on silence where you can.
+- **`--context-size` is worth setting for batch jobs.** The KV cache is sized from the model's
+  context length rather than the prompt, and it is allocated per item. Capping it to what the
+  longest clip actually needs (about `13 * seconds + 700`) avoids repeatedly reserving gigabytes.
+
+Weight quantization also matters more than usual here: prefill batches efficiently for K-quant
+models (Q4_K, Q5_K, Q6_K) but falls back to a per-token path for Q8_0, so a K-quant build of the
+same model prefills noticeably faster. See `docs/performance.md` for measurements.
+
 ## Project Scope
 
 - CPU inference only

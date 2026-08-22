@@ -2,20 +2,24 @@ use crate::app::events::{
     RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress, emit_runtime_event,
 };
 use crate::cli::CliOptions;
+use crate::engine::audio::{
+    load_audio_chunk_samples, prepare_audios_for_multimodal, probe_audios_for_multimodal,
+};
 use crate::engine::io::{get_gguf_string_from_map, parse_gguf_file};
 use crate::engine::kernels::{TopKSampler, argmax, sample, softmax};
 use crate::engine::multimodal::{
-    VisionEncoder, build_vision_encoder_from_mmproj, expand_prompt_with_image_embeddings,
+    AudioEncoder, MediaEmbeddingSequence, VisionEncoder, build_audio_encoder_from_mmproj,
+    build_vision_encoder_from_mmproj, expand_prompt_with_media_embeddings, preflight_media_context,
 };
 use crate::engine::profiling::{PROF_TRANSFORMER_NS, prof_end, prof_start, record_forward_pass};
 use crate::engine::types::{
-    Config, ContentPart, EncodedPrompt, GGUFFile, GenerationRequest, MediaRef, MultimodalBackend,
-    MultimodalWeights, PlaceholderSpan, ThinkMode, Tokenizer, TransformerWeights, XorShiftRng,
+    AudioEncoderBackend, AudioTranscriptionResult, Config, ContentPart, EncodedPrompt, GGUFFile,
+    GenerationRequest, MediaRef, MultimodalBackend, MultimodalWeights, PlaceholderSpan, ThinkMode,
+    Tokenizer, TransformerWeights, XorShiftRng,
 };
 use crate::engine::vision::{
-    ImageNormalization, ImagePreprocessProfile, ImageResizeMode, load_audio_chunk_samples,
-    load_video_chunk_tensors, prepare_audios_for_multimodal, prepare_images_for_multimodal,
-    prepare_videos_for_multimodal,
+    ImageNormalization, ImagePreprocessProfile, ImageResizeMode, load_video_chunk_tensors,
+    prepare_images_for_multimodal, prepare_videos_for_multimodal,
 };
 use crate::rag::{DocumentEncoder, RagIndex, prepend_rag_context};
 use image::{ImageFormat, ImageReader};
@@ -1461,7 +1465,7 @@ struct MmprojSidecarProbe {
     path: String,
     has_vision_encoder: bool,
     has_vision_projector: bool,
-    has_audio_encoder: bool,
+    audio_backend: Option<AudioEncoderBackend>,
     n_tensors: u64,
 }
 
@@ -1550,9 +1554,14 @@ pub(crate) struct ModelRuntime {
     mmproj_sidecar: Option<MmprojSidecarProbe>,
     mmproj_candidates: Vec<String>,
     vision_encoder: Option<VisionEncoder>,
+    audio_encoder: Option<AudioEncoder>,
     document_encoder: Option<DocumentEncoder>,
     rag_index: Option<RagIndex>,
+    kv_cache_format_override: Option<crate::engine::types::KvCacheFormat>,
     kv_cache_format_logged: bool,
+    /// Whether the last decode consumed its entire token budget, which means it
+    /// stopped at the limit instead of at a stop token.
+    last_decode_used_full_token_budget: bool,
     prefill_cache: Option<crate::app::prefill_cache::PrefixCache>,
     prefill_cache_warned: bool,
 }
@@ -1561,9 +1570,11 @@ impl ModelRuntime {
     const DEFAULT_VIDEO_SAMPLED_FPS: u32 = 1;
     const MAX_VIDEO_DECODED_FRAMES: usize = 3600;
     const VIDEO_CHUNK_SIZE_FRAMES: usize = 32;
-    const AUDIO_TARGET_SAMPLE_RATE: u32 = 16_000;
-    const AUDIO_MAX_SAMPLES: usize = 16_000 * 3600;
-    const AUDIO_CHUNK_SIZE_SAMPLES: usize = 16_000 * 30;
+    const MEDIA_DECODE_RESERVE_TOKENS: usize = 256;
+    /// Upper bound of the decode budget reserved for audio requests. It covers
+    /// the vendor transcription cap so a request that passes context preflight
+    /// cannot lose transcript text to the context limit instead.
+    const AUDIO_DECODE_RESERVE_TOKENS: usize = 512;
     const VISION_ENCODER_TENSOR_PREFIXES: &'static [&'static str] = &[
         "v.",
         "vision.",
@@ -1584,8 +1595,15 @@ impl ModelRuntime {
         "vision_language_adapter.",
         "model.vision_language_adapter.",
     ];
-    const AUDIO_TENSOR_PREFIXES: &'static [&'static str] =
-        &["audio.", "aud.", "speech.", "whisper.", "model.audio."];
+    const AUDIO_TENSOR_PREFIXES: &'static [&'static str] = &[
+        "a.",
+        "mm.a.",
+        "audio.",
+        "aud.",
+        "speech.",
+        "whisper.",
+        "model.audio.",
+    ];
 
     fn model_architecture(&self) -> &str {
         get_gguf_string_from_map(&self.gguf.kv, "general.architecture").unwrap_or("unknown")
@@ -1638,7 +1656,9 @@ impl ModelRuntime {
     fn has_audio_tokens(&self) -> bool {
         match self.config.capabilities.multimodal_backend {
             MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
-                self.has_vocab_token("<|audio_pad|>")
+                self.has_vocab_token("<|audio_start|>")
+                    && self.has_vocab_token("<|audio_pad|>")
+                    && self.has_vocab_token("<|audio_end|>")
             }
             MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 | MultimodalBackend::None => {
                 false
@@ -1657,13 +1677,6 @@ impl ModelRuntime {
             .unwrap_or(false)
     }
 
-    fn supports_external_audio(&self) -> bool {
-        self.mmproj_sidecar
-            .as_ref()
-            .map(|probe| probe.has_audio_encoder)
-            .unwrap_or(false)
-    }
-
     fn ensure_external_multimodal_initialized(
         &mut self,
         image_count: usize,
@@ -1676,7 +1689,12 @@ impl ModelRuntime {
         if self.config.capabilities.multimodal_backend == MultimodalBackend::None {
             return Ok(());
         }
-        if self.mmproj_sidecar.is_some() && self.vision_encoder.is_some() {
+        let vision_requested = image_count > 0 || video_count > 0;
+        let audio_requested = audio_count > 0;
+        if self.mmproj_sidecar.is_some()
+            && (!vision_requested || self.vision_encoder.is_some())
+            && (!audio_requested || self.audio_encoder.is_some())
+        {
             return Ok(());
         }
 
@@ -1692,16 +1710,23 @@ impl ModelRuntime {
                 emit_debug_line(
                     event_callback,
                     format!(
-                        "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, audio={}",
+                        "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, audio_backend={}",
                         probe.path,
                         probe.n_tensors,
                         probe.has_vision_encoder,
                         probe.has_vision_projector,
-                        probe.has_audio_encoder
+                        probe
+                            .audio_backend
+                            .map(AudioEncoderBackend::as_str)
+                            .unwrap_or("none")
                     ),
                 );
             }
-            if self.vision_encoder.is_none() && (image_count > 0 || video_count > 0) {
+            if self.vision_encoder.is_none()
+                && vision_requested
+                && probe.has_vision_encoder
+                && probe.has_vision_projector
+            {
                 let mmproj = parse_gguf_file(&probe.path, debug_mode).map_err(|e| {
                     format!(
                         "failed to load llama-style mmproj sidecar '{}' for multimodal backend initialization: {e}",
@@ -1709,6 +1734,33 @@ impl ModelRuntime {
                     )
                 })?;
                 self.vision_encoder = build_vision_encoder_from_mmproj(&self.config, mmproj)?;
+            }
+            if self.audio_encoder.is_none()
+                && audio_requested
+                && let Some(audio_backend) = probe.audio_backend
+            {
+                let mmproj = parse_gguf_file(&probe.path, debug_mode).map_err(|e| {
+                    format!(
+                        "failed to load llama-style audio mmproj sidecar '{}': {e}",
+                        probe.path
+                    )
+                })?;
+                let encoder = build_audio_encoder_from_mmproj(
+                    audio_backend,
+                    self.config.input_embedding_dim,
+                    mmproj,
+                )?;
+                if debug_mode {
+                    emit_debug_line(
+                        event_callback,
+                        format!(
+                            "Loaded audio sidecar weight contract: {} (execution_ready={})",
+                            encoder.contract_summary(),
+                            encoder.execution_ready()
+                        ),
+                    );
+                }
+                self.audio_encoder = Some(encoder);
             }
         } else if debug_mode && !self.mmproj_candidates.is_empty() {
             emit_debug_line(
@@ -1734,19 +1786,32 @@ impl ModelRuntime {
     }
 
     fn effective_supports_audio(&self) -> bool {
-        self.config.capabilities.supports_native_audio
-            || (self.has_audio_tokens() && self.supports_external_audio())
+        self.has_audio_tokens()
+            && (self.config.capabilities.supports_native_audio
+                || self
+                    .audio_encoder
+                    .as_ref()
+                    .map(AudioEncoder::execution_ready)
+                    .unwrap_or(false))
     }
 
     fn mmproj_summary(&self) -> String {
         if let Some(probe) = &self.mmproj_sidecar {
             format!(
-                "mmproj(path='{}', n_tensors={}, vision_encoder={}, vision_projector={}, audio={})",
+                "mmproj(path='{}', n_tensors={}, vision_encoder={}, vision_projector={}, audio_backend={}, audio_encoder_loaded={}, audio_execution_ready={})",
                 probe.path,
                 probe.n_tensors,
                 probe.has_vision_encoder,
                 probe.has_vision_projector,
-                probe.has_audio_encoder
+                probe
+                    .audio_backend
+                    .map(AudioEncoderBackend::as_str)
+                    .unwrap_or("none"),
+                self.audio_encoder.is_some(),
+                self.audio_encoder
+                    .as_ref()
+                    .map(AudioEncoder::execution_ready)
+                    .unwrap_or(false),
             )
         } else if self.mmproj_candidates.is_empty() {
             "mmproj(path=not-searched)".to_string()
@@ -2012,32 +2077,19 @@ impl ModelRuntime {
                     continue;
                 }
             };
-            let probe = MmprojSidecarProbe {
-                path: sidecar_path.clone(),
-                has_vision_encoder: Self::gguf_has_tensor_with_any_prefix(
-                    &sidecar,
-                    Self::VISION_ENCODER_TENSOR_PREFIXES,
-                ),
-                has_vision_projector: Self::gguf_has_tensor_with_any_prefix(
-                    &sidecar,
-                    Self::VISION_PROJECTOR_TENSOR_PREFIXES,
-                ),
-                has_audio_encoder: Self::gguf_has_tensor_with_any_prefix(
-                    &sidecar,
-                    Self::AUDIO_TENSOR_PREFIXES,
-                ),
-                n_tensors: sidecar.n_tensors,
-            };
-            if let Err(e) = crate::vendors::validate_mmproj_for_backend(cfg, &sidecar) {
-                if debug_mode {
-                    eprintln!(
-                        "Skipping mmproj sidecar '{}': not compatible with backend '{}' ({e})",
-                        sidecar_path,
-                        cfg.capabilities.multimodal_backend.as_str()
-                    );
+            let audio_backend = match crate::vendors::validate_mmproj_for_backend(cfg, &sidecar) {
+                Ok(audio_backend) => audio_backend,
+                Err(e) => {
+                    if debug_mode {
+                        eprintln!(
+                            "Skipping mmproj sidecar '{}': not compatible with backend '{}' ({e})",
+                            sidecar_path,
+                            cfg.capabilities.multimodal_backend.as_str()
+                        );
+                    }
+                    continue;
                 }
-                continue;
-            }
+            };
             if let Err(e) = Self::validate_mmproj_variant_match(checkpoint, &sidecar_path, &sidecar)
             {
                 if debug_mode {
@@ -2048,6 +2100,24 @@ impl ModelRuntime {
                 }
                 continue;
             }
+            // Qwen3-ASR projector tensors use `mm.a.*`, which also matches the legacy
+            // broad `mm.*` vision-projector prefix. The validated audio contract is
+            // audio-only, so do not misreport that overlap as a vision component.
+            let probe = MmprojSidecarProbe {
+                path: sidecar_path.clone(),
+                has_vision_encoder: audio_backend.is_none()
+                    && Self::gguf_has_tensor_with_any_prefix(
+                        &sidecar,
+                        Self::VISION_ENCODER_TENSOR_PREFIXES,
+                    ),
+                has_vision_projector: audio_backend.is_none()
+                    && Self::gguf_has_tensor_with_any_prefix(
+                        &sidecar,
+                        Self::VISION_PROJECTOR_TENSOR_PREFIXES,
+                    ),
+                audio_backend,
+                n_tensors: sidecar.n_tensors,
+            };
             return Ok((Some(probe), candidate_strings));
         }
         Ok((None, candidate_strings))
@@ -2193,6 +2263,18 @@ impl ModelRuntime {
         }
 
         Ok(())
+    }
+
+    fn media_decode_reserve(&self) -> usize {
+        self.settings
+            .max_tokens
+            .clamp(1, Self::MEDIA_DECODE_RESERVE_TOKENS)
+    }
+
+    fn audio_decode_reserve(&self) -> usize {
+        self.settings
+            .max_tokens
+            .clamp(1, Self::AUDIO_DECODE_RESERVE_TOKENS)
     }
 
     fn image_preprocess_profile(&self) -> ImagePreprocessProfile {
@@ -2374,6 +2456,8 @@ impl ModelRuntime {
         Ok(GenerationRequest {
             system_prompt: request.system_prompt.clone(),
             parts,
+            include_empty_system_prompt: request.include_empty_system_prompt,
+            assistant_prefill: request.assistant_prefill.clone(),
         })
     }
 
@@ -2445,7 +2529,7 @@ impl ModelRuntime {
     ///
     /// Prefer this over `load_from_bytes` when the model is too large to embed
     /// at compile time (e.g. vision models).  The real `checkpoint_path` is
-    /// recorded so that mmproj sidecar discovery works when the first image
+    /// recorded so that mmproj sidecar discovery works when the first media
     /// request arrives — the sidecar is initialised lazily on demand.
     pub(crate) fn load_from_file(path: &std::path::Path, debug_mode: bool) -> Result<Self, String> {
         use crate::engine::io::parse_gguf_file;
@@ -2509,31 +2593,59 @@ impl ModelRuntime {
             weights,
             settings,
             multimodal_weights,
-            // mmproj sidecar is probed lazily the first time an image is provided.
+            // mmproj sidecar is probed lazily the first time media is provided.
             mmproj_sidecar: None,
             mmproj_candidates: Vec::new(),
             vision_encoder: None,
+            audio_encoder: None,
             document_encoder: None,
             rag_index: None,
+            kv_cache_format_override: None,
             kv_cache_format_logged: false,
+            last_decode_used_full_token_budget: false,
             prefill_cache: None,
             prefill_cache_warned: false,
         })
     }
 
-    /// Load the mmproj vision projector from bytes embedded in the binary.
+    /// Load a multimodal projector from bytes embedded in the binary.
     ///
     /// Call this once after [`load_from_bytes`](Self::load_from_bytes) to enable
-    /// image inference without needing a sidecar file on disk.  Has no effect if
-    /// a vision encoder is already loaded.
+    /// sidecar-backed media without needing a file on disk. Audio weight-contract
+    /// loading is supported, but audio execution remains unavailable.
     pub(crate) fn load_mmproj_from_bytes(&mut self, data: &'static [u8]) -> Result<(), String> {
-        if self.vision_encoder.is_some() {
+        if self.vision_encoder.is_some() || self.audio_encoder.is_some() {
             return Ok(());
         }
         use crate::engine::io::parse_gguf_from_bytes;
         let mmproj = parse_gguf_from_bytes(data, false)
             .map_err(|e| format!("failed to parse embedded mmproj: {e}"))?;
-        self.vision_encoder = build_vision_encoder_from_mmproj(&self.config, mmproj)?;
+        let audio_backend = crate::vendors::validate_mmproj_for_backend(&self.config, &mmproj)
+            .map_err(|e| format!("embedded mmproj is not compatible with the text model: {e}"))?;
+        let n_tensors = mmproj.n_tensors;
+        let has_vision_encoder = audio_backend.is_none()
+            && Self::gguf_has_tensor_with_any_prefix(&mmproj, Self::VISION_ENCODER_TENSOR_PREFIXES);
+        let has_vision_projector = audio_backend.is_none()
+            && Self::gguf_has_tensor_with_any_prefix(
+                &mmproj,
+                Self::VISION_PROJECTOR_TENSOR_PREFIXES,
+            );
+        if let Some(backend) = audio_backend {
+            self.audio_encoder = Some(build_audio_encoder_from_mmproj(
+                backend,
+                self.config.input_embedding_dim,
+                mmproj,
+            )?);
+        } else {
+            self.vision_encoder = build_vision_encoder_from_mmproj(&self.config, mmproj)?;
+        }
+        self.mmproj_sidecar = Some(MmprojSidecarProbe {
+            path: "<embedded>".to_string(),
+            has_vision_encoder,
+            has_vision_projector,
+            audio_backend,
+            n_tensors,
+        });
         Ok(())
     }
 
@@ -2608,9 +2720,12 @@ impl ModelRuntime {
             mmproj_sidecar: None,
             mmproj_candidates: Vec::new(),
             vision_encoder: None,
+            audio_encoder: None,
             document_encoder: None,
             rag_index: None,
+            kv_cache_format_override: None,
             kv_cache_format_logged: false,
+            last_decode_used_full_token_budget: false,
             prefill_cache: None,
             prefill_cache_warned: false,
         })
@@ -2660,8 +2775,8 @@ impl ModelRuntime {
             debug_mode,
         )?;
         tokenizer.use_sentencepiece = config.is_gemma3;
-        let media_requested =
-            !cli.images.is_empty() || !cli.videos.is_empty() || !cli.audios.is_empty();
+        let vision_requested = !cli.images.is_empty() || !cli.videos.is_empty();
+        let media_requested = vision_requested || !cli.audios.is_empty();
         let (mmproj_sidecar, mmproj_candidates) = if media_requested
             && config.capabilities.multimodal_backend != MultimodalBackend::None
         {
@@ -2675,12 +2790,15 @@ impl ModelRuntime {
         {
             if let Some(probe) = &mmproj_sidecar {
                 eprintln!(
-                    "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, audio={}",
+                    "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, audio_backend={}",
                     probe.path,
                     probe.n_tensors,
                     probe.has_vision_encoder,
                     probe.has_vision_projector,
-                    probe.has_audio_encoder
+                    probe
+                        .audio_backend
+                        .map(AudioEncoderBackend::as_str)
+                        .unwrap_or("none")
                 );
             } else if !mmproj_candidates.is_empty() {
                 eprintln!(
@@ -2690,15 +2808,50 @@ impl ModelRuntime {
             }
         }
 
-        let vision_encoder = if media_requested {
+        let vision_encoder = if vision_requested {
             if let Some(probe) = &mmproj_sidecar {
-                let mmproj = parse_gguf_file(&probe.path, debug_mode).map_err(|e| {
-                    format!(
-                        "failed to load llama-style mmproj sidecar '{}' for multimodal backend initialization: {e}",
-                        probe.path
-                    )
-                })?;
-                build_vision_encoder_from_mmproj(&config, mmproj)?
+                if probe.has_vision_encoder && probe.has_vision_projector {
+                    let mmproj = parse_gguf_file(&probe.path, debug_mode).map_err(|e| {
+                        format!(
+                            "failed to load llama-style mmproj sidecar '{}' for multimodal backend initialization: {e}",
+                            probe.path
+                        )
+                    })?;
+                    build_vision_encoder_from_mmproj(&config, mmproj)?
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let audio_encoder = if !cli.audios.is_empty() {
+            if let Some(probe) = &mmproj_sidecar {
+                if let Some(audio_backend) = probe.audio_backend {
+                    let mmproj = parse_gguf_file(&probe.path, debug_mode).map_err(|e| {
+                        format!(
+                            "failed to load llama-style audio mmproj sidecar '{}': {e}",
+                            probe.path
+                        )
+                    })?;
+                    let encoder = build_audio_encoder_from_mmproj(
+                        audio_backend,
+                        config.input_embedding_dim,
+                        mmproj,
+                    )?;
+                    if debug_mode {
+                        eprintln!(
+                            "Loaded audio sidecar weight contract: {} (execution_ready={})",
+                            encoder.contract_summary(),
+                            encoder.execution_ready()
+                        );
+                    }
+                    Some(encoder)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -2841,9 +2994,12 @@ impl ModelRuntime {
             mmproj_sidecar,
             mmproj_candidates,
             vision_encoder,
+            audio_encoder,
             document_encoder,
             rag_index,
+            kv_cache_format_override: None,
             kv_cache_format_logged: false,
+            last_decode_used_full_token_budget: false,
             prefill_cache: None,
             prefill_cache_warned: false,
         })
@@ -2914,9 +3070,9 @@ impl ModelRuntime {
             let mut base = 0usize;
             while base < tokens.len() {
                 let take = chunk.min(tokens.len() - base);
-                let toks: Vec<usize> = tokens[base..base + take]
+                let toks: Vec<crate::engine::runtime::PrefillInput<'_>> = tokens[base..base + take]
                     .iter()
-                    .map(|&t| t as usize)
+                    .map(|&t| crate::engine::runtime::PrefillInput::Token(t as usize))
                     .collect();
                 crate::engine::runtime::transformer_prefill_batch(
                     &toks,
@@ -3114,6 +3270,8 @@ impl ModelRuntime {
                     .map(|msg| msg.content.clone())
                     .unwrap_or_default(),
             )],
+            include_empty_system_prompt: false,
+            assistant_prefill: None,
         };
         self.retry_without_think_for_request(output, &request, false)
     }
@@ -3324,6 +3482,90 @@ impl ModelRuntime {
         request: &GenerationRequest,
         stream_stdout: bool,
     ) -> Result<String, String> {
+        self.generate_request_with_rag(request, stream_stdout, true)
+    }
+
+    pub(crate) fn transcribe_audio(
+        &mut self,
+        audio_path: &str,
+        context: &str,
+        language: Option<&str>,
+    ) -> Result<AudioTranscriptionResult, String> {
+        self.ensure_external_multimodal_initialized(0, 0, 1)?;
+        let audio_backend = self
+            .audio_encoder
+            .as_ref()
+            .map(AudioEncoder::backend)
+            .ok_or_else(|| {
+                format!(
+                    "audio transcription requires a supported audio encoder sidecar; {}",
+                    self.mmproj_summary()
+                )
+            })?;
+        let policy = crate::vendors::audio_transcription_policy(audio_backend);
+        let prepared = policy.build_request(audio_path, context, language)?;
+
+        let original_temperature = self.settings.temperature;
+        let original_top_k = self.settings.top_k;
+        let original_top_p = self.settings.top_p;
+        let original_repeat_penalty = self.settings.repeat_penalty;
+        let original_repeat_last_n = self.settings.repeat_last_n;
+        let original_max_tokens = self.settings.max_tokens;
+        let original_think_mode = self.settings.think_mode;
+        let original_show_tokens = self.settings.show_tokens;
+        let original_structured_output_mode = self.settings.structured_output_mode;
+        let original_decode_policy = self.settings.vendor_decode_policy;
+        let original_kv_cache_format_override = self.kv_cache_format_override;
+
+        self.settings.temperature = 0.0;
+        self.settings.top_k = 0;
+        self.settings.top_p = 1.0;
+        self.settings.repeat_penalty = 1.0;
+        self.settings.repeat_last_n = 0;
+        let decode_budget = original_max_tokens.clamp(1, policy.max_new_tokens);
+        self.settings.max_tokens = decode_budget;
+        self.settings.think_mode = ThinkMode::No;
+        self.settings.show_tokens = false;
+        self.settings.structured_output_mode = StructuredOutputMode::None;
+        self.settings.vendor_decode_policy = policy.decode_policy;
+        self.kv_cache_format_override = Some(policy.kv_cache_format);
+
+        // Transcription context is model input, not a retrieval query. Keep the
+        // official system-context/audio-only message shape even when RAG is loaded.
+        let output = self.generate_request_with_rag(&prepared.generation_request, false, false);
+
+        self.settings.temperature = original_temperature;
+        self.settings.top_k = original_top_k;
+        self.settings.top_p = original_top_p;
+        self.settings.repeat_penalty = original_repeat_penalty;
+        self.settings.repeat_last_n = original_repeat_last_n;
+        self.settings.max_tokens = original_max_tokens;
+        self.settings.think_mode = original_think_mode;
+        self.settings.show_tokens = original_show_tokens;
+        self.settings.structured_output_mode = original_structured_output_mode;
+        self.settings.vendor_decode_policy = original_decode_policy;
+        self.kv_cache_format_override = original_kv_cache_format_override;
+
+        if output.is_ok() && self.last_decode_used_full_token_budget {
+            emit_cli_info_line(
+                self.settings.runtime_event_callback.as_ref(),
+                format!(
+                    "Warning: transcript stopped at the {decode_budget}-token transcription limit for '{audio_path}'; it covers only the beginning of this audio. Split long recordings into shorter files.",
+                ),
+                false,
+                false,
+            );
+        }
+
+        output.map(|raw| policy.parse_output(&raw, prepared.forced_language.as_deref()))
+    }
+
+    fn generate_request_with_rag(
+        &mut self,
+        request: &GenerationRequest,
+        stream_stdout: bool,
+        allow_rag: bool,
+    ) -> Result<String, String> {
         let buffered_visible_think_stdout = should_buffer_visible_think_stdout(
             stream_stdout,
             self.settings.runtime_event_callback.is_some(),
@@ -3332,39 +3574,44 @@ impl ModelRuntime {
         );
         let effective_stream_stdout = stream_stdout && !buffered_visible_think_stdout;
         // RAG: augment system_prompt with retrieved context if an index is loaded.
-        let rag_augmented: Option<GenerationRequest>;
-        let request = if let (Some(enc), Some(idx)) =
-            (self.document_encoder.as_mut(), self.rag_index.as_ref())
-        {
-            let user_text: String = request
-                .parts
-                .iter()
-                .filter_map(|p| {
-                    if let ContentPart::Text(t) = p {
-                        Some(t.as_str())
-                    } else {
-                        None
-                    }
+        let rag_augmented = if allow_rag {
+            if let (Some(enc), Some(idx)) =
+                (self.document_encoder.as_mut(), self.rag_index.as_ref())
+            {
+                let user_text: String = request
+                    .parts
+                    .iter()
+                    .filter_map(|p| {
+                        if let ContentPart::Text(t) = p {
+                            Some(t.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let top_k = self.settings.rag_top_k;
+                let prefixed = if enc.query_prefix().is_empty() {
+                    user_text.clone()
+                } else {
+                    format!("{}{user_text}", enc.query_prefix())
+                };
+                let query_emb = enc.embed(&prefixed)?;
+                let chunks = idx.query(&query_emb, &user_text, top_k);
+                let new_system = prepend_rag_context(&chunks, &request.system_prompt);
+                Some(GenerationRequest {
+                    system_prompt: new_system,
+                    parts: request.parts.clone(),
+                    include_empty_system_prompt: request.include_empty_system_prompt,
+                    assistant_prefill: request.assistant_prefill.clone(),
                 })
-                .collect::<Vec<_>>()
-                .join(" ");
-            let top_k = self.settings.rag_top_k;
-            let prefixed = if enc.query_prefix().is_empty() {
-                user_text.clone()
             } else {
-                format!("{}{user_text}", enc.query_prefix())
-            };
-            let query_emb = enc.embed(&prefixed)?;
-            let chunks = idx.query(&query_emb, &user_text, top_k);
-            let new_system = prepend_rag_context(&chunks, &request.system_prompt);
-            rag_augmented = Some(GenerationRequest {
-                system_prompt: new_system,
-                parts: request.parts.clone(),
-            });
-            rag_augmented.as_ref().unwrap()
+                None
+            }
         } else {
-            request
+            None
         };
+        let request = rag_augmented.as_ref().unwrap_or(request);
 
         let effective_request = self.expand_request_for_vendor_detail_crop(request)?;
         let media_requested = effective_request.parts.iter().any(|part| {
@@ -3423,6 +3670,7 @@ impl ModelRuntime {
             if (!images.is_empty() || !videos.is_empty() || !audios.is_empty())
                 && self.multimodal_weights.is_none()
                 && self.vision_encoder.is_none()
+                && self.audio_encoder.is_none()
             {
                 return Err(format!(
                     "native media path selected but multimodal weights for backend '{}' were not initialized",
@@ -3473,8 +3721,64 @@ impl ModelRuntime {
                 );
             }
 
+            let mut planned_audio_token_counts = Vec::new();
+            if !audios.is_empty() {
+                let audio_encoder = self.audio_encoder.as_ref().ok_or_else(|| {
+                    "audio context preflight requires a loaded audio encoder sidecar".to_string()
+                })?;
+                let preprocess_config =
+                    crate::vendors::audio_preprocess_config(audio_encoder.backend());
+                let audio_plans = probe_audios_for_multimodal(&audios, preprocess_config)?;
+                planned_audio_token_counts = audio_plans
+                    .iter()
+                    .map(|plan| audio_encoder.planned_embedding_token_count(&plan.feature_windows))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let total_audio_tokens =
+                    planned_audio_token_counts
+                        .iter()
+                        .try_fold(0usize, |total, count| {
+                            total
+                                .checked_add(*count)
+                                .ok_or_else(|| "planned audio embedding count overflow".to_string())
+                        })?;
+                let total_target_samples = audio_plans.iter().try_fold(0usize, |total, plan| {
+                    total
+                        .checked_add(plan.target_sample_count)
+                        .ok_or_else(|| "planned audio sample count overflow".to_string())
+                })?;
+                let duration_seconds = total_target_samples as f64
+                    / f64::from(preprocess_config.decode.target_sample_rate);
+
+                if images.is_empty() && videos.is_empty() {
+                    preflight_media_context(
+                        &encoded_prompt,
+                        &[],
+                        &planned_audio_token_counts,
+                        self.config.seq_len,
+                        self.audio_decode_reserve(),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "audio context preflight failed for {} file(s), {:.2}s total, {total_audio_tokens} projected token(s): {error}",
+                            audio_plans.len(), duration_seconds
+                        )
+                    })?;
+                }
+                if self.settings.debug_mode {
+                    emit_debug_line(
+                        event_callback,
+                        format!(
+                            "Audio context plan: files={}, duration={duration_seconds:.2}s, projected_tokens={total_audio_tokens}, decode_reserve={}",
+                            audio_plans.len(),
+                            self.audio_decode_reserve()
+                        ),
+                    );
+                }
+            }
+
             let mut preprocess_summary: Vec<String> = Vec::new();
             let mut prepared_images = Vec::new();
+            let mut prepared_audios = Vec::new();
 
             if !images.is_empty() {
                 prepared_images = prepare_images_for_multimodal(&images, image_profile)?;
@@ -3531,54 +3835,83 @@ impl ModelRuntime {
                 preprocess_summary.push(format!("videos={}", prepared.len()));
             }
             if !audios.is_empty() {
-                let prepared = prepare_audios_for_multimodal(
-                    &audios,
-                    Self::AUDIO_TARGET_SAMPLE_RATE,
-                    Self::AUDIO_MAX_SAMPLES,
-                    Self::AUDIO_CHUNK_SIZE_SAMPLES,
-                )?;
+                let audio_encoder = self.audio_encoder.as_ref().ok_or_else(|| {
+                    "audio preprocessing requires a loaded audio encoder sidecar".to_string()
+                })?;
+                let preprocess_config =
+                    crate::vendors::audio_preprocess_config(audio_encoder.backend());
+                prepared_audios = prepare_audios_for_multimodal(&audios, preprocess_config)?;
                 if self.settings.debug_mode {
-                    let first = &prepared[0];
+                    let first = &prepared_audios[0];
                     let first_chunk_samples = if !first.chunks.is_empty() {
                         load_audio_chunk_samples(first, 0)?.len()
                     } else {
                         0
                     };
+                    let (
+                        first_feature_start,
+                        first_feature_valid,
+                        first_feature_padded,
+                        mel_bins,
+                        first_feature_elements,
+                    ) = first
+                        .feature_windows
+                        .first()
+                        .map_or((0, 0, 0, 0, 0), |window| {
+                            (
+                                window.start_frame,
+                                window.valid_frames,
+                                window.padded_frames,
+                                window.mel_bins,
+                                window.data_mel_major.len(),
+                            )
+                        });
                     emit_debug_line(
                         event_callback,
                         format!(
-                            "Prepared {} audio tensor(s); first audio: path='{}', sample_rate={}, channels={}, samples={}, chunks={}, first_chunk_samples={}",
-                            prepared.len(),
+                            "Prepared {} audio tensor(s); first audio: path='{}', source_rate={}, source_channels={}, sample_rate={}, channels={}, samples={}, chunks={}, feature_windows={}, first_feature_start={}, first_feature_valid={}, first_feature_padded={}, mel_bins={}, first_feature_elements={}, first_chunk_samples={}",
+                            prepared_audios.len(),
                             first.path,
+                            first.source_sample_rate,
+                            first.source_channels,
                             first.sample_rate,
                             first.channels,
                             first.total_samples,
                             first.chunks.len(),
+                            first.feature_windows.len(),
+                            first_feature_start,
+                            first_feature_valid,
+                            first_feature_padded,
+                            mel_bins,
+                            first_feature_elements,
                             first_chunk_samples
                         ),
                     );
                 }
-                preprocess_summary.push(format!("audios={}", prepared.len()));
+                preprocess_summary.push(format!("audios={}", prepared_audios.len()));
             }
 
             let mut prefill_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
             let mut prompt_tokens = encoded_prompt.token_ids.clone();
+            let mut image_embeddings = Vec::new();
 
             if !prepared_images.is_empty() {
                 let encoder = self.vision_encoder.as_ref().ok_or_else(|| {
-                let mmproj_note = self
-                    .mmproj_sidecar
-                    .as_ref()
-                    .map(|probe| format!(" (llama-style mmproj sidecar loaded: '{}')", probe.path))
-                    .unwrap_or_default();
-                format!(
-                    "native image preprocessing succeeded ({}), but no compatible native vision encoder is initialized for backend '{}'{}",
-                    preprocess_summary.join(", "),
-                    self.config.capabilities.multimodal_backend.as_str(),
-                    mmproj_note
-                )
-            })?;
-                let image_embeddings = encoder.encode_images(&prepared_images)?;
+                    let mmproj_note = self
+                        .mmproj_sidecar
+                        .as_ref()
+                        .map(|probe| {
+                            format!(" (llama-style mmproj sidecar loaded: '{}')", probe.path)
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "native image preprocessing succeeded ({}), but no compatible native vision encoder is initialized for backend '{}'{}",
+                        preprocess_summary.join(", "),
+                        self.config.capabilities.multimodal_backend.as_str(),
+                        mmproj_note
+                    )
+                })?;
+                image_embeddings = encoder.encode_images(&prepared_images)?;
                 if self.settings.debug_mode
                     && let Some(first) = image_embeddings.first()
                 {
@@ -3608,20 +3941,115 @@ impl ModelRuntime {
                         ),
                     );
                 }
-                let (expanded_tokens, injected) = expand_prompt_with_image_embeddings(
+            }
+
+            if !videos.is_empty() {
+                return Err(format!(
+                    "native media preprocessing completed ({}), but video embedding execution is not implemented yet",
+                    preprocess_summary.join(", ")
+                ));
+            }
+
+            let mut audio_embeddings = Vec::new();
+            if !prepared_audios.is_empty() {
+                let encoder = self.audio_encoder.as_ref().ok_or_else(|| {
+                    "audio preprocessing succeeded, but no audio encoder is initialized".to_string()
+                })?;
+                let debug_mode = self.settings.debug_mode;
+                audio_embeddings = prepared_audios
+                    .iter()
+                    .map(|audio| {
+                        let window_count = audio.feature_windows.len();
+                        // One encoder window covers eight seconds, so long files
+                        // spend minutes here. Report progress at most ten times.
+                        let progress_step = window_count.div_ceil(10).max(1);
+                        let mut tokens = Vec::new();
+                        for (index, window) in audio.feature_windows.iter().enumerate() {
+                            let encoded = encoder.encode_feature_window(window)?;
+                            tokens.extend(encoded.tokens);
+                            if debug_mode
+                                && (index + 1) % progress_step == 0
+                                && index + 1 < window_count
+                            {
+                                emit_debug_line(
+                                    event_callback,
+                                    format!(
+                                        "Encoding audio '{}': window {}/{window_count}, {} embedding token(s)",
+                                        audio.path,
+                                        index + 1,
+                                        tokens.len()
+                                    ),
+                                );
+                            }
+                        }
+                        Ok(MediaEmbeddingSequence { tokens })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let actual_audio_token_counts = audio_embeddings
+                    .iter()
+                    .map(|sequence| sequence.tokens.len())
+                    .collect::<Vec<_>>();
+                if actual_audio_token_counts != planned_audio_token_counts {
+                    return Err(format!(
+                        "audio encoder token count differs from preflight plan: planned={planned_audio_token_counts:?}, actual={actual_audio_token_counts:?}"
+                    ));
+                }
+                if self.settings.debug_mode
+                    && let Some(first) = audio_embeddings.first()
+                {
+                    let mut min_norm = f32::INFINITY;
+                    let mut max_norm = 0.0f32;
+                    let mut sum_norm = 0.0f32;
+                    for token in &first.tokens {
+                        let norm = token.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        min_norm = min_norm.min(norm);
+                        max_norm = max_norm.max(norm);
+                        sum_norm += norm;
+                    }
+                    let average_norm = if first.tokens.is_empty() {
+                        0.0
+                    } else {
+                        sum_norm / first.tokens.len() as f32
+                    };
+                    emit_debug_line(
+                        event_callback,
+                        format!(
+                            "audio embeddings: tokens={} norm(min/avg/max)={min_norm:.4}/{average_norm:.4}/{max_norm:.4}",
+                            first.tokens.len()
+                        ),
+                    );
+                }
+            }
+
+            if !image_embeddings.is_empty() || !audio_embeddings.is_empty() {
+                let image_token_counts = image_embeddings
+                    .iter()
+                    .map(|sequence| sequence.tokens.len())
+                    .collect::<Vec<_>>();
+                let audio_token_counts = audio_embeddings
+                    .iter()
+                    .map(|sequence| sequence.tokens.len())
+                    .collect::<Vec<_>>();
+                let decode_reserve = if audio_token_counts.is_empty() {
+                    self.media_decode_reserve()
+                } else {
+                    self.audio_decode_reserve()
+                };
+                preflight_media_context(
+                    &encoded_prompt,
+                    &image_token_counts,
+                    &audio_token_counts,
+                    self.config.seq_len,
+                    decode_reserve,
+                )?;
+                let (expanded_tokens, injected) = expand_prompt_with_media_embeddings(
                     &encoded_prompt,
                     &image_embeddings,
+                    &audio_embeddings,
                     self.config.input_embedding_dim,
                 )?;
                 prompt_tokens = expanded_tokens;
                 prefill_embeddings = injected;
-            }
-
-            if !videos.is_empty() || !audios.is_empty() {
-                return Err(format!(
-                    "native media preprocessing completed ({}), but video/audio embedding execution is not implemented yet",
-                    preprocess_summary.join(", ")
-                ));
             }
 
             if self.settings.debug_mode {
@@ -3655,8 +4083,14 @@ impl ModelRuntime {
                 prompt_tokens.push(self.tokenizer.bos_token);
             }
             if prompt_tokens.len() > self.config.seq_len {
+                if media_requested {
+                    return Err(format!(
+                        "expanded media prompt has {} token(s), exceeding context limit {}; refusing to truncate through media embeddings",
+                        prompt_tokens.len(),
+                        self.config.seq_len
+                    ));
+                }
                 prompt_tokens.truncate(self.config.seq_len);
-                prefill_embeddings.retain(|k, _| *k < self.config.seq_len);
             }
 
             let output = self.generate_from_prefill(
@@ -3715,7 +4149,10 @@ impl ModelRuntime {
         let mut pos = 0usize;
         let mut start = 0i64;
 
-        let mut state = crate::engine::runtime::malloc_run_state(&self.config)?;
+        let mut state = crate::engine::runtime::malloc_run_state_with_kv_cache_format(
+            &self.config,
+            self.kv_cache_format_override,
+        )?;
         if debug_mode && !self.kv_cache_format_logged {
             emit_debug_line(
                 event_callback.as_ref(),
@@ -3961,9 +4398,16 @@ impl ModelRuntime {
         // rope/KV/attention steps are the same shared helpers); the last
         // prompt token stays on the sequential path so the logits and
         // sampling flow are untouched.
+        //
+        // Media prompts take this path too: injected audio/image embeddings
+        // ride along as `PrefillInput::Embedding`. Deepstack models are the
+        // exception — their embeddings carry a per-layer tail that only the
+        // sequential path replays, so they keep the per-token loop.
+        let embeddings_fit_batch_prefill = prefill_injected_embeddings.is_empty()
+            || self.config.input_embedding_dim == self.config.dim;
         if crate::engine::switches::use_batch_prefill()
             && crate::engine::runtime::batch_prefill_supported(&self.config)
-            && prefill_injected_embeddings.is_empty()
+            && embeddings_fit_batch_prefill
             && prompt_tokens.len() > 8
         {
             let prefill_end = prompt_tokens.len() - 1;
@@ -3972,9 +4416,21 @@ impl ModelRuntime {
             let mut base = pos;
             while base < prefill_end {
                 let take = chunk.min(prefill_end - base);
-                let toks: Vec<usize> = prompt_tokens[base..base + take]
-                    .iter()
-                    .map(|&t| t as usize)
+                let toks: Vec<crate::engine::runtime::PrefillInput<'_>> = (base..base + take)
+                    .map(|position| {
+                        prefill_injected_embeddings.get(&position).map_or_else(
+                            || {
+                                crate::engine::runtime::PrefillInput::Token(
+                                    prompt_tokens[position] as usize,
+                                )
+                            },
+                            |embedding| {
+                                crate::engine::runtime::PrefillInput::Embedding(
+                                    embedding.as_slice(),
+                                )
+                            },
+                        )
+                    })
                     .collect();
                 crate::engine::runtime::transformer_prefill_batch(
                     &toks,
@@ -4336,7 +4792,9 @@ impl ModelRuntime {
                 start = time_in_ms();
             }
 
-            if pos >= prompt_tokens.len().saturating_sub(1) {
+            // Post-increment `pos`, as above: decode progress starts once the
+            // prompt is fully consumed.
+            if pos >= prompt_tokens.len() {
                 let now_ms = time_in_ms();
                 if now_ms.saturating_sub(last_progress_emit_ms) >= 200 {
                     let decode_tokens = generated_tokens.len();
@@ -4363,7 +4821,14 @@ impl ModelRuntime {
                 }
             }
 
-            if pos >= prompt_tokens.len().saturating_sub(1) {
+            // `pos` and `token` were advanced just above, so `token` is the
+            // token *at* `pos`. It is generated only once `pos` has passed the
+            // whole prompt — testing `len() - 1` here counted the final prompt
+            // token as generated, which shifted every periodic loop-guard check
+            // (`% 4`, `% 16`) and the decode-budget accounting by one. Batched
+            // prefill enters this loop already past that position, so the two
+            // prefill paths disagreed on `generated_tokens.len()`.
+            if pos >= prompt_tokens.len() {
                 generated_tokens.push(token);
                 if let Some(literal) = matched_stop_text_literal {
                     if debug_mode {
@@ -4549,9 +5014,12 @@ impl ModelRuntime {
                         break;
                     }
                 }
-                // Unconditional checks — catch loops regardless of temperature or think mode.
+                // Policy-gated checks that ignore temperature and think mode.
                 // Fires every 4 tokens after the first 8 generated tokens.
-                if generated_tokens.len() >= 8 && generated_tokens.len() % 4 == 0 {
+                if decode_policy.unconditional_loop_guard
+                    && generated_tokens.len() >= 8
+                    && generated_tokens.len() % 4 == 0
+                {
                     // Text-level: inline phrase repetition in visible output.
                     if !output.is_empty()
                         && let Some(phrase) = repeated_inline_phrase(&output)
@@ -4577,6 +5045,11 @@ impl ModelRuntime {
                 }
             }
         }
+
+        // Decoding that consumes its whole budget ended at the limit rather than
+        // at a stop token, so the visible output is cut off.
+        self.last_decode_used_full_token_budget =
+            generated_tokens.len() >= total_limit.saturating_sub(prompt_tokens.len());
 
         let pending_decoded = flush_utf8_pending_lossy(&mut utf8_pending);
         process_decoded_with_think(
@@ -4876,6 +5349,8 @@ impl ModelRuntime {
             let req = GenerationRequest {
                 system_prompt: system_prompt.to_string(),
                 parts,
+                include_empty_system_prompt: false,
+                assistant_prefill: None,
             };
             return self.generate_request(&req, stream_stdout);
         }
@@ -4918,6 +5393,8 @@ impl ModelRuntime {
         let request = GenerationRequest {
             system_prompt: system_prompt.to_string(),
             parts: vec![ContentPart::Text(prompt.to_string())],
+            include_empty_system_prompt: false,
+            assistant_prefill: None,
         };
         self.retry_without_think_for_request(output, &request, stream_stdout)
     }
@@ -4933,6 +5410,7 @@ mod tests {
         promote_think_only_content, sanitize_final_response_text,
         should_buffer_visible_think_stdout,
     };
+    use crate::app::CWD_TEST_LOCK;
     use crate::engine::types::ThinkMode;
     use crate::vendors::VendorDecodePolicy;
     use std::fs;
@@ -5136,6 +5614,32 @@ mod tests {
         assert_eq!(output, "Hello! I'm ready to help.");
     }
 
+    const TRANSCRIPTION_BACKENDS: &[crate::engine::types::AudioEncoderBackend] =
+        &[crate::engine::types::AudioEncoderBackend::Qwen3Asr];
+
+    #[test]
+    fn audio_decode_reserve_covers_every_transcription_decode_cap() {
+        for backend in TRANSCRIPTION_BACKENDS.iter().copied() {
+            let policy = crate::vendors::audio_transcription_policy(backend);
+            assert!(
+                policy.max_new_tokens <= ModelRuntime::AUDIO_DECODE_RESERVE_TOKENS,
+                "{} reserves {} decode token(s) but may generate {}",
+                backend.as_str(),
+                ModelRuntime::AUDIO_DECODE_RESERVE_TOKENS,
+                policy.max_new_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn transcription_policy_disables_the_generic_repetition_guards() {
+        for backend in TRANSCRIPTION_BACKENDS.iter().copied() {
+            let policy = crate::vendors::audio_transcription_policy(backend);
+            assert!(!policy.decode_policy.unconditional_loop_guard);
+            assert!(!policy.decode_policy.deterministic_loop_guard);
+        }
+    }
+
     #[test]
     fn visible_think_stdout_is_not_buffered_for_cli_streaming() {
         let policy = VendorDecodePolicy {
@@ -5182,6 +5686,7 @@ mod tests {
 
     #[test]
     fn mmproj_discovery_uses_current_directory_for_relative_model_path() {
+        let _cwd_guard = CWD_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let temp = tempdir().expect("tempdir");
         let old_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(temp.path()).expect("chdir temp");

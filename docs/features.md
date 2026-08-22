@@ -48,7 +48,11 @@ Supported tensor data paths include:
     - Gemma3 image placeholders (`<start_of_image>` / `<end_of_image>`)
     - Qwen image/video/audio placeholders
   - runtime prompt/media alignment validation before preprocessing
-  - generation loop prefill hook for external embeddings (`transformer_with_embedding`) is wired for future native media injection
+  - generation loop prefill hook for external embeddings (`transformer_with_embedding`) supports ordered image/audio embedding injection internally
+  - media prompts prefill in batches: injected embeddings travel through `transformer_prefill_batch`
+    as `PrefillInput::Embedding` rather than forcing the per-position loop. Deepstack models, whose
+    embeddings carry a per-layer tail, keep the sequential path
+  - media expansion validates spans globally and refuses context overflow instead of truncating through embedding sequences
   - clearer media capability diagnostics when GGUF is missing native multimodal tensor groups
     - includes sidecar search results and effective support status
   - native preprocessing foundation:
@@ -60,8 +64,51 @@ Supported tensor data paths include:
     - video:
       - currently unavailable in no-external-dependency mode
     - audio:
-      - currently unavailable in no-external-dependency mode
-  - current runtime returns explicit "not implemented yet" errors for native image/video/audio embedding execution paths
+      - bounded RIFF/WAVE decode of integer PCM (8/16/24/32-bit) and IEEE float (32/64-bit),
+        including the `WAVE_FORMAT_EXTENSIBLE` header that writers emit for more than two channels
+        or more than 16 bits
+      - chunk sizes are bounded by the bytes present, so WAV streams written without seeking
+        (`0xffffffff` RIFF/data sizes) decode down to their last complete frame
+      - deterministic channel averaging and miniaudio-compatible LPF4 linear resampling to a
+        vendor target rate
+      - Qwen3-ASR source-contract log-Mel extraction and 800/100-frame windowing
+      - pinned llama.cpp synthetic log-Mel parity regression with a measured `3e-5` portable tolerance
+      - log-Mel extraction runs rayon-parallel per frame over a table-driven, allocation-free FFT
+        and a sparsity-aware mel projection, bit-identical to the previous serial implementation
+        (see `docs/performance.md` for the measured effect)
+      - isolated Qwen3-ASR sidecar execution through the 480-channel convolution front end,
+        repeated per-chunk positional embeddings, all 18 audio transformer blocks, required post
+        LayerNorm, and the two-layer `mm.a.*` GELU-ERF projector
+      - official Q8_0/BF16 sidecar probe support through `examples/audio_encoder_dump.rs`, including
+        stable stage dumps for model-backed numerical comparison
+      - `examples/audio_prep_bench.rs` times the decode/log-Mel front end and, with `DUMP_DIR` set,
+        writes raw feature bits so front-end changes can be checked for bit equality
+      - produces 13 text-model-width audio embeddings per padded 100-frame chunk while preserving padding-derived outputs
+      - WAV shape probing predicts audio embedding counts before decode/FFT, reserves the full
+        vendor transcription decode budget (512 tokens), and reports duration/context overflow
+        before encoder work
+      - Qwen3-ASR transcription contract is implemented internally: context-only system turn,
+        audio-only user turn, optional canonical forced-language assistant prefill, greedy decode,
+        `<|im_end|>` stopping, and typed raw/language/transcript parsing
+      - auto-language parsing accepts `language X<asr_text>...`, text-only fallback, and
+        `language None<asr_text>` silence output; forced-language continuations are treated as plain text
+      - transcription decoding keeps repeated speech: the vendor decode policy switches off the
+        generic repeated-phrase and token-cycle guards through `unconditional_loop_guard`, and
+        degenerate decoder loops are collapsed by the vendor output normalizer instead
+      - transcription prefill uses the vendor-required Q8 KV cache even when the general runtime
+        default is Turbo; an exact projected-embedding A/B showed Turbo corrupting the low-norm audio
+        signal while Q8 reproduced the reference transcript
+      - request-level Qwen3-ASR execution passed automatic-language, forced-English, and silence
+        quality gates with the official Q8_0 text/sidecar pair
+  - one-shot CLI accepts exactly one `--audio`, treats `--prompt` as transcription context, accepts
+    optional `--audio-language`, and writes transcript-only output to stdout
+  - `--audio-batch <manifest.jsonl>` validates a strict `{id,path,language?,context?}` JSONL schema
+    before model load, resolves relative audio paths from the manifest directory, retains one
+    runtime, processes records serially, and flushes ordered structured success/error results
+  - `EmbeddedRuntime::transcribe_audio(...)` exposes the typed raw/language/transcript result and
+    supports serial offline batch loops with one retained model/runtime
+  - current runtime returns explicit errors for native video execution, mixed audio/image/video
+    input, and repeated `--audio` attachments
 - autoregressive generation loop
 - quantized KV cache for attention state:
   - default TurboQuant-style `turbo` KV cache mode:
@@ -92,6 +139,13 @@ Supported tensor data paths include:
 ## CLI + Environment Configuration
 
 User-facing CLI options are defined in `src/cli.rs`.
+
+Audio-specific options:
+
+- `--audio <path>`: one finite file for offline Qwen3-ASR transcription
+- `--audio-language <language>`: optional canonical forced language; requires `--audio`
+- `--prompt <text>`: transcription context/hotword hint when `--audio` is present
+- `--audio-batch <manifest.jsonl>`: serial offline transcription with one model load and JSONL output
 
 Agent config file (optional):
 - `~/.gguf-runner/config.toml`
@@ -153,4 +207,5 @@ Notes:
 - CPU-only runtime (no GPU backend)
 - GGUF-only model format
 - model compatibility depends on expected tensor layout and metadata presence
-- native video/audio decode paths are currently unavailable in no-external-dependency mode
+- native video decode remains unavailable; native audio transcription reads RIFF/WAVE integer PCM
+  and IEEE float input, so compressed containers such as MP3, FLAC, and M4A need external conversion

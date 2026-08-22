@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 mod agent;
+mod audio_batch;
 pub mod embed;
 mod events;
 mod generation;
@@ -21,6 +22,7 @@ use crate::engine::switches::{
 };
 use crate::engine::types::{ContentPart, GenerationRequest, MediaRef};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -47,6 +49,9 @@ const REPL_COMMANDS: [&str; 11] = [
     "exit",
     "quit",
 ];
+
+#[cfg(test)]
+static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn map_kv_cache_mode(mode: Option<crate::cli::CliKvCacheMode>) -> Option<KvCacheMode> {
     mode.map(|v| match v {
@@ -254,6 +259,12 @@ pub(crate) fn run() -> Result<(), String> {
 
     match cli.mode {
         CliOperationMode::Oneshot => {
+            let mut audio_batch_manifest = cli
+                .audio_batch
+                .as_deref()
+                .map(Path::new)
+                .map(audio_batch::open_and_validate_manifest)
+                .transpose()?;
             let mut runtime = generation::ModelRuntime::load(&cli)?;
             if let Some(out) = &cli.render_prefill_cache {
                 let blob = runtime.render_prefill_cache_blob(&cli.system_prompt)?;
@@ -265,7 +276,11 @@ pub(crate) fn run() -> Result<(), String> {
                         fs::read(f).map_err(|e| format!("read prefill cache '{f}': {e}"))?;
                     runtime.set_prefill_cache_bytes(&bytes)?;
                 }
-                run_oneshot_mode(&mut runtime, &cli)?;
+                if let Some(manifest) = audio_batch_manifest.as_mut() {
+                    run_audio_batch_mode(&mut runtime, manifest)?;
+                } else {
+                    run_oneshot_mode(&mut runtime, &cli)?;
+                }
             }
         }
         CliOperationMode::Repl => {
@@ -283,6 +298,29 @@ pub(crate) fn run() -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+fn run_audio_batch_mode(
+    runtime: &mut generation::ModelRuntime,
+    manifest: &mut audio_batch::AudioBatchManifest,
+) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let summary = audio_batch::run_manifest(manifest, &mut output, |path, context, language| {
+        let path = path
+            .to_str()
+            .ok_or_else(|| "audio batch path contains non-UTF8 characters".to_string())?;
+        let validated =
+            validate_media_paths(&[path.to_string()], "audio", 1, MAX_AUDIO_BYTES, None)?;
+        runtime.transcribe_audio(&validated[0], context, language)
+    })?;
+    if summary.failed > 0 {
+        return Err(format!(
+            "audio batch completed with {} succeeded and {} failed item(s)",
+            summary.succeeded, summary.failed
+        ));
+    }
     Ok(())
 }
 
@@ -315,6 +353,23 @@ fn run_oneshot_mode(
         Some(VIDEO_EXTENSIONS),
     )?;
     let audios = validate_media_paths(&cli.audios, "audio", MAX_AUDIOS, MAX_AUDIO_BYTES, None)?;
+    if !audios.is_empty() {
+        if !images.is_empty() || !videos.is_empty() {
+            return Err(
+                "offline audio transcription does not support mixed image/video inputs".to_string(),
+            );
+        }
+        if audios.len() != 1 {
+            return Err(format!(
+                "offline audio transcription accepts exactly one --audio path, got {}; use the embedded API to reuse one loaded runtime across multiple files",
+                audios.len()
+            ));
+        }
+        let result =
+            runtime.transcribe_audio(&audios[0], &cli.prompt, cli.audio_language.as_deref())?;
+        println!("{}", result.transcript);
+        return Ok(());
+    }
     let request = build_generation_request(&cli.prompt, &cli.system_prompt, images, videos, audios);
     let _ = runtime.generate_request(&request, true)?;
     Ok(())
@@ -676,12 +731,14 @@ fn build_generation_request(
     GenerationRequest {
         system_prompt: system_prompt.to_string(),
         parts,
+        include_empty_system_prompt: false,
+        assistant_prefill: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::expand_repl_tab_completion;
+    use super::{CWD_TEST_LOCK, expand_repl_tab_completion};
     use std::fs;
 
     #[test]
@@ -707,6 +764,7 @@ mod tests {
 
     #[test]
     fn repl_tab_completion_completes_image_path() {
+        let _cwd_guard = CWD_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let test_dir = std::env::temp_dir().join("gguf-runner-repl-tab");
         let _ = fs::remove_dir_all(&test_dir);
         fs::create_dir_all(&test_dir).expect("create temp dir");

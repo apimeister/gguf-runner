@@ -95,6 +95,97 @@ gguf-runner --model ./Qwen3.5-2B-Q4_K_M.gguf --image ./regression/IMG_0138.jpg -
 | 2026-03-11 | Qwen3-VL-2B-Instruct-Q4_K_M.gguf | mac-m4-32g | image_v1 | 15.784 | 71.829 | |
 | 2026-03-11 | Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf | mac-m4-32g | image_v1 | 6.952 | 228.771 | |
 
+## Audio Pipeline (2026-08-22, mac-m5-32g)
+
+Host `mac-m5-32g` (Apple M5, 6 performance + 4 efficiency cores). Model: official
+`Qwen3-ASR-1.7B-Q8_0.gguf` with its `mmproj` sidecar. Speech generated with `say` at 16 kHz mono.
+All model-run figures are min-of-N with the model's page cache pre-warmed.
+
+### Log-Mel front end
+
+`extract_whisper_log_mel_windows` A/B, both implementations built from the same tree and measured
+back to back, 15 repetitions, min. Output is byte-identical between the two (verified over 4.25M
+feature values).
+
+| audio | serial recursive FFT | parallel table FFT | speedup |
+|---|---:|---:|---:|
+| 1 s | 2.11 ms | 0.79 ms | 2.7x |
+| 10 s | 11.28 ms | 1.65 ms | 6.8x |
+| 30 s | 34.21 ms | 4.28 ms | 8.0x |
+| 300 s | 346.4 ms | 40.25 ms | 8.6x |
+
+Short clips gain least because 101 frames cannot fill ten cores. The pre-change profile was 58.8%
+`fft_real`, 30.7% mel projection, 6.8% allocator; after the change the front end is ~0.03% of
+audio-dependent work and no longer worth optimizing.
+
+### Where transcription time goes
+
+Phase split, measured by differencing a `--max-tokens 1` run against a full run:
+
+| audio | prefill | decode |
+|---|---:|---:|
+| 19.1 s | 78% | 22% |
+| 57.2 s | 79% | 21% |
+
+Sampling profile of a full run: `vec_dot_q8_0_2rows_i8mm_prequant` 112,477 samples (~61%), idle
+spin ~38%, audio encoder `erff` 415 (0.2%). The front end and the ASR encoder are both negligible;
+the cost is language-model matmul.
+
+### Prefill scales quadratically with audio duration
+
+Qwen3-ASR emits ~13.05 audio embedding tokens per second of audio.
+
+| audio | tokens | prefill | ms/token |
+|---|---:|---:|---:|
+| 19.1 s | 249 | 6.77 s | 27.2 |
+| 57.2 s | 746 | 23.00 s | 30.8 |
+| 183.4 s | 2393 | 102.40 s | 42.8 |
+
+These fit `cost_per_token ~= 25.3 + 0.0073 * n` ms (consecutive slopes 0.00734 and 0.00727), so
+total prefill is O(n^2). The constant term is weight streaming; the linear term is attention over
+the KV cache. They cross near 3,470 tokens, about 4.4 minutes of audio: shorter files are
+matmul-bound, longer files are attention-bound. A separately measured 33.9-minute recording
+(26,468 tokens, 2004 s) is consistent with the quadratic term dominating at length.
+
+### Batched prefill depends on the weight quantization
+
+Interleaved on/off runs, ~480-token prompt, `--max-tokens 1`:
+
+| model | min | median |
+|---|---:|---:|
+| Qwen3-ASR-1.7B-Q8_0 | 1.10x | 1.15x |
+| Qwen3.5-2B-Q4_K_M | 1.50x | 1.46x |
+
+Q8_0 appears in neither `batch_fast_supported` (Q2_K..Q6_K) nor `batch_exact_supported`
+(Q4_0/Q4_1/Q5_0/Q5_1/K-quants/IQ4_NL), so `bmm_prefill` falls through to its per-token loop and only
+cache locality remains. A K-quant build of the same model is the cheapest way to get the larger
+win; a batched Q8_0 kernel is the open work item.
+
+### Threads
+
+30 s audio, warm cache:
+
+| threads | real | user |
+|---|---:|---:|
+| 4 | 17.59 s | 61.97 s |
+| 6 | 16.42 s | 78.48 s |
+| 8 | 15.64 s | 92.83 s |
+| 10 | 15.65 s | 103.15 s |
+
+`--threads 8` matches the default on wall clock while using ~11% less CPU.
+
+### Operational notes
+
+- The KV cache is sized from the model's `seq_len`, not the prompt, and is allocated per generation
+  call. For this model at the default 65,536 context that is roughly 1.9 GB per call, re-done for
+  every `--audio-batch` record. `--context-size` caps it; a 30-second segment needs about 610
+  tokens.
+- Measurements on a thermally saturated machine are unusable: an identical batch command measured
+  105.5 s and then 78.2 s (+/-30%). Interleave the variants being compared, take min-of-N, and let
+  the machine cool between long runs.
+- Highly repetitive synthetic speech is a poor benchmark input: it trips the repetition guards and
+  truncates transcripts, which silently changes how much decode work a run does.
+
 ## Benchmark Caveats
 
 - Results come from different dates, machines, and code revisions.

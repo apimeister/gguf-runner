@@ -5,7 +5,7 @@ use crate::engine::kernels::{
     axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size, matmul_quantized,
     scale_slice_inplace,
 };
-use crate::engine::multimodal::injection::ImageEmbeddingSequence;
+use crate::engine::multimodal::injection::MediaEmbeddingSequence;
 use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
 use crate::engine::vision::PreparedImageTensor;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
@@ -726,7 +726,7 @@ impl Qwen3VlVisionEncoder {
     fn encode_single_image(
         &self,
         image: &PreparedImageTensor,
-    ) -> Result<ImageEmbeddingSequence, String> {
+    ) -> Result<MediaEmbeddingSequence, String> {
         let mapped = self.gguf.mapped.as_slice();
         let (mut x, positions, pw, ph) = self.patch_embed_and_reorder(image)?;
         let n_tokens = x.len() / self.dim;
@@ -956,13 +956,13 @@ impl Qwen3VlVisionEncoder {
             tokens.push(token);
         }
 
-        Ok(ImageEmbeddingSequence { tokens })
+        Ok(MediaEmbeddingSequence { tokens })
     }
 
     pub(crate) fn encode_images(
         &self,
         images: &[PreparedImageTensor],
-    ) -> Result<Vec<ImageEmbeddingSequence>, String> {
+    ) -> Result<Vec<MediaEmbeddingSequence>, String> {
         if images.is_empty() {
             return Ok(Vec::new());
         }

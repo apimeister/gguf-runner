@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::app::events::{RuntimeEvent, RuntimeEventCallback, RuntimeProgress};
 use crate::app::generation::ModelRuntime;
+pub use crate::engine::types::AudioTranscriptionResult;
 use crate::vendors::{ChatMessage, ChatRole};
 
 /// Shared, mutable token sink forwarded to by a [`TurnStream`]. Boxed so any
@@ -99,11 +100,11 @@ impl EmbeddedRuntime {
         })
     }
 
-    /// Load the mmproj vision projector from bytes embedded in the binary.
+    /// Load a multimodal projector from bytes embedded in the binary.
     ///
-    /// Call this once after [`load_from_bytes`] to enable image inference without
-    /// a sidecar file on disk.  The bytes must be a valid GGUF mmproj file
-    /// (e.g. `mmproj-SmolVLM-256M-Instruct-f16.gguf`) passed via `include_bytes!`.
+    /// Call this once after [`load_from_bytes`] to load a vision encoder or a
+    /// Qwen3-ASR audio encoder without a sidecar file on disk. The bytes must be
+    /// a valid GGUF mmproj file passed via `include_bytes!`.
     pub fn load_mmproj_from_bytes(&mut self, data: &'static [u8]) -> Result<(), String> {
         self.inner.load_mmproj_from_bytes(data)
     }
@@ -126,6 +127,24 @@ impl EmbeddedRuntime {
             .ok_or_else(|| "image path contains non-UTF8 characters".to_string())?;
         self.inner
             .generate_text_with_images(prompt, system_prompt, &[image_str.to_string()], false)
+    }
+
+    /// Transcribe one finite audio file with an optional context hint and
+    /// forced language.
+    ///
+    /// The first supported backend is Qwen3-ASR. The model and matching audio
+    /// mmproj sidecar stay loaded, so callers can invoke this method repeatedly
+    /// for offline batch processing without reloading weights.
+    pub fn transcribe_audio(
+        &mut self,
+        audio_path: &std::path::Path,
+        context: &str,
+        language: Option<&str>,
+    ) -> Result<AudioTranscriptionResult, String> {
+        let audio_str = audio_path
+            .to_str()
+            .ok_or_else(|| "audio path contains non-UTF8 characters".to_string())?;
+        self.inner.transcribe_audio(audio_str, context, language)
     }
 
     /// Set the sampling temperature.

@@ -45,6 +45,7 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
         stop_text_literals: &[],
         deterministic_loop_guard: false,
         deterministic_loop_guard_min_generated_tokens: 0,
+        unconditional_loop_guard: true,
         recover_early_endoftext_once: false,
         early_endoftext_recover_max_tokens: 0,
         hidden_think_token_cap_base: 256,
@@ -189,6 +190,8 @@ pub(super) fn encode_chat_prompt(
     let request = GenerationRequest {
         system_prompt: system_prompt.to_string(),
         parts: vec![ContentPart::Text(prompt.to_string())],
+        include_empty_system_prompt: false,
+        assistant_prefill: None,
     };
     encode_generation_request(tokenizer, &request).token_ids
 }
@@ -274,6 +277,8 @@ mod tests {
                     path: "img.png".to_string(),
                 }),
             ],
+            include_empty_system_prompt: false,
+            assistant_prefill: None,
         };
 
         let encoded = encode_generation_request(&mut tokenizer, &request);

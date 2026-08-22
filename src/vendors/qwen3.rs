@@ -54,6 +54,7 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
         stop_text_literals: qwen_common::QWEN_STOP_TEXT_LITERALS,
         deterministic_loop_guard: true,
         deterministic_loop_guard_min_generated_tokens: 96,
+        unconditional_loop_guard: true,
         recover_early_endoftext_once: false,
         early_endoftext_recover_max_tokens: 0,
         hidden_think_token_cap_base: 256,

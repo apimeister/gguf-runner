@@ -8,18 +8,21 @@ mod llama;
 mod qwen2;
 mod qwen3;
 mod qwen35;
+mod qwen3_asr;
 mod qwen3next;
 mod qwen3vl;
 mod qwen_common;
 mod smolvlm;
 
+use crate::engine::audio::{AudioDecodeConfig, AudioPreprocessConfig, WhisperLogMelConfig};
 use crate::engine::io::{
-    get_gguf_float_from_map, get_gguf_i64_array_from_map, get_gguf_int_from_map,
-    get_gguf_string_from_map,
+    get_gguf_bool_from_map, get_gguf_float_from_map, get_gguf_i64_array_from_map,
+    get_gguf_int_from_map, get_gguf_string_from_map,
 };
 use crate::engine::types::{
-    Config, ContentPart, EncodedPrompt, GGUFFile, GenerationRequest, ModelCapabilities,
-    MultimodalBackend, ThinkMode, Tokenizer, VendorTokenizerPolicy,
+    AudioEncoderBackend, AudioTranscriptionResult, Config, ContentPart, EncodedPrompt, GGUFFile,
+    GenerationRequest, KvCacheFormat, ModelCapabilities, MultimodalBackend, ThinkMode, Tokenizer,
+    VendorTokenizerPolicy,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +44,11 @@ pub(crate) struct VendorDecodePolicy {
     pub(crate) stop_text_literals: &'static [&'static str],
     pub(crate) deterministic_loop_guard: bool,
     pub(crate) deterministic_loop_guard_min_generated_tokens: usize,
+    /// Enables the temperature- and think-mode-independent repetition guards
+    /// that stop decoding on a repeated inline phrase or token cycle. Families
+    /// whose valid output may repeat verbatim, such as transcription, disable
+    /// this and rely on their own output policy instead.
+    pub(crate) unconditional_loop_guard: bool,
     pub(crate) recover_early_endoftext_once: bool,
     pub(crate) early_endoftext_recover_max_tokens: usize,
     pub(crate) hidden_think_token_cap_base: usize,
@@ -55,6 +63,52 @@ pub(crate) struct VendorDecodePolicy {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct VendorRuntimeDebugPolicy {
     pub(crate) native_context_label: Option<&'static str>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedAudioTranscriptionRequest {
+    pub(crate) generation_request: GenerationRequest,
+    pub(crate) forced_language: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct VendorAudioTranscriptionPolicy {
+    pub(crate) decode_policy: VendorDecodePolicy,
+    pub(crate) kv_cache_format: KvCacheFormat,
+    pub(crate) max_new_tokens: usize,
+    build_request: fn(
+        audio_path: &str,
+        context: &str,
+        language: Option<&str>,
+    ) -> Result<PreparedAudioTranscriptionRequest, String>,
+    parse_output: fn(raw: &str, forced_language: Option<&str>) -> AudioTranscriptionResult,
+}
+
+impl VendorAudioTranscriptionPolicy {
+    pub(crate) fn build_request(
+        self,
+        audio_path: &str,
+        context: &str,
+        language: Option<&str>,
+    ) -> Result<PreparedAudioTranscriptionRequest, String> {
+        (self.build_request)(audio_path, context, language)
+    }
+
+    pub(crate) fn parse_output(
+        self,
+        raw: &str,
+        forced_language: Option<&str>,
+    ) -> AudioTranscriptionResult {
+        (self.parse_output)(raw, forced_language)
+    }
+}
+
+pub(crate) fn audio_transcription_policy(
+    backend: AudioEncoderBackend,
+) -> VendorAudioTranscriptionPolicy {
+    match backend {
+        AudioEncoderBackend::Qwen3Asr => qwen3_asr::transcription_policy(),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,6 +133,31 @@ pub(crate) struct VendorMultimodalPolicy {
     pub(crate) detail_crop: VendorDetailCropPolicy,
     pub(crate) mmproj_filename_score_hints: &'static [MmprojFilenameScoreHint],
     pub(crate) missing_sidecar_hint: &'static str,
+}
+
+pub(crate) fn audio_preprocess_config(backend: AudioEncoderBackend) -> AudioPreprocessConfig {
+    match backend {
+        AudioEncoderBackend::Qwen3Asr => AudioPreprocessConfig {
+            decode: AudioDecodeConfig {
+                target_sample_rate: 16_000,
+                max_output_samples: 16_000 * 3600,
+                chunk_size_samples: 16_000 * 30,
+                max_file_bytes: 1024 * 1024 * 1024,
+                max_channels: 32,
+                max_source_sample_rate: 384_000,
+            },
+            features: WhisperLogMelConfig {
+                sample_rate: 16_000,
+                fft_length: 400,
+                window_length: 400,
+                hop_length: 160,
+                mel_bins: 128,
+                mel_floor: 5.960_464_5e-8,
+                max_window_frames: 800,
+                frame_chunk_size: 100,
+            },
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,7 +188,31 @@ const VISION_TENSOR_PREFIXES: &[&str] = &[
     "multi_modal_projector.",
     "mmproj.",
 ];
-const AUDIO_TENSOR_PREFIXES: &[&str] = &["audio.", "aud.", "speech."];
+const AUDIO_TENSOR_PREFIXES: &[&str] = &["a.", "mm.a.", "audio.", "aud.", "speech."];
+const QWEN3_ASR_FIXED_TENSORS: &[&str] = &[
+    "a.position_embd.weight",
+    "a.conv2d.1.weight",
+    "a.conv2d.1.bias",
+    "a.conv2d.2.weight",
+    "a.conv2d.2.bias",
+    "a.conv2d.3.weight",
+    "a.conv2d.3.bias",
+    "a.conv_out.weight",
+    "mm.a.mlp.1.weight",
+    "mm.a.mlp.1.bias",
+    "mm.a.mlp.2.weight",
+    "mm.a.mlp.2.bias",
+];
+const QWEN3_ASR_LAYER_TENSOR_SUFFIXES: &[&str] = &[
+    "ln1.weight",
+    "ln2.weight",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_out.weight",
+    "ffn_up.weight",
+    "ffn_down.weight",
+];
 
 fn has_vocab_token(gguf: &GGUFFile, token: &str) -> bool {
     gguf.vocab_tokens.iter().any(|entry| entry == token)
@@ -152,27 +255,181 @@ fn qwen_mmproj_family_markers(mmproj: &GGUFFile) -> (bool, bool) {
     (has_qwen3vl, has_qwen35)
 }
 
-pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Result<(), String> {
-    let arch = get_gguf_string_from_map(&mmproj.kv, "general.architecture").unwrap_or_default();
-    let projector = get_gguf_string_from_map(&mmproj.kv, "clip.projector_type").unwrap_or_default();
-    let projection_dim =
-        get_gguf_int_from_map(&mmproj.kv, "clip.vision.projection_dim", 0) as usize;
+#[derive(Clone, Copy, Debug)]
+struct AudioMmprojMetadata<'a> {
+    architecture: &'a str,
+    has_vision_encoder: bool,
+    has_audio_encoder: bool,
+    projector_type: &'a str,
+    projection_dim: usize,
+    embedding_length: usize,
+    feed_forward_length: usize,
+    block_count: usize,
+    head_count: usize,
+    layer_norm_epsilon: f32,
+    num_mel_bins: usize,
+}
+
+fn positive_gguf_usize(mmproj: &GGUFFile, key: &str) -> usize {
+    usize::try_from(get_gguf_int_from_map(&mmproj.kv, key, 0))
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(0)
+}
+
+fn audio_mmproj_metadata(mmproj: &GGUFFile) -> AudioMmprojMetadata<'_> {
+    AudioMmprojMetadata {
+        architecture: get_gguf_string_from_map(&mmproj.kv, "general.architecture")
+            .unwrap_or_default(),
+        has_vision_encoder: get_gguf_bool_from_map(&mmproj.kv, "clip.has_vision_encoder", false),
+        has_audio_encoder: get_gguf_bool_from_map(&mmproj.kv, "clip.has_audio_encoder", false),
+        projector_type: get_gguf_string_from_map(&mmproj.kv, "clip.audio.projector_type")
+            .unwrap_or_default(),
+        projection_dim: positive_gguf_usize(mmproj, "clip.audio.projection_dim"),
+        embedding_length: positive_gguf_usize(mmproj, "clip.audio.embedding_length"),
+        feed_forward_length: positive_gguf_usize(mmproj, "clip.audio.feed_forward_length"),
+        block_count: positive_gguf_usize(mmproj, "clip.audio.block_count"),
+        head_count: positive_gguf_usize(mmproj, "clip.audio.attention.head_count"),
+        layer_norm_epsilon: get_gguf_float_from_map(
+            &mmproj.kv,
+            "clip.audio.attention.layer_norm_epsilon",
+            0.0,
+        ),
+        num_mel_bins: positive_gguf_usize(mmproj, "clip.audio.num_mel_bins"),
+    }
+}
+
+fn required_qwen3_asr_tensor_names(block_count: usize) -> Vec<String> {
+    let mut names = QWEN3_ASR_FIXED_TENSORS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    for layer in 0..block_count {
+        for suffix in QWEN3_ASR_LAYER_TENSOR_SUFFIXES {
+            names.push(format!("a.blk.{layer}.{suffix}"));
+        }
+    }
+    names
+}
+
+fn validate_qwen3_asr_mmproj_contract(
+    backend: MultimodalBackend,
+    text_input_embedding_dim: usize,
+    metadata: AudioMmprojMetadata<'_>,
+    has_tensor: impl Fn(&str) -> bool,
+) -> Result<AudioEncoderBackend, String> {
+    if !metadata.has_audio_encoder {
+        return Err("audio mmproj is missing clip.has_audio_encoder=true".to_string());
+    }
+    if metadata.has_vision_encoder {
+        return Err(
+            "combined vision/audio sidecars are not supported yet; use the audio-only Qwen3-ASR sidecar"
+                .to_string(),
+        );
+    }
+    if backend != MultimodalBackend::Qwen3Vl {
+        return Err(format!(
+            "qwen3a audio mmproj is unsupported for text backend '{}'",
+            backend.as_str()
+        ));
+    }
+    if metadata.architecture != "clip" {
+        return Err(format!(
+            "unsupported audio mmproj architecture '{}'; expected 'clip'",
+            metadata.architecture
+        ));
+    }
+    if metadata.projector_type != "qwen3a" {
+        return Err(format!(
+            "unsupported audio projector '{}'; expected clip.audio.projector_type='qwen3a'",
+            metadata.projector_type
+        ));
+    }
+    if metadata.projection_dim == 0 {
+        return Err(
+            "audio mmproj is missing clip.audio.projection_dim; cannot verify text/audio dim compatibility"
+                .to_string(),
+        );
+    }
+    if metadata.projection_dim != text_input_embedding_dim {
+        return Err(format!(
+            "mmproj/text dim mismatch: clip.audio.projection_dim={} but model input embedding dim={}. hint: this audio mmproj likely belongs to a different checkpoint",
+            metadata.projection_dim, text_input_embedding_dim
+        ));
+    }
+    for (key, value) in [
+        ("clip.audio.embedding_length", metadata.embedding_length),
+        (
+            "clip.audio.feed_forward_length",
+            metadata.feed_forward_length,
+        ),
+        ("clip.audio.block_count", metadata.block_count),
+        ("clip.audio.attention.head_count", metadata.head_count),
+    ] {
+        if value == 0 {
+            return Err(format!("audio mmproj is missing required metadata '{key}'"));
+        }
+    }
+    if !metadata.layer_norm_epsilon.is_finite() || metadata.layer_norm_epsilon <= 0.0 {
+        return Err("audio mmproj has invalid clip.audio.attention.layer_norm_epsilon".to_string());
+    }
+    if metadata.num_mel_bins != 128 {
+        return Err(format!(
+            "unsupported qwen3a mel-bin count {}; expected 128",
+            metadata.num_mel_bins
+        ));
+    }
+    if !metadata
+        .embedding_length
+        .is_multiple_of(metadata.head_count)
+    {
+        return Err(format!(
+            "invalid qwen3a attention shape: embedding_length={} is not divisible by head_count={}",
+            metadata.embedding_length, metadata.head_count
+        ));
+    }
+
+    let missing = required_qwen3_asr_tensor_names(metadata.block_count)
+        .into_iter()
+        .filter(|name| !has_tensor(name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "qwen3a audio mmproj is missing required tensor(s): {}",
+            missing.join(", ")
+        ));
+    }
+
+    Ok(AudioEncoderBackend::Qwen3Asr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_vision_mmproj_contract(
+    backend: MultimodalBackend,
+    text_embedding_dim: usize,
+    architecture: &str,
+    projector: &str,
+    projection_dim: usize,
+    has_qwen3vl_marker: bool,
+    has_qwen35_marker: bool,
+    has_deepstack_tensors: bool,
+) -> Result<(), String> {
     if projection_dim == 0 {
         return Err(
             "mmproj is missing clip.vision.projection_dim; cannot verify text/vision dim compatibility"
                 .to_string(),
         );
     }
-    if projection_dim != cfg.dim {
+    if projection_dim != text_embedding_dim {
         return Err(format!(
             "mmproj/text dim mismatch: clip.vision.projection_dim={} but model embedding dim={}. hint: this mmproj likely belongs to a different checkpoint",
-            projection_dim, cfg.dim
+            projection_dim, text_embedding_dim
         ));
     }
 
-    match cfg.capabilities.multimodal_backend {
+    match backend {
         MultimodalBackend::Gemma3 => {
-            if arch != "clip" || projector != "gemma3" {
+            if architecture != "clip" || projector != "gemma3" {
                 return Err(
                     "unsupported mmproj for this runner: expected clip.projector_type='gemma3'"
                         .to_string(),
@@ -181,27 +438,22 @@ pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Re
             Ok(())
         }
         MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
-            if arch != "clip" || projector != "qwen3vl_merger" {
+            if architecture != "clip" || projector != "qwen3vl_merger" {
                 return Err(
                     "unsupported mmproj for this runner: expected clip.projector_type='qwen3vl_merger'"
                         .to_string(),
                 );
             }
-            let (has_qwen3vl, has_qwen35) = qwen_mmproj_family_markers(mmproj);
-            match cfg.capabilities.multimodal_backend {
+            match backend {
                 MultimodalBackend::Qwen35 => {
-                    if has_qwen3vl && !has_qwen35 {
+                    if has_qwen3vl_marker && !has_qwen35_marker {
                         return Err("incompatible mmproj family for qwen35 backend: sidecar metadata indicates Qwen3-VL; use a Qwen3.5 mmproj from the same checkpoint family".to_string());
                     }
-                    if mmproj
-                        .tensors
-                        .iter()
-                        .any(|tensor| tensor.name.starts_with("v.deepstack."))
-                    {
+                    if has_deepstack_tensors {
                         return Err("incompatible mmproj family for qwen35 backend: deepstack vision tensors detected (Qwen3-VL style); use a Qwen3.5 mmproj sidecar".to_string());
                     }
                 }
-                MultimodalBackend::Qwen3Vl if has_qwen35 && !has_qwen3vl => {
+                MultimodalBackend::Qwen3Vl if has_qwen35_marker && !has_qwen3vl_marker => {
                     return Err("incompatible mmproj family for qwen3vl backend: sidecar metadata indicates Qwen3.5; use a Qwen3-VL mmproj from the same checkpoint family".to_string());
                 }
                 _ => {}
@@ -209,7 +461,7 @@ pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Re
             Ok(())
         }
         MultimodalBackend::Idefics3 => {
-            if arch != "clip" || projector != "idefics3" {
+            if architecture != "clip" || projector != "idefics3" {
                 return Err(
                     "unsupported mmproj for this runner: expected clip.projector_type='idefics3'"
                         .to_string(),
@@ -219,9 +471,47 @@ pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Re
         }
         _ => Err(format!(
             "external vision mmproj is unsupported for backend '{}'",
-            cfg.capabilities.multimodal_backend.as_str()
+            backend.as_str()
         )),
     }
+}
+
+pub(crate) fn validate_mmproj_for_backend(
+    cfg: &Config,
+    mmproj: &GGUFFile,
+) -> Result<Option<AudioEncoderBackend>, String> {
+    let audio_metadata = audio_mmproj_metadata(mmproj);
+    if audio_metadata.has_audio_encoder || !audio_metadata.projector_type.is_empty() {
+        return validate_qwen3_asr_mmproj_contract(
+            cfg.capabilities.multimodal_backend,
+            cfg.input_embedding_dim,
+            audio_metadata,
+            |name| mmproj.tensor_lookup.contains_key(name),
+        )
+        .map(Some);
+    }
+
+    let architecture =
+        get_gguf_string_from_map(&mmproj.kv, "general.architecture").unwrap_or_default();
+    let projector = get_gguf_string_from_map(&mmproj.kv, "clip.projector_type").unwrap_or_default();
+    let projection_dim = positive_gguf_usize(mmproj, "clip.vision.projection_dim");
+    let (has_qwen3vl_marker, has_qwen35_marker) = qwen_mmproj_family_markers(mmproj);
+    let has_deepstack_tensors = mmproj
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name.starts_with("v.deepstack."));
+
+    validate_vision_mmproj_contract(
+        cfg.capabilities.multimodal_backend,
+        cfg.dim,
+        architecture,
+        projector,
+        projection_dim,
+        has_qwen3vl_marker,
+        has_qwen35_marker,
+        has_deepstack_tensors,
+    )?;
+    Ok(None)
 }
 
 fn detect_model_capabilities(
@@ -259,7 +549,9 @@ fn detect_model_capabilities(
             has_vocab_token(gguf, "<|vision_start|>")
                 && has_vocab_token(gguf, "<|vision_end|>")
                 && has_vocab_token(gguf, "<|video_pad|>"),
-            has_vocab_token(gguf, "<|audio_pad|>"),
+            has_vocab_token(gguf, "<|audio_start|>")
+                && has_vocab_token(gguf, "<|audio_pad|>")
+                && has_vocab_token(gguf, "<|audio_end|>"),
         ),
         MultimodalBackend::Idefics3 => (has_vocab_token(gguf, "<image>"), false, false),
         MultimodalBackend::None => (false, false, false),
@@ -271,7 +563,8 @@ fn detect_model_capabilities(
         multimodal_backend,
         supports_native_image: has_image_tokens && has_vision_tensors,
         supports_native_video: has_video_tokens && has_vision_tensors,
-        supports_native_audio: has_audio_tokens && has_audio_tensors,
+        // Audio tensor presence is only a contract signal until an AudioEncoder is constructed.
+        supports_native_audio: false,
     };
 
     if debug_mode {
@@ -829,5 +1122,158 @@ pub(crate) fn runtime_debug_policy(config: &Config) -> VendorRuntimeDebugPolicy 
         smolvlm::runtime_debug_policy()
     } else {
         llama::runtime_debug_policy()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{
+        AudioMmprojMetadata, QWEN3_ASR_FIXED_TENSORS, QWEN3_ASR_LAYER_TENSOR_SUFFIXES,
+        audio_preprocess_config, validate_qwen3_asr_mmproj_contract,
+        validate_vision_mmproj_contract,
+    };
+    use crate::engine::types::{AudioEncoderBackend, MultimodalBackend};
+
+    fn valid_qwen3_asr_metadata() -> AudioMmprojMetadata<'static> {
+        AudioMmprojMetadata {
+            architecture: "clip",
+            has_vision_encoder: false,
+            has_audio_encoder: true,
+            projector_type: "qwen3a",
+            projection_dim: 2_048,
+            embedding_length: 480,
+            feed_forward_length: 1_920,
+            block_count: 2,
+            head_count: 8,
+            layer_norm_epsilon: 1e-5,
+            num_mel_bins: 128,
+        }
+    }
+
+    fn qwen3_asr_tensor_names(block_count: usize) -> HashSet<String> {
+        let mut names = QWEN3_ASR_FIXED_TENSORS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<HashSet<_>>();
+        for layer in 0..block_count {
+            for suffix in QWEN3_ASR_LAYER_TENSOR_SUFFIXES {
+                names.insert(format!("a.blk.{layer}.{suffix}"));
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn accepts_complete_qwen3_asr_audio_sidecar_contract() {
+        let metadata = valid_qwen3_asr_metadata();
+        let tensors = qwen3_asr_tensor_names(metadata.block_count);
+
+        let result = validate_qwen3_asr_mmproj_contract(
+            MultimodalBackend::Qwen3Vl,
+            2_048,
+            metadata,
+            |name| tensors.contains(name),
+        );
+
+        assert_eq!(result, Ok(AudioEncoderBackend::Qwen3Asr));
+    }
+
+    #[test]
+    fn qwen3_asr_audio_preprocess_profile_matches_pinned_runtime() {
+        let profile = audio_preprocess_config(AudioEncoderBackend::Qwen3Asr);
+        assert_eq!(profile.decode.target_sample_rate, 16_000);
+        assert_eq!(profile.decode.chunk_size_samples, 480_000);
+        assert_eq!(profile.features.sample_rate, 16_000);
+        assert_eq!(profile.features.fft_length, 400);
+        assert_eq!(profile.features.window_length, 400);
+        assert_eq!(profile.features.hop_length, 160);
+        assert_eq!(profile.features.mel_bins, 128);
+        assert_eq!(profile.features.max_window_frames, 800);
+        assert_eq!(profile.features.frame_chunk_size, 100);
+    }
+
+    #[test]
+    fn rejects_qwen3_asr_sidecar_for_wrong_text_embedding_dimension() {
+        let metadata = valid_qwen3_asr_metadata();
+        let tensors = qwen3_asr_tensor_names(metadata.block_count);
+
+        let error = validate_qwen3_asr_mmproj_contract(
+            MultimodalBackend::Qwen3Vl,
+            3_072,
+            metadata,
+            |name| tensors.contains(name),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("mmproj/text dim mismatch"));
+    }
+
+    #[test]
+    fn rejects_qwen3_asr_sidecar_with_missing_required_tensor() {
+        let metadata = valid_qwen3_asr_metadata();
+        let mut tensors = qwen3_asr_tensor_names(metadata.block_count);
+        tensors.remove("a.conv2d.3.weight");
+
+        let error = validate_qwen3_asr_mmproj_contract(
+            MultimodalBackend::Qwen3Vl,
+            2_048,
+            metadata,
+            |name| tensors.contains(name),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("a.conv2d.3.weight"));
+    }
+
+    #[test]
+    fn rejects_combined_qwen3_asr_sidecar_until_both_encoders_can_be_built() {
+        let mut metadata = valid_qwen3_asr_metadata();
+        metadata.has_vision_encoder = true;
+        let tensors = qwen3_asr_tensor_names(metadata.block_count);
+
+        let error = validate_qwen3_asr_mmproj_contract(
+            MultimodalBackend::Qwen3Vl,
+            2_048,
+            metadata,
+            |name| tensors.contains(name),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("combined vision/audio sidecars are not supported yet"));
+    }
+
+    #[test]
+    fn rejects_wrong_qwen3_asr_projector_type() {
+        let mut metadata = valid_qwen3_asr_metadata();
+        metadata.projector_type = "qwen3vl_merger";
+        let tensors = qwen3_asr_tensor_names(metadata.block_count);
+
+        let error = validate_qwen3_asr_mmproj_contract(
+            MultimodalBackend::Qwen3Vl,
+            2_048,
+            metadata,
+            |name| tensors.contains(name),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("clip.audio.projector_type='qwen3a'"));
+    }
+
+    #[test]
+    fn vision_sidecar_validation_still_accepts_qwen3vl_contract() {
+        let result = validate_vision_mmproj_contract(
+            MultimodalBackend::Qwen3Vl,
+            2_048,
+            "clip",
+            "qwen3vl_merger",
+            2_048,
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(result, Ok(()));
     }
 }

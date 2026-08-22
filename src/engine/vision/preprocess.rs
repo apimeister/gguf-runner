@@ -87,22 +87,6 @@ pub(crate) struct PreparedVideoTensor {
     pub(crate) chunks: Vec<PreparedVideoChunk>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PreparedAudioChunk {
-    pub(crate) start_sample: usize,
-    pub(crate) sample_count: usize,
-}
-
-#[derive(Debug)]
-pub(crate) struct PreparedAudioTensor {
-    pub(crate) path: String,
-    pub(crate) sample_rate: u32,
-    pub(crate) channels: u16,
-    pub(crate) total_samples: usize,
-    pub(crate) chunks: Vec<PreparedAudioChunk>,
-    pub(crate) data_mono_f32: Vec<f32>,
-}
-
 fn normalize_channel(
     value_unit_range: f32,
     channel: usize,
@@ -327,20 +311,6 @@ pub(crate) fn prepare_images_for_multimodal(
     Ok(prepared)
 }
 
-fn plan_chunks(total_items: usize, chunk_size: usize) -> Result<Vec<(usize, usize)>, String> {
-    if chunk_size == 0 {
-        return Err("chunk size must be > 0".to_string());
-    }
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    while start < total_items {
-        let len = (total_items - start).min(chunk_size);
-        out.push((start, len));
-        start += len;
-    }
-    Ok(out)
-}
-
 pub(crate) fn prepare_videos_for_multimodal(
     video_paths: &[String],
     _profile: ImagePreprocessProfile,
@@ -377,61 +347,10 @@ pub(crate) fn load_video_chunk_tensors(
     prepare_images_for_multimodal(&chunk.frame_paths, profile)
 }
 
-pub(crate) fn prepare_audios_for_multimodal(
-    audio_paths: &[String],
-    target_sample_rate: u32,
-    max_samples: usize,
-    chunk_size_samples: usize,
-) -> Result<Vec<PreparedAudioTensor>, String> {
-    if target_sample_rate == 0 {
-        return Err("audio target_sample_rate must be > 0".to_string());
-    }
-    if max_samples == 0 {
-        return Err("audio max_samples must be > 0".to_string());
-    }
-    if chunk_size_samples == 0 {
-        return Err("audio chunk_size_samples must be > 0".to_string());
-    }
-    for path in audio_paths {
-        if fs::metadata(path).is_err() {
-            return Err(format!("cannot read audio file '{path}'"));
-        }
-    }
-    let _ = plan_chunks(max_samples.min(1), chunk_size_samples)?;
-    let _ = target_sample_rate;
-    Err(
-        "native audio preprocessing is unavailable in no-external-dependency mode (external decoder path removed)"
-            .to_string(),
-    )
-}
-
-pub(crate) fn load_audio_chunk_samples(
-    audio: &PreparedAudioTensor,
-    chunk_idx: usize,
-) -> Result<Vec<f32>, String> {
-    let chunk = audio
-        .chunks
-        .get(chunk_idx)
-        .ok_or_else(|| format!("audio chunk index out of range: {chunk_idx}"))?;
-    let start = chunk.start_sample;
-    let end = start
-        .checked_add(chunk.sample_count)
-        .ok_or_else(|| "audio chunk range overflow".to_string())?;
-    if end > audio.data_mono_f32.len() {
-        return Err(format!(
-            "audio chunk range out of bounds: end={} > total_samples={}",
-            end,
-            audio.data_mono_f32.len()
-        ));
-    }
-    Ok(audio.data_mono_f32[start..end].to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ImageNormalization, ImagePreprocessProfile, ImageResizeMode, load_audio_chunk_samples,
-        plan_chunks, prepare_audios_for_multimodal, prepare_images_for_multimodal,
+        ImageNormalization, ImagePreprocessProfile, ImageResizeMode, prepare_images_for_multimodal,
         prepare_videos_for_multimodal, resize_and_center_crop, resize_for_profile,
         rgb_u8_to_chw_f32,
     };
@@ -557,45 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn chunk_planning_is_deterministic() {
-        let chunks = plan_chunks(10, 4).unwrap();
-        assert_eq!(chunks, vec![(0, 4), (4, 4), (8, 2)]);
-    }
-
-    #[test]
-    fn load_audio_chunk_from_in_memory_buffer() {
-        let audio = super::PreparedAudioTensor {
-            path: "dummy".to_string(),
-            sample_rate: 16_000,
-            channels: 1,
-            total_samples: 4,
-            chunks: vec![
-                super::PreparedAudioChunk {
-                    start_sample: 0,
-                    sample_count: 2,
-                },
-                super::PreparedAudioChunk {
-                    start_sample: 2,
-                    sample_count: 2,
-                },
-            ],
-            data_mono_f32: vec![0.5, -1.0, 2.0, 4.0],
-        };
-
-        let c0 = load_audio_chunk_samples(&audio, 0).unwrap();
-        let c1 = load_audio_chunk_samples(&audio, 1).unwrap();
-        assert_eq!(c0, vec![0.5, -1.0]);
-        assert_eq!(c1, vec![2.0, 4.0]);
-    }
-
-    #[test]
-    fn prepare_audio_rejects_bad_inputs() {
-        let err =
-            prepare_audios_for_multimodal(&[], 0, 10, 10).expect_err("expected validation error");
-        assert!(err.contains("target_sample_rate"));
-    }
-
-    #[test]
     fn video_preprocess_returns_no_external_dependency_error() {
         let temp = TempDir::new().unwrap();
         let video_path = temp.path().join("dummy.mp4");
@@ -607,21 +487,6 @@ mod tests {
             1,
             4,
             2,
-        )
-        .expect_err("expected unsupported decoder error");
-        assert!(err.contains("no-external-dependency mode"));
-    }
-
-    #[test]
-    fn audio_preprocess_returns_no_external_dependency_error() {
-        let temp = TempDir::new().unwrap();
-        let audio_path = temp.path().join("dummy.mp4");
-        std::fs::write(&audio_path, b"not-a-real-audio").unwrap();
-        let err = prepare_audios_for_multimodal(
-            &[audio_path.to_string_lossy().into_owned()],
-            16_000,
-            64_000,
-            16_000,
         )
         .expect_err("expected unsupported decoder error");
         assert!(err.contains("no-external-dependency mode"));

@@ -582,6 +582,14 @@ struct Cli {
     #[arg(long = "audio", value_name = "path")]
     audios: Vec<String>,
 
+    /// Force the language for Qwen3-ASR transcription (for example, English).
+    #[arg(long = "audio-language", value_name = "language")]
+    audio_language: Option<String>,
+
+    /// Process a JSONL manifest of independent offline audio transcription requests.
+    #[arg(long = "audio-batch", value_name = "manifest.jsonl")]
+    audio_batch: Option<String>,
+
     /// Sampling temperature (default: model hint or 0.9).
     #[arg(long)]
     temperature: Option<f32>,
@@ -881,6 +889,8 @@ pub(crate) struct CliOptions {
     pub(crate) images: Vec<String>,
     pub(crate) videos: Vec<String>,
     pub(crate) audios: Vec<String>,
+    pub(crate) audio_language: Option<String>,
+    pub(crate) audio_batch: Option<String>,
     pub(crate) temperature: Option<f32>,
     pub(crate) top_k: Option<usize>,
     pub(crate) top_p: Option<f32>,
@@ -970,9 +980,12 @@ impl CliOptions {
             && cli.render_prefill_cache.is_none()
             && matches!(mode, CliOperationMode::Oneshot)
             && cli.prompt.trim().is_empty()
+            && cli.audios.is_empty()
+            && cli.audio_batch.is_none()
         {
             return Err("`--prompt` is required in oneshot mode".to_string());
         }
+        validate_audio_options(&cli, mode, requested_tools_enabled)?;
         let tool_prompt_specs = default_tool_prompt_specs();
         let loaded_shell = if requested_tools_enabled {
             load_shell_config_from_config()?
@@ -1003,6 +1016,8 @@ impl CliOptions {
             images: cli.images,
             videos: cli.videos,
             audios: cli.audios,
+            audio_language: cli.audio_language,
+            audio_batch: cli.audio_batch,
             temperature: cli.temperature,
             top_k: cli.top_k,
             top_p: cli.top_p,
@@ -1064,6 +1079,43 @@ impl CliOptions {
     }
 }
 
+fn validate_audio_options(
+    cli: &Cli,
+    mode: CliOperationMode,
+    requested_tools_enabled: bool,
+) -> Result<(), String> {
+    if cli.audio_language.is_some() && cli.audios.is_empty() && cli.audio_batch.is_none() {
+        return Err("`--audio-language` requires `--audio <path>`".to_string());
+    }
+    if cli.audio_batch.is_none() {
+        return Ok(());
+    }
+    if !matches!(mode, CliOperationMode::Oneshot) {
+        return Err("`--audio-batch` is supported only in oneshot mode".to_string());
+    }
+    if requested_tools_enabled {
+        return Err("`--audio-batch` cannot be combined with tools mode".to_string());
+    }
+    if !cli.audios.is_empty() || !cli.images.is_empty() || !cli.videos.is_empty() {
+        return Err(
+            "`--audio-batch` cannot be combined with `--audio`, `--image`, or `--video`"
+                .to_string(),
+        );
+    }
+    if cli.audio_language.is_some() || !cli.prompt.trim().is_empty() {
+        return Err(
+            "batch language and context belong in each manifest record; do not combine `--audio-batch` with `--audio-language` or `--prompt`"
+                .to_string(),
+        );
+    }
+    if cli.render_prefill_cache.is_some() || cli.prefill_cache.is_some() || cli.rag_build {
+        return Err(
+            "`--audio-batch` cannot be combined with prefill-cache or RAG build modes".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1136,39 @@ mod tests {
             help_text.contains("Use none to disable all tools"),
             "expected --allowed-tools help to mention that none disables all tools"
         );
+    }
+
+    #[test]
+    fn audio_batch_does_not_require_a_prompt() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--model",
+            "model.gguf",
+            "--audio-batch",
+            "batch.jsonl",
+        ])
+        .expect("parse batch flags");
+        assert!(cli.prompt.is_empty());
+        assert!(
+            validate_audio_options(&cli, cli.mode, false).is_ok(),
+            "batch-only CLI should be valid"
+        );
+    }
+
+    #[test]
+    fn audio_batch_rejects_per_invocation_audio_context() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--model",
+            "model.gguf",
+            "--audio-batch",
+            "batch.jsonl",
+            "--prompt",
+            "global context",
+        ])
+        .expect("parse batch flags");
+        let error = validate_audio_options(&cli, cli.mode, false).expect_err("conflicting prompt");
+        assert!(error.contains("each manifest record"));
     }
 
     #[test]

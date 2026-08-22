@@ -1096,6 +1096,8 @@ fn build_repl_multimodal_request(
     crate::engine::types::GenerationRequest {
         system_prompt: system_prompt.to_string(),
         parts,
+        include_empty_system_prompt: false,
+        assistant_prefill: None,
     }
 }
 

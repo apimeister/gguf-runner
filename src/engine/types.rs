@@ -110,6 +110,20 @@ pub(crate) enum ContentPart {
 pub(crate) struct GenerationRequest {
     pub(crate) system_prompt: String,
     pub(crate) parts: Vec<ContentPart>,
+    /// Preserve an empty system turn when the model's processor emits one as
+    /// part of its exact prompt contract.
+    pub(crate) include_empty_system_prompt: bool,
+    /// `None` selects the vendor's normal assistant-generation prefix. `Some`
+    /// requests a plain assistant prefix and appends the supplied text before
+    /// generation; an empty string therefore suppresses vendor think seeding.
+    pub(crate) assistant_prefill: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTranscriptionResult {
+    pub raw_output: String,
+    pub language: String,
+    pub transcript: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +131,7 @@ pub(crate) struct PlaceholderSpan {
     pub(crate) token_start: usize,
     pub(crate) token_len: usize,
     pub(crate) media_index: usize,
-    /// When true the entire span (all token_len tokens) is replaced by the image embeddings;
+    /// When true the entire span (all token_len tokens) is replaced by the media embeddings;
     /// no begin/end marker tokens are emitted. Used for single-token placeholders like SmolVLM's
     /// <image> where the model does not expect surrounding marker tokens.
     pub(crate) replace_marker: bool,
@@ -159,6 +173,19 @@ impl MultimodalBackend {
             MultimodalBackend::Qwen3Vl => "qwen3vl",
             MultimodalBackend::Qwen35 => "qwen35",
             MultimodalBackend::Idefics3 => "idefics3",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AudioEncoderBackend {
+    Qwen3Asr,
+}
+
+impl AudioEncoderBackend {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AudioEncoderBackend::Qwen3Asr => "qwen3_asr",
         }
     }
 }
@@ -594,6 +621,8 @@ pub(crate) struct Tokenizer {
     pub(crate) vocab_size: usize,
     pub(crate) max_token_length: usize,
     pub(crate) bos_token: i32,
+    /// True when GGUF metadata explicitly disables automatic BOS insertion.
+    pub(crate) skip_bos_token: bool,
     pub(crate) eos_token: i32,
     pub(crate) start_header_token: i32,
     pub(crate) end_header_token: i32,

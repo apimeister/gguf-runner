@@ -1,6 +1,7 @@
 # Module Structure Reference
 
-This project is currently a binary crate (`src/main.rs`) with internal modules (`mod ...`), not a separate `lib.rs`.
+This project provides a binary entrypoint (`src/main.rs`) plus a small library facade (`src/lib.rs`)
+for `EmbeddedRuntime`; both share the same internal app, vendor, and engine modules.
 
 ## Maintenance Rule
 
@@ -12,8 +13,11 @@ This project is currently a binary crate (`src/main.rs`) with internal modules (
 ```text
 src/
   main.rs
+  lib.rs
   app/
     mod.rs
+    audio_batch.rs
+    embed.rs
     events.rs
     generation.rs
     agent.rs
@@ -28,6 +32,10 @@ src/
   engine/
     mod.rs
     types.rs
+    audio/
+      mod.rs
+      decode.rs
+      features.rs
     io/
       mod.rs
       gguf.rs
@@ -35,6 +43,7 @@ src/
       mod.rs
       gemma3.rs
       injection.rs
+      qwen3_asr.rs
       qwen3vl.rs
     vision/
       mod.rs
@@ -62,6 +71,7 @@ src/
     qwen35.rs
     qwen3vl.rs
     qwen3next.rs
+    qwen3_asr.rs
     qwen_common.rs
 ```
 
@@ -84,11 +94,16 @@ src/
   - validate non-empty media file paths for standard generation mode:
     - `--image` (`png/jpg/jpeg/webp`)
     - `--video` (`mp4`)
-    - `--audio` (extension-agnostic validation in current scaffold)
+    - one `--audio` path for offline Qwen3-ASR transcription (extension-agnostic validation)
+    - optional `--audio-language` forced-language policy input
   - route by operation mode:
     - `oneshot`: single prompt execution
     - `repl`: interactive question/answer loop with slash commands (`/help`, `/model`, `/exit`, `/quit`)
   - routes plain text-only non-agent turns through `generate_text(...)`; uses structured `GenerationRequest` execution only when media inputs are present
+  - routes one-shot audio-only requests through `transcribe_audio(...)`, treating `--prompt` as
+    context/hotword text and keeping transcript-only stdout separate from stderr diagnostics
+  - validates a complete `--audio-batch` manifest before model load, retains one runtime for the
+    serial job, and routes per-record file checks/transcription through `app::audio_batch`
   - tool-agent support is orthogonal to operation mode:
     - default `allowed-tools=none` in `oneshot`
     - default `allowed-tools=all` in `repl`
@@ -96,6 +111,16 @@ src/
       based on prompt/tool eligibility rather than forcing every REPL turn through the agent planner
     - when tools are disabled, requests are handled via standard generation
   - print profiling/timing summaries
+
+### `src/app/audio_batch.rs`
+
+- Owns the offline JSONL batch schema and serial job loop.
+- Performs a constant-space validation pass before model load and rewinds the manifest for
+  processing instead of retaining all records in memory.
+- Resolves relative paths from the manifest directory, preserves input order, writes one structured
+  success/error record per item, and flushes every result.
+- Keeps batch orchestration out of `engine`; each item uses the normal transcription request path
+  and therefore receives fresh inference state while reusing loaded model and sidecar weights.
 
 ### `src/app/repl.rs`
 
@@ -118,7 +143,7 @@ src/
 - Uses native multimodal generation for turns with active image attachments, rather than routing image access through tool-agent calls.
 - When tools are enabled, only tool-likely prompts are routed into the agent runner; ordinary chat remains on the standard text-generation path.
 - Plain text REPL chat runs with `think=no` to avoid exposing raw chain-of-thought or losing the visible answer on reasoning-model chat templates; oneshot behavior remains unchanged.
-- Active REPL media attachments can initialize external multimodal support lazily on first use, including local `mmproj` sidecar discovery/loading for sidecar-backed vision families.
+- Active REPL media attachments can initialize external multimodal support lazily on first use, including local `mmproj` sidecar discovery/loading for sidecar-backed vision families. Audio-only sidecars can be recognized by the shared lazy probe, but REPL audio attachments and audio encoder execution remain unavailable.
 - Loads the runtime inside the worker thread so the REPL owns runtime lifecycle end-to-end and enforces one active runtime.
 
 ### `src/app/events.rs`
@@ -140,6 +165,11 @@ src/
   - GGUF parse/load
   - llama-style local `mmproj*.gguf` sidecar discovery/probe for multimodal models (no extra CLI switch)
   - sidecar probe enforces checkpoint variant token matching (for example `2b`, `35b`, `a3b`) to prevent silent cross-size pairing
+  - metadata-first Qwen3-ASR audio-only sidecar recognition records the validated `qwen3_asr` backend independently from vision capability
+  - eager and lazy loading construct `VisionEncoder` only for image/video requests when the selected sidecar exposes both vision encoder and projector tensors
+  - eager and lazy audio requests construct a dedicated Qwen3-ASR `AudioEncoder`; diagnostics
+    report loaded weights and effective execution readiness
+  - embedded mmproj loading supports either the existing vision encoders or the Qwen3-ASR audio weight contract
   - applies vendor multimodal/runtime debug policies to sidecar scoring, request shaping, and context-length debug logging
   - vendor config + tokenizer + weights initialization
   - multimodal weight-group probe/initialization for multimodal backends
@@ -162,7 +192,10 @@ src/
       - qwen35 backend uses fit-within preprocessing (aspect-ratio preserving, patch-aligned) at a balanced intermediate scale to retain full-frame text regions while limiting visual-token overload
       - gemma3 backend uses fixed-size stretch resize to encoder image_size (llama.cpp-compatible SigLIP preprocess semantics)
       - videos: currently unavailable in no-external-dependency mode
-      - audio: currently unavailable in no-external-dependency mode
+      - audio: bounded RIFF/WAVE integer PCM and IEEE float decode, deterministic channel averaging and
+        miniaudio-compatible LPF4 linear resampling, followed by model-policy-driven log-Mel window
+        construction; header/shape probing predicts feature-window and embedding counts before the
+        expensive path
     - native image embedding execution via in-engine multimodal backend (`qwen3vl`/`qwen35` mmproj sidecar path)
       - Gemma3 sidecar path uses `<start_of_image>`/`<end_of_image>` prompt markers and SigLIP-style projector pooling
     - think-tag decode safeguards:
@@ -174,8 +207,23 @@ src/
       - current `agent-json` mode seeds a compact JSON prefix for tool-agent turns
       - lexical/schema-aware token masking for `tool_call` / `final` responses
       - stop after first complete top-level JSON object
-    - explicit current-state errors for unimplemented native video/audio embedding execution
+    - ordered image/audio language-space embedding injection with a context preflight that reserves up to 256 requested decode tokens for image requests, the full 512-token vendor transcription budget for audio requests, and never truncates media embeddings
+    - debug-mode audio encoder progress at most ten times per file, since one window covers eight seconds of input
+    - explicit current-state errors for unimplemented native video execution
+  - `transcribe_audio(...)` orchestration builds the vendor-owned audio-only request,
+    disables RAG/reasoning/structured output, applies greedy transcription decode settings, restores
+    caller settings on success or failure, applies the vendor-required Q8 KV-cache override, and
+    returns a typed parsed result
   - shared decode core `generate_from_prefill(...)` for text + multimodal routes (supports per-position embedding overrides during prefill)
+    - prompts of more than eight tokens prefill in chunks through `transformer_prefill_batch(...)`,
+      including media prompts: injected embeddings are passed as `PrefillInput::Embedding`. The
+      batch gate falls back to the sequential loop only when the model is unsupported or when
+      injected embeddings are wider than `dim` (deepstack). The final prompt token always stays on
+      the sequential path so the logits and sampling flow are untouched
+    - `generated_tokens` counts only positions past the prompt. Both bookkeeping checks after the
+      `pos`/`token` advance test `pos >= prompt_tokens.len()`, not `len() - 1`; the off-by-one
+      counted the last prompt token as generated, which shifted every periodic loop-guard check
+      (`% 4`, `% 16`) and the decode-budget accounting, and made the two prefill paths disagree
 - Supports optional app-level runtime event callbacks:
   - streamed visible output chunks for TUI REPL
   - debug-line emission without writing directly to terminal during REPL turns
@@ -273,12 +321,15 @@ src/
 - Includes multimodal switch:
   - repeatable `--image <path>` for image inputs (standard generation mode)
   - repeatable `--video <path>` for video inputs (standard generation mode)
-  - repeatable `--audio <path>` for audio inputs (standard generation mode)
+  - `--audio <path>` for one-file offline transcription
+  - `--audio-language <language>` for optional forced-language transcription
+  - `--audio-batch <manifest.jsonl>` for serial offline jobs with structured JSONL output
 
 ### `src/engine/mod.rs`
 
 - Aggregates engine submodules:
-  - `io`, `kernels`, `profiling`, `runtime`, `switches`, `tokenizer`, `types`, `vision`, `weights`.
+  - `audio`, `io`, `kernels`, `multimodal`, `profiling`, `runtime`, `switches`, `tokenizer`,
+    `types`, `vision`, `weights`.
 
 ### `src/engine/types.rs`
 
@@ -291,14 +342,20 @@ src/
     - `n_deepstack_layers`
   - Multimodal request domain types used by app/runtime boundary:
     - `GenerationRequest`
+      - can preserve an empty system turn and request a plain assistant prefill for exact
+        processor contracts without adding family checks to app code
     - `ContentPart`
     - `MediaRef`
     - `EncodedPrompt`
     - `PlaceholderSpan`
+    - `AudioTranscriptionResult` (raw model output, detected/forced language, transcript)
+    - `KvCacheFormat`, also accepted as a generic run-state allocation override so app/vendor policy
+      can select a quality-safe cache without engine family branches
   - Vendor tokenizer policy type used by tokenizer init:
     - `VendorTokenizerPolicy` (`disable_bos_fallback`, `end_turn_token_literals`)
   - Model multimodal capability metadata:
     - `MultimodalBackend`
+    - `AudioEncoderBackend` (currently `Qwen3Asr`; selects the dedicated audio encoder constructor without adding family branches to app flow)
     - `ModelCapabilities`
   - Extended model identity flags:
     - `Config::is_qwen35`
@@ -319,7 +376,7 @@ src/
 
 ### `src/engine/vision/*`
 
-- Shared multimodal preprocessing utilities.
+- Image/video preprocessing utilities.
 - `vision/preprocess.rs` currently provides deterministic preprocessing:
   - images:
     - decode (`png`/`jpeg`/`webp` via `image` crate)
@@ -328,15 +385,54 @@ src/
     - configurable normalization profile (`UnitRange` / `MeanStd`)
   - videos:
     - currently unavailable in no-external-dependency mode (native decode path removed)
-  - audio:
-    - currently unavailable in no-external-dependency mode (native decode path removed)
+
+### `src/engine/audio/*`
+
+- Offline audio decode and feature preprocessing, separate from the vision namespace.
+- `audio/decode.rs`:
+  - validates RIFF/WAVE structure with checked chunk and buffer arithmetic
+  - accepts integer PCM at 8, 16, 24, or 32 bits and IEEE float at 32 or 64 bits, in plain or
+    `WAVE_FORMAT_EXTENSIBLE` fmt layouts, and names the `ffmpeg` conversion when rejecting anything
+    else
+  - bounds every chunk by the bytes present, so streams written without seeking keep their complete
+    frames while a file whose declared data size fits must be frame-aligned
+  - enforces vendor-provided file, channel, source-rate, and decoded-sample limits
+  - averages channels deterministically into mono and uses a miniaudio-compatible linear converter
+    with a fourth-order Butterworth low-pass filter for sample-rate conversion
+  - plans bounded sample chunks while retaining one contiguous target-rate mono buffer
+  - probes validated WAV shape and exact resampled sample count before sample decode, feature extraction, or encoder execution
+- `audio/features.rs`:
+  - implements periodic Hann windowing, centered reflection padding, exact-length FFT, power spectrum, Slaney filters with area normalization, base-10 log, and Whisper dynamic-range normalization
+  - creates mel-major feature windows with valid-frame metadata and zero-pads each window to the configured frame-chunk multiple
+  - exposes the same checked feature-window plan independently for context preflight
+  - the frame loop is rayon-parallel over a frame-major intermediate; the mel-major transpose is
+    fused into the window split, so no whole-clip mel-major copy is materialized
+  - `FftPlan` hoists the twiddle tables, the decimation-in-time leaf order, and a
+    `leaf_length * leaf_length` DFT table out of the per-frame path; `FftScratch` holds the
+    ping-pong buffers so the transform never allocates. This replaced a recursive form that
+    re-derived twiddles from a modulo per inner iteration and allocated three `Vec`s per recursion
+    node — for the 400-point transform, 10,000 integer divisions and ~93 allocations per frame
+  - `build_mel_filter_spans` restricts the projection to each filter's nonzero bin span. Slaney
+    filters are ~1.5% dense (394 of 25,728 weights), so this touches ~33x fewer groups of four
+  - all of the above is bit-identical to the previous implementation: the butterfly expression
+    association, the group-of-four-then-promote summation order, and its group boundaries are
+    preserved, and skipped groups are exactly zero. Verified byte-for-byte over 4.25M feature
+    values before and after
+- `audio/mod.rs` owns the shared preprocessing profiles and prepared PCM/feature domain types consumed by vendor policy and future audio encoder execution.
+- The initial Qwen3-ASR profile is 16 kHz, 400-point FFT/window, 160-sample hop, 128 mel bins, at most 800 effective frames per window, and padding to 100-frame boundaries.
+- A deterministic 128,000-sample regression is derived from direct execution of pinned llama.cpp `mtmd_audio_preprocessor_qwen3a`: shapes match exactly and the measured cross-toolchain maximum absolute log-Mel error is `2.288818359e-5` (or `1.192092896e-7` with contraction disabled).
+- The official 48-kHz/24-bit speech sample matches miniaudio across 240,820 resampled samples with
+  maximum/mean absolute error `1.788139343e-7/3.564497433e-9`; short upsample and downsample impulse
+  regressions lock the converter's filter transient and latency semantics.
 
 ### `src/engine/multimodal/*`
 
 - Native multimodal embedding and prompt-injection subsystem.
 - `multimodal/injection.rs`:
-  - expands image placeholder spans into token-aligned embedding injection maps
-  - builds expanded prefill token stream for variable-length image embedding sequences
+  - defines a modality-neutral language-space `MediaEmbeddingSequence`
+  - merges image/audio placeholder spans in source-token order and validates per-modality order, global overlap, bounds, marker shape, media-index uniqueness, embedding dimensions, and checked expanded length
+  - preserves begin/end markers, replaces each placeholder with variable-length embedding slots, and builds the token-aligned prefill injection map
+  - preflights expanded context plus decode reserve and rejects overflow rather than truncating through media embeddings
 - `multimodal/qwen3vl.rs`:
   - Qwen3-VL CLIP/mmproj image encoder path (`qwen3vl_merger`)
   - loads mmproj tensors, runs patch embedding + vision transformer + projector in Rust
@@ -349,10 +445,33 @@ src/
   - runs ViT layers with separate q/k/v projections, patch-grid average pooling, RMS normalization, and `mm.input_projection` into text embedding space
   - full-resolution ViT path is default; optional pre-attention fast-pooling shortcut is opt-in via `GGUF_GEMMA3_ENABLE_FAST_POOL=1`
   - emits language-space image token embeddings for prompt injection
+- `multimodal/qwen3_asr.rs`:
+  - parses Qwen3-ASR `clip.audio.*` metadata into `Qwen3AsrAudioConfig`
+  - validates all `a.*` convolution/transformer and `mm.a.*` projector shapes in GGML dimension order
+  - derives the distinct 480-channel convolution width from the official tensor contract while the
+    transformer width remains 896
+  - infers and cross-checks the projector hidden dimension from its two matrix weights
+  - validates supported GGML storage, quantization block alignment, overflow, and mapped-file bounds
+  - executes the isolated encoder front end over prepared feature windows: three stride-2/padding-1 Conv2D stages, GELU-ERF, Qwen channel/frequency reorder, and quantized `a.conv_out` projection
+  - mirrors llama.cpp's F16 im2col activation rounding for F16/F32 convolution kernels and resets token order at each padded 100-frame chunk boundary
+  - adds the first 13 positional rows repeatedly for each chunk, then executes every pre-LayerNorm audio transformer block with full-window bidirectional multi-head attention, GELU-ERF FFNs, optional biases, and residual connections
+  - applies required `a.post_ln.*` normal LayerNorm after the transformer and before the audio projector
+  - rounds F16/BF16 activations to GGML's matrix dot type; BF16 ties-to-even and matmul behavior have focused regressions
+  - executes `mm.a.mlp.1` -> GELU-ERF -> `mm.a.mlp.2` through quantized matrix kernels and returns 13 text-model-width audio embeddings per padded 100-frame chunk
+  - retains every padding-derived output token, matching the pinned source graph until model-backed fixtures establish whether a later trim is required
 - `multimodal/mod.rs`:
-  - backend construction (`build_vision_encoder_from_mmproj`)
-  - enables external `mmproj` encoder construction for `gemma3`, `qwen3vl`, and `qwen35` backends
-  - encoder abstraction (`VisionEncoder`)
+  - backend construction (`build_vision_encoder_from_mmproj`, `build_audio_encoder_from_mmproj`)
+  - enables external vision `mmproj` construction for `gemma3`, `qwen3vl`, and `qwen35`, plus Qwen3-ASR audio weight-contract construction
+  - encoder abstractions (`VisionEncoder`, `AudioEncoder`), including internal typed dispatch for isolated audio convolution, transformer, and language-space projector execution
+  - predicts Qwen3-ASR output counts from planned padded feature windows, dispatches each window through the complete sidecar graph, and concatenates adjacent chunks inside one audio marker envelope
+  - `examples/audio_encoder_dump.rs` probes official sidecars and dumps convolution, per-layer,
+    post-transformer, and projected F32 tensors from synthetic input, PCM WAV, or a captured
+    convolution output
+  - `examples/audio_prep_bench.rs` times `prepare_audios_for_multimodal` over one or more WAV files
+    (`REPS` controls repetitions) and, with `DUMP_DIR` set, writes each window's raw f32 bits so a
+    front-end change can be diffed for bit equality against a baseline build
+  - audio readiness is enabled after Q8_0 automatic-language, forced-language, and silence
+    transcription gates
 
 ### `src/engine/tokenizer/mod.rs`
 
@@ -382,10 +501,19 @@ src/
 - Runtime-specific execution and threading config.
 - `runtime/inference.rs`:
   - `malloc_run_state(...)`
+  - `malloc_run_state_with_kv_cache_format(...)` for a generic request-scoped Q8/Turbo override;
+    Qwen3-ASR selects Q8 in vendor policy because Turbo fails the audio quality gate
   - `transformer(...)`
   - `transformer_without_logits(...)` for prompt-prefill steps that only need KV/cache state
   - `transformer_with_embedding(...)` (prefill hook for external embedding vectors)
   - `transformer_with_embedding_without_logits(...)` for embedded prefill steps that only need KV/cache state
+  - `transformer_prefill_batch(...)` runs a chunk of prompt positions through every layer, batching
+    the dense FFN while the attention half stays per token; `batch_prefill_supported(...)` gates it
+    (post-norm BERT, Gemma3 ordering, and per-token MoE routing fall back to the sequential loop)
+  - `PrefillInput::{Token, Embedding}` lets that chunk mix vocabulary tokens with encoder-produced
+    embeddings, so audio and image prompts prefill in batches instead of one position at a time.
+    Embeddings must be `dim` wide; deepstack prompts, whose embeddings carry a per-layer tail that
+    only the sequential path replays, stay on the per-token loop
   - accepts multimodal prefill vectors at either `dim` or `input_embedding_dim`
   - applies per-layer deepstack residual injection for Qwen3-VL-style expanded embeddings
   - reuses kernel activation scratch across the high-frequency sequential projection calls in a token step, including prepared-activation reuse across compatible dense, BERT fused, Qwen3Next full-attention, and FFN gate/up projection groups
@@ -434,11 +562,17 @@ src/
   - Keeps `qwen35*` checkpoints on `qwen35` vendor prompt/decode policies even when the runtime executes their recurrent/SSM layers through the Qwen3Next-style engine path.
   - Sets generic runtime feature flags on `Config` from vendor/model metadata so engine code can consume runtime behavior without new family branches.
   - Probes multimodal capability from tokenizer special tokens + GGUF tensor prefixes for `gemma3`, `qwen3vl`, and `qwen35`.
-  - Performs vendor-specific mmproj sidecar compatibility checks (`validate_mmproj_for_backend(...)`) including projector type, projection dim matching, and Qwen family/deepstack guards.
+  - Performs vendor-specific mmproj sidecar compatibility checks (`validate_mmproj_for_backend(...)`):
+    - vision projector type, projection dim matching, and Qwen family/deepstack guards
+    - Qwen3-ASR audio-only metadata (`clip.audio.*`), text/audio dimension compatibility, and mandatory `a.*`/`mm.a.*` tensor-name validation
+    - rejects combined vision/audio sidecars until both encoder paths can be constructed independently
   - Dispatches vendor policies used by app/tokenizer decode paths:
     - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`, hidden/visible think budgets, multimodal think preference, think-retry toggles)
     - `tokenizer_policy(...)` returning `VendorTokenizerPolicy`
     - `multimodal_policy(...)` returning `VendorMultimodalPolicy` (image prompt suffix, detail-crop behavior, mmproj candidate scoring hints, sidecar diagnostics hint)
+    - `audio_preprocess_config(...)` returning the backend-specific decode, resource-limit, log-Mel, and feature-window profile without placing Qwen3-ASR constants in app/engine branches
+    - `audio_transcription_policy(...)` returning backend-owned request construction, decode/stopping,
+      forced-language validation, typed output parsing behavior, and required KV-cache format
     - `runtime_debug_policy(...)` returning `VendorRuntimeDebugPolicy` (family-specific native-context debug label)
   - Routes both simple chat prompt encoding and structured `GenerationRequest` encoding to family-specific implementation.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen*.rs`:
@@ -446,10 +580,16 @@ src/
   - Qwen family is split by variant:
     - `qwen2.rs`: Qwen2 chat template + baseline decode/tokenizer policies.
     - `qwen3.rs`: Qwen3-MoE defaults/validation helpers and Qwen3 prompt wrappers.
+    - `qwen3_asr.rs`: Qwen3-ASR context/audio request contract, supported forced languages,
+      `<asr_text>` parser, silence/fallback handling, upstream-compatible repetition cleanup, and
+      Q8 KV-cache requirement.
     - `qwen35.rs`: Qwen3.5 decode/tokenizer/multimodal policies (detail-crop opt-in and sidecar hints).
     - `qwen3vl.rs`: Qwen3-VL decode/tokenizer/multimodal policies.
     - `qwen3next.rs`: Qwen3-Next SSM validation/debug + decode/tokenizer policies.
-    - `qwen_common.rs`: shared Qwen stop-token constants, runtime debug policy, and Qwen3 structured prompt encoder with image/video/audio placeholder-span mapping.
+    - `qwen_common.rs`: shared Qwen stop-token constants, runtime debug policy, and Qwen3 structured prompt encoder with image/video/audio placeholder-span mapping; audio uses the exact `<|audio_start|><|audio_pad|><|audio_end|>` marker sequence, and exact assistant prefills preserve `<asr_text>` as one vocabulary token.
+  - Tokenizer initialization honors `tokenizer.ggml.add_bos_token`; this prevents Qwen3-ASR's
+    converted `<|im_end|>` BOS ID from being inserted when its source tokenizer says
+    `add_bos_token=false`.
 
 ## Runtime Data Flow
 
@@ -467,7 +607,11 @@ src/
   - runtime validates prompt/media alignment before starting preprocessing.
   - if native multimodal tensors are unavailable, runtime fails with a qualified native-capability error that includes architecture/token/tensor probe details.
   - vendor decode policy built (`vendors::decode_policy(...)`) and applied by the token loop for think-tag parsing, phase-bounded visible/hidden think decoding, stop-token matching, deterministic loop-guard behavior, and vendor-enabled think-recovery retries.
-  - token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`); native media embedding injection remains in progress.
+  - both repetition guards are policy-owned: `deterministic_loop_guard` covers the suffix/line checks and `unconditional_loop_guard` covers the repeated-phrase and token-cycle checks, so families whose valid output repeats verbatim, such as transcription, keep their full output.
+  - token loop executes forward passes (`engine::runtime::transformer(...)`) + sampling (`engine::kernels`); image injection is active, while audio injection is wired but held behind the model-parity readiness gate.
+  - the internal transcription route obtains its policy from the loaded `AudioEncoderBackend`, keeps
+    context as the exact system turn (without RAG augmentation), uses a plain ChatML assistant prefix,
+    and parses the raw continuation into `AudioTranscriptionResult` after generation.
 10. Agent mode:
   - tool transcript prompt encoded per turn
   - model emits JSON `tool_call` / `final`

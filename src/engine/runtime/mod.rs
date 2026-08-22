@@ -4,9 +4,10 @@ mod parallel;
 use crate::engine::types::Config;
 
 pub(crate) use inference::{
-    PrefillScratch, batch_prefill_supported, malloc_run_state, transformer,
-    transformer_prefill_batch, transformer_with_embedding,
-    transformer_with_embedding_without_logits, transformer_without_logits,
+    PrefillInput, PrefillScratch, batch_prefill_supported, malloc_run_state,
+    malloc_run_state_with_kv_cache_format, transformer, transformer_prefill_batch,
+    transformer_with_embedding, transformer_with_embedding_without_logits,
+    transformer_without_logits,
 };
 pub(crate) use parallel::configure_rayon_threads;
 
