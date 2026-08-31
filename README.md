@@ -385,6 +385,47 @@ per line; failed items produce `status:"error"`, processing continues, and the c
 nonzero after the batch if any item failed. REPL audio is not implemented. Embedded callers can
 reuse one loaded `EmbeddedRuntime` across files via `transcribe_audio(...)`.
 
+## Speaker Recognition
+
+A dedicated `speaker_xvector` GGUF can produce speaker embeddings without loading a language
+model. Enrollment is additive: the index retains every observation and rebuilds a quality-weighted
+profile, so later recordings can refine an existing speaker.
+
+```bash
+# Stateless embedding
+gguf-runner \
+  --speaker-model ./speaker-xvector.gguf \
+  --speaker-embed \
+  --audio ./alice.wav
+
+# Create or refine Alice's profile
+gguf-runner \
+  --speaker-model ./speaker-xvector.gguf \
+  --speaker-index ./team.spkidx \
+  --speaker-enroll alice \
+  --audio ./alice.wav
+
+# Or reuse output previously saved by --speaker-embed
+gguf-runner \
+  --speaker-index ./team.spkidx \
+  --speaker-enroll alice \
+  --speaker-embedding-input ./alice-embeddings.jsonl
+
+# Open-set identification
+gguf-runner \
+  --speaker-model ./speaker-xvector.gguf \
+  --speaker-index ./team.spkidx \
+  --speaker-identify \
+  --audio ./unknown.wav
+```
+
+The same self-contained path supports verification, candidate-reviewed or guarded automatic
+profile refinement, observation removal, and basic meeting diarization. Existing indexes and
+exported embeddings can be used without loading the speaker model, and diarization can cluster
+unknown voices without an index. WAV is currently the only in-process audio container,
+simultaneous speakers are not separated, and voice matches are not an authentication factor. See
+`docs/speaker-recognition.md` for the complete guide and model contract.
+
 ### Audio performance notes
 
 Transcription cost is dominated by the language model, not by audio decoding — roughly 80% prefill
@@ -417,6 +458,7 @@ same model prefills noticeably faster. See `docs/performance.md` for measurement
 - Performance history: `docs/performance.md`
 - Tokenizer benchmark flow: `docs/tokenizer-benchmark.md`
 - Module layout: `docs/module-structure.md`
+- Speaker recognition and additive profiles: `docs/speaker-recognition.md`
 
 ## GGUF Metadata Dump (No Inference)
 

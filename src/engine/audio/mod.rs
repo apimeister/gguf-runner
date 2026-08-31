@@ -2,8 +2,18 @@ mod decode;
 mod features;
 
 pub(crate) use decode::{
-    load_audio_chunk_samples, prepare_audios_for_multimodal, probe_audios_for_multimodal,
+    decode_audio_file, load_audio_chunk_samples, prepare_audios_for_multimodal,
+    probe_audios_for_multimodal,
 };
+pub(crate) use features::extract_whisper_log_mel_windows;
+
+#[derive(Debug)]
+pub(crate) struct DecodedAudio {
+    pub(crate) source_sample_rate: u32,
+    pub(crate) source_channels: u16,
+    pub(crate) sample_rate: u32,
+    pub(crate) samples_mono_f32: Vec<f32>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PreparedAudioChunk {

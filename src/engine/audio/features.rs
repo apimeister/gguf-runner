@@ -421,7 +421,7 @@ pub(super) fn plan_whisper_log_mel_windows(
     )
 }
 
-pub(super) fn extract_whisper_log_mel_windows(
+pub(crate) fn extract_whisper_log_mel_windows(
     samples: &[f32],
     config: WhisperLogMelConfig,
 ) -> Result<Vec<PreparedAudioFeatureWindow>, String> {

@@ -18,6 +18,28 @@ Supported families:
 Currently unsupported:
 - DeepSeek architectures (`deepseek*` GGUF metadata)
 
+## Speaker Recognition
+
+- Dedicated `speaker_xvector` GGUF runtime; no language model or ASR-language embeddings are used.
+- Stateless, versioned JSONL embedding output with model fingerprint and recording-quality
+  metadata; exported embeddings can be reused for enrollment, verification, or identification
+  without another encoder pass.
+- Versioned local `.spkidx` profiles with append-only observations and derived quality-weighted
+  centroids.
+- Additive enrollment, 1:1 verification, open-set 1:N identification, explicit unknown results,
+  top-one/top-two margins, profile/observation listing and removal.
+- Conservative refinement modes: off by default, editable JSONL candidates, or explicitly enabled
+  high-confidence automatic updates.
+- In-process energy VAD, known-speaker association, and unknown-speaker clustering for finite
+  meeting WAVs, with an optional profile index; overlapping-speaker separation is not implemented.
+- File and embedded-byte `SpeakerRuntime` entrypoints plus a retained, model-free
+  `SpeakerIndexRuntime` for exported-embedding and profile-management operations.
+- Model/index fingerprints prevent cross-model embedding comparisons. Model thresholds are required
+  metadata rather than universal runner constants.
+- Speaker association is not authentication or liveness detection.
+
+See `docs/speaker-recognition.md` for usage, privacy guidance, limitations, and the GGUF contract.
+
 ## Quantization / Tensor Type Support
 
 Supported tensor data paths include:

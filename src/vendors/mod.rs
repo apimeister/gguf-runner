@@ -13,12 +13,14 @@ mod qwen3next;
 mod qwen3vl;
 mod qwen_common;
 mod smolvlm;
+mod speaker_xvector;
 
 use crate::engine::audio::{AudioDecodeConfig, AudioPreprocessConfig, WhisperLogMelConfig};
 use crate::engine::io::{
     get_gguf_bool_from_map, get_gguf_float_from_map, get_gguf_i64_array_from_map,
     get_gguf_int_from_map, get_gguf_string_from_map,
 };
+use crate::engine::speaker::SpeakerModelPolicy;
 use crate::engine::types::{
     AudioEncoderBackend, AudioTranscriptionResult, Config, ContentPart, EncodedPrompt, GGUFFile,
     GenerationRequest, KvCacheFormat, ModelCapabilities, MultimodalBackend, ThinkMode, Tokenizer,
@@ -108,6 +110,17 @@ pub(crate) fn audio_transcription_policy(
 ) -> VendorAudioTranscriptionPolicy {
     match backend {
         AudioEncoderBackend::Qwen3Asr => qwen3_asr::transcription_policy(),
+    }
+}
+
+pub(crate) fn speaker_model_policy(gguf: &GGUFFile) -> Result<SpeakerModelPolicy, String> {
+    let architecture = get_gguf_string_from_map(&gguf.kv, "general.architecture")
+        .ok_or_else(|| "speaker GGUF is missing 'general.architecture' metadata".to_string())?;
+    match architecture {
+        "speaker_xvector" => speaker_xvector::policy(gguf),
+        other => Err(format!(
+            "unsupported speaker GGUF architecture '{other}'; supported: speaker_xvector"
+        )),
     }
 }
 

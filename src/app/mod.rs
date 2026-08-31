@@ -1,6 +1,7 @@
 // Items in this module are used by the binary crate. When the library crate is linted
 // in isolation (cargo clippy without --bin) they appear unused because the lib only
-// exports EmbeddedRuntime and does not re-export binary-only code.
+// exports EmbeddedRuntime/SpeakerRuntime/SpeakerIndexRuntime and does not re-export
+// binary-only code.
 #![allow(dead_code)]
 
 mod agent;
@@ -12,6 +13,8 @@ mod generation;
 mod image_batch;
 pub(crate) mod prefill_cache;
 mod repl;
+pub mod speaker;
+mod speaker_index;
 
 use crate::cli::CliOperationMode;
 use crate::cli::CliOptions;
@@ -273,6 +276,23 @@ pub(crate) fn run() -> Result<(), String> {
         for line in collect_debug_banner_lines(&cli) {
             eprintln!("{line}");
         }
+    }
+
+    if cli.speaker_action.is_some() {
+        if let Some(thread_count) = cli.threads {
+            crate::engine::runtime::configure_rayon_threads(thread_count, cli.debug);
+        }
+        speaker::run_cli(&cli)?;
+        if cli.profiling {
+            print_profile_report();
+        }
+        if cli.show_timings {
+            eprintln!(
+                "overall runtime: {:.3}s",
+                run_started.elapsed().as_secs_f64()
+            );
+        }
+        return Ok(());
     }
 
     // --rag-build: build (or rebuild) the RAG index and exit without generating.

@@ -4,6 +4,19 @@ Examples:
 - `wget https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf`
 - `wget https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-Q4_K_M.gguf`
 
+## Speaker embedding model
+
+Speaker recognition actions that consume audio use a dedicated `speaker_xvector` GGUF passed with
+`--speaker-model`; they do not use the language model or a multimodal sidecar. Existing indexes and
+exported embeddings can be queried or updated without loading that GGUF. The project does not
+currently bundle or name a pretrained checkpoint. A compatible model must implement the metadata,
+tensor, and audio-frontend contract documented in [Speaker Recognition](speaker-recognition.md).
+
+Renaming an ONNX, ECAPA-TDNN, or other speaker model to `.gguf` is not sufficient. Its weights must
+be converted to the documented `speaker_xvector` layout, and its training frontend must match the
+runner's frontend. Keep the exact GGUF file used for enrollment: the profile index records its
+fingerprint and rejects a different model.
+
 ## Qwen3-VL `mmproj` (vision encoder)
 
 Qwen3-VL GGUF is split into two artifacts:

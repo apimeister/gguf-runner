@@ -2,7 +2,8 @@ use std::fs;
 
 use super::features::{extract_whisper_log_mel_windows, plan_whisper_log_mel_windows};
 use super::{
-    AudioPreprocessConfig, PreparedAudioChunk, PreparedAudioInputPlan, PreparedAudioTensor,
+    AudioDecodeConfig, AudioPreprocessConfig, DecodedAudio, PreparedAudioChunk,
+    PreparedAudioInputPlan, PreparedAudioTensor, WhisperLogMelConfig,
 };
 
 const WAVE_FORMAT_PCM: u16 = 1;
@@ -505,19 +506,8 @@ fn probe_one(path: &str, config: AudioPreprocessConfig) -> Result<PreparedAudioI
 }
 
 fn prepare_one(path: &str, config: AudioPreprocessConfig) -> Result<PreparedAudioTensor, String> {
-    let bytes = read_bounded_audio_file(path, config)?;
-    let (format, data) = parse_wave_chunks(&bytes, config)
-        .map_err(|error| format!("cannot decode audio file '{path}': {error}"))?;
-    let source_sample_count = data.len() / usize::from(format.block_align);
-    let output_len =
-        checked_output_sample_count(path, source_sample_count, format.sample_rate, config)?;
-    let source_samples = decode_and_downmix(data, format);
-    let data_mono_f32 = resample_linear_low_pass(
-        &source_samples,
-        format.sample_rate,
-        config.decode.target_sample_rate,
-        output_len,
-    );
+    let decoded = decode_audio_file(path, config.decode)?;
+    let data_mono_f32 = decoded.samples_mono_f32;
     let feature_windows = extract_whisper_log_mel_windows(&data_mono_f32, config.features)
         .map_err(|error| format!("cannot extract audio features from '{path}': {error}"))?;
     let total_samples = data_mono_f32.len();
@@ -525,14 +515,54 @@ fn prepare_one(path: &str, config: AudioPreprocessConfig) -> Result<PreparedAudi
 
     Ok(PreparedAudioTensor {
         path: path.to_string(),
-        source_sample_rate: format.sample_rate,
-        source_channels: format.channels,
-        sample_rate: config.decode.target_sample_rate,
+        source_sample_rate: decoded.source_sample_rate,
+        source_channels: decoded.source_channels,
+        sample_rate: decoded.sample_rate,
         channels: 1,
         total_samples,
         chunks,
         feature_windows,
         data_mono_f32,
+    })
+}
+
+pub(crate) fn decode_audio_file(
+    path: &str,
+    decode_config: AudioDecodeConfig,
+) -> Result<DecodedAudio, String> {
+    let placeholder_features = WhisperLogMelConfig {
+        sample_rate: decode_config.target_sample_rate,
+        fft_length: 400,
+        window_length: 400,
+        hop_length: 160,
+        mel_bins: 1,
+        mel_floor: f32::MIN_POSITIVE,
+        max_window_frames: 1,
+        frame_chunk_size: 1,
+    };
+    let config = AudioPreprocessConfig {
+        decode: decode_config,
+        features: placeholder_features,
+    };
+    validate_config(config)?;
+    let bytes = read_bounded_audio_file(path, config)?;
+    let (format, data) = parse_wave_chunks(&bytes, config)
+        .map_err(|error| format!("cannot decode audio file '{path}': {error}"))?;
+    let source_sample_count = data.len() / usize::from(format.block_align);
+    let output_len =
+        checked_output_sample_count(path, source_sample_count, format.sample_rate, config)?;
+    let source_samples = decode_and_downmix(data, format);
+    let samples_mono_f32 = resample_linear_low_pass(
+        &source_samples,
+        format.sample_rate,
+        decode_config.target_sample_rate,
+        output_len,
+    );
+    Ok(DecodedAudio {
+        source_sample_rate: format.sample_rate,
+        source_channels: format.channels,
+        sample_rate: decode_config.target_sample_rate,
+        samples_mono_f32,
     })
 }
 

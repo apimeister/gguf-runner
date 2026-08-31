@@ -134,6 +134,43 @@ fn parse_operation_mode(raw: &str) -> Result<CliOperationMode, String> {
     }
 }
 
+fn parse_similarity_score(raw: &str) -> Result<f32, String> {
+    let value = raw
+        .parse::<f32>()
+        .map_err(|error| format!("invalid value '{raw}': {error}"))?;
+    if value.is_finite() && (-1.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "invalid value '{raw}': expected a finite cosine score in [-1, 1]"
+        ))
+    }
+}
+
+fn parse_identification_margin(raw: &str) -> Result<f32, String> {
+    let value = raw
+        .parse::<f32>()
+        .map_err(|error| format!("invalid value '{raw}': {error}"))?;
+    if value.is_finite() && (0.0..=2.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "invalid value '{raw}': expected a finite value in [0, 2]"
+        ))
+    }
+}
+
+fn parse_speaker_learning_mode(raw: &str) -> Result<CliSpeakerLearningMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(CliSpeakerLearningMode::Off),
+        "candidates" | "candidate" => Ok(CliSpeakerLearningMode::Candidates),
+        "auto" => Ok(CliSpeakerLearningMode::Auto),
+        _ => Err(format!(
+            "invalid value '{raw}': expected off/candidates/auto"
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CliKvCacheMode {
     Q8,
@@ -144,6 +181,27 @@ pub(crate) enum CliKvCacheMode {
 pub(crate) enum CliOperationMode {
     Oneshot,
     Repl,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CliSpeakerLearningMode {
+    #[default]
+    Off,
+    Candidates,
+    Auto,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CliSpeakerAction {
+    Embed,
+    Enroll(String),
+    Verify(String),
+    Identify,
+    Diarize,
+    Accept(String),
+    List,
+    RemoveSpeaker(String),
+    RemoveObservation(String),
 }
 
 #[derive(Clone, Debug)]
@@ -543,17 +601,12 @@ fn normalize_description_text(raw: String) -> Option<String> {
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Run GGUF language models",
+    about = "Run GGUF language and speaker models",
     long_about = None,
     disable_help_subcommand = true
 )]
 struct Cli {
-    #[arg(
-        long,
-        required_unless_present = "show_features",
-        default_value = "",
-        value_name = "model.gguf"
-    )]
+    #[arg(long, default_value = "", value_name = "model.gguf")]
     model: String,
 
     #[arg(long, default_value = "")]
@@ -593,6 +646,78 @@ struct Cli {
     /// Process a JSONL manifest of independent image generation requests.
     #[arg(long = "image-batch", value_name = "manifest.jsonl")]
     image_batch: Option<String>,
+
+    /// Speaker-embedding GGUF, required only when an action processes audio.
+    #[arg(long = "speaker-model", value_name = "speaker.gguf")]
+    speaker_model: Option<String>,
+
+    /// Persistent profile index; optional for unknown-only diarization.
+    #[arg(long = "speaker-index", value_name = "speakers.spkidx")]
+    speaker_index: Option<String>,
+
+    /// Emit L2-normalized embeddings for the --audio inputs without modifying an index.
+    #[arg(long = "speaker-embed")]
+    speaker_embed: bool,
+
+    /// Reuse one or more exported speaker embeddings as JSONL input.
+    #[arg(long = "speaker-embedding-input", value_name = "embeddings.jsonl")]
+    speaker_embedding_inputs: Vec<String>,
+
+    /// Add every audio or exported embedding input as a trusted observation.
+    #[arg(long = "speaker-enroll", value_name = "speaker-id")]
+    speaker_enroll: Option<String>,
+
+    /// Verify one audio or exported embedding against this claimed speaker id.
+    #[arg(long = "speaker-verify", value_name = "speaker-id")]
+    speaker_verify: Option<String>,
+
+    /// Identify one audio or exported embedding, or return unknown.
+    #[arg(long = "speaker-identify")]
+    speaker_identify: bool,
+
+    /// Segment and associate speakers in one meeting recording (no overlap separation).
+    #[arg(long = "speaker-diarize")]
+    speaker_diarize: bool,
+
+    /// Apply records marked accepted=true from a speaker candidate JSONL file.
+    #[arg(long = "speaker-accept", value_name = "candidates.jsonl")]
+    speaker_accept: Option<String>,
+
+    /// List profiles and removable observation ids from --speaker-index.
+    #[arg(long = "speaker-list")]
+    speaker_list: bool,
+
+    /// Delete one complete speaker profile from --speaker-index.
+    #[arg(long = "speaker-remove", value_name = "speaker-id")]
+    speaker_remove: Option<String>,
+
+    /// Delete one observation and recompute its speaker profile.
+    #[arg(long = "speaker-remove-observation", value_name = "observation-id")]
+    speaker_remove_observation: Option<String>,
+
+    /// Profile refinement after identification: off, candidates, or auto.
+    #[arg(
+        long = "speaker-learning",
+        value_parser = parse_speaker_learning_mode,
+        default_value = "off"
+    )]
+    speaker_learning: CliSpeakerLearningMode,
+
+    /// Append high-confidence refinement candidates as JSONL.
+    #[arg(long = "speaker-candidates", value_name = "candidates.jsonl")]
+    speaker_candidates: Option<String>,
+
+    /// Override the model/index verification threshold for index creation or update.
+    #[arg(long = "speaker-threshold", value_parser = parse_similarity_score)]
+    speaker_threshold: Option<f32>,
+
+    /// Override the required top-one/top-two identification margin.
+    #[arg(long = "speaker-margin", value_parser = parse_identification_margin)]
+    speaker_margin: Option<f32>,
+
+    /// Admit an enrollment/candidate that fails the profile consistency threshold.
+    #[arg(long = "speaker-force-enroll")]
+    speaker_force_enroll: bool,
 
     /// Sampling temperature (default: model hint or 0.9).
     #[arg(long)]
@@ -905,6 +1030,15 @@ pub(crate) struct CliOptions {
     pub(crate) audio_language: Option<String>,
     pub(crate) audio_batch: Option<String>,
     pub(crate) image_batch: Option<String>,
+    pub(crate) speaker_model: Option<String>,
+    pub(crate) speaker_index: Option<String>,
+    pub(crate) speaker_embedding_inputs: Vec<String>,
+    pub(crate) speaker_action: Option<CliSpeakerAction>,
+    pub(crate) speaker_learning: CliSpeakerLearningMode,
+    pub(crate) speaker_candidates: Option<String>,
+    pub(crate) speaker_threshold: Option<f32>,
+    pub(crate) speaker_margin: Option<f32>,
+    pub(crate) speaker_force_enroll: bool,
     pub(crate) temperature: Option<f32>,
     pub(crate) top_k: Option<usize>,
     pub(crate) top_p: Option<f32>,
@@ -970,6 +1104,7 @@ impl CliOptions {
     pub(crate) fn parse() -> Result<Self, String> {
         let cli = Cli::try_parse().map_err(|e| e.to_string())?;
         let mode = cli.mode;
+        let speaker_action = speaker_action_from_cli(&cli)?;
         let mut allowed_tools = match cli.allowed_tools.as_deref() {
             Some(raw) => parse_allowed_tools(raw)?,
             None => {
@@ -991,9 +1126,14 @@ impl CliOptions {
             }
         }
         let requested_tools_enabled = !allowed_tools.is_empty();
+        validate_speaker_options(&cli, speaker_action.as_ref(), requested_tools_enabled)?;
+        if !cli.show_features && speaker_action.is_none() && cli.model.trim().is_empty() {
+            return Err("`--model <model.gguf>` is required".to_string());
+        }
         if !cli.show_features
             && !cli.rag_build
             && cli.render_prefill_cache.is_none()
+            && speaker_action.is_none()
             && matches!(mode, CliOperationMode::Oneshot)
             && cli.prompt.trim().is_empty()
             && cli.audios.is_empty()
@@ -1036,6 +1176,15 @@ impl CliOptions {
             audio_language: cli.audio_language,
             audio_batch: cli.audio_batch,
             image_batch: cli.image_batch,
+            speaker_model: cli.speaker_model,
+            speaker_index: cli.speaker_index,
+            speaker_embedding_inputs: cli.speaker_embedding_inputs,
+            speaker_action,
+            speaker_learning: cli.speaker_learning,
+            speaker_candidates: cli.speaker_candidates,
+            speaker_threshold: cli.speaker_threshold,
+            speaker_margin: cli.speaker_margin,
+            speaker_force_enroll: cli.speaker_force_enroll,
             temperature: cli.temperature,
             top_k: cli.top_k,
             top_p: cli.top_p,
@@ -1096,6 +1245,241 @@ impl CliOptions {
             rag_max_tokens_per_chunk: cli.rag_max_tokens_per_chunk,
             rag_build: cli.rag_build,
         })
+    }
+}
+
+fn speaker_action_from_cli(cli: &Cli) -> Result<Option<CliSpeakerAction>, String> {
+    let mut actions = Vec::new();
+    if cli.speaker_embed {
+        actions.push(CliSpeakerAction::Embed);
+    }
+    if let Some(speaker_id) = &cli.speaker_enroll {
+        actions.push(CliSpeakerAction::Enroll(speaker_id.clone()));
+    }
+    if let Some(speaker_id) = &cli.speaker_verify {
+        actions.push(CliSpeakerAction::Verify(speaker_id.clone()));
+    }
+    if cli.speaker_identify {
+        actions.push(CliSpeakerAction::Identify);
+    }
+    if cli.speaker_diarize {
+        actions.push(CliSpeakerAction::Diarize);
+    }
+    if let Some(path) = &cli.speaker_accept {
+        actions.push(CliSpeakerAction::Accept(path.clone()));
+    }
+    if cli.speaker_list {
+        actions.push(CliSpeakerAction::List);
+    }
+    if let Some(speaker_id) = &cli.speaker_remove {
+        actions.push(CliSpeakerAction::RemoveSpeaker(speaker_id.clone()));
+    }
+    if let Some(observation_id) = &cli.speaker_remove_observation {
+        actions.push(CliSpeakerAction::RemoveObservation(observation_id.clone()));
+    }
+    if actions.len() > 1 {
+        return Err(
+            "speaker actions are mutually exclusive; choose one of --speaker-embed, --speaker-enroll, --speaker-verify, --speaker-identify, --speaker-diarize, --speaker-accept, --speaker-list, --speaker-remove, or --speaker-remove-observation"
+                .to_string(),
+        );
+    }
+    Ok(actions.pop())
+}
+
+fn validate_speaker_options(
+    cli: &Cli,
+    action: Option<&CliSpeakerAction>,
+    requested_tools_enabled: bool,
+) -> Result<(), String> {
+    let has_speaker_configuration = cli.speaker_model.is_some()
+        || cli.speaker_index.is_some()
+        || !cli.speaker_embedding_inputs.is_empty()
+        || cli.speaker_candidates.is_some()
+        || cli.speaker_threshold.is_some()
+        || cli.speaker_margin.is_some()
+        || cli.speaker_force_enroll
+        || !matches!(cli.speaker_learning, CliSpeakerLearningMode::Off);
+    let Some(action) = action else {
+        if has_speaker_configuration {
+            return Err("speaker options require exactly one --speaker-* action".to_string());
+        }
+        return Ok(());
+    };
+    if cli
+        .speaker_model
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("--speaker-model must not be empty".to_string());
+    }
+    if speaker_action_requires_model(cli, action) && cli.speaker_model.is_none() {
+        return Err(
+            "this speaker action processes audio and requires --speaker-model <speaker.gguf>"
+                .to_string(),
+        );
+    }
+    if !cli.model.trim().is_empty() {
+        return Err(
+            "speaker operations load --speaker-model directly; do not also pass --model"
+                .to_string(),
+        );
+    }
+    if !matches!(cli.mode, CliOperationMode::Oneshot) {
+        return Err("speaker operations are supported only in oneshot mode".to_string());
+    }
+    if requested_tools_enabled {
+        return Err("speaker operations cannot be combined with tools mode".to_string());
+    }
+    if cli.show_features
+        || cli.rag_build
+        || cli.render_prefill_cache.is_some()
+        || cli.prefill_cache.is_some()
+        || cli.audio_batch.is_some()
+        || cli.image_batch.is_some()
+        || !cli.images.is_empty()
+        || !cli.videos.is_empty()
+        || cli.audio_language.is_some()
+        || !cli.prompt.trim().is_empty()
+    {
+        return Err(
+            "speaker operations cannot be combined with generation, media-batch, prefill-cache, RAG-build, image/video, prompt, or audio-language options"
+                .to_string(),
+        );
+    }
+
+    let needs_index = !matches!(action, CliSpeakerAction::Embed | CliSpeakerAction::Diarize);
+    if needs_index && cli.speaker_index.as_deref().is_none_or(str::is_empty) {
+        return Err("this speaker action requires --speaker-index <speakers.spkidx>".to_string());
+    }
+    if matches!(action, CliSpeakerAction::Embed) && cli.speaker_index.is_some() {
+        return Err("--speaker-embed is stateless; do not pass --speaker-index".to_string());
+    }
+    if matches!(action, CliSpeakerAction::Diarize)
+        && cli.speaker_index.as_deref().is_some_and(str::is_empty)
+    {
+        return Err("--speaker-index must not be empty".to_string());
+    }
+
+    let audio_count = cli.audios.len();
+    let embedding_file_count = cli.speaker_embedding_inputs.len();
+    match action {
+        CliSpeakerAction::Embed if audio_count == 0 => {
+            return Err("--speaker-embed requires at least one --audio <path>".to_string());
+        }
+        CliSpeakerAction::Embed if embedding_file_count != 0 => {
+            return Err(
+                "--speaker-embed creates embeddings; do not pass --speaker-embedding-input"
+                    .to_string(),
+            );
+        }
+        CliSpeakerAction::Enroll(_) if audio_count == 0 && embedding_file_count == 0 => {
+            return Err(
+                "--speaker-enroll requires --audio or --speaker-embedding-input".to_string(),
+            );
+        }
+        CliSpeakerAction::Verify(_) | CliSpeakerAction::Identify
+            if audio_count + embedding_file_count == 0 =>
+        {
+            return Err(
+                "this speaker action requires one --audio or --speaker-embedding-input".to_string(),
+            );
+        }
+        CliSpeakerAction::Verify(_) | CliSpeakerAction::Identify if audio_count > 1 => {
+            return Err("this speaker action accepts at most one --audio <path>".to_string());
+        }
+        CliSpeakerAction::Verify(_) | CliSpeakerAction::Identify
+            if audio_count == 1 && embedding_file_count != 0 =>
+        {
+            return Err(
+                "choose either --audio or --speaker-embedding-input for this action".to_string(),
+            );
+        }
+        CliSpeakerAction::Diarize if audio_count != 1 || embedding_file_count != 0 => {
+            return Err(
+                "--speaker-diarize requires exactly one --audio and cannot use an exported embedding"
+                    .to_string(),
+            );
+        }
+        CliSpeakerAction::Accept(_)
+        | CliSpeakerAction::List
+        | CliSpeakerAction::RemoveSpeaker(_)
+        | CliSpeakerAction::RemoveObservation(_)
+            if audio_count != 0 || embedding_file_count != 0 =>
+        {
+            return Err(
+                "this speaker index action does not accept audio or embedding input".to_string(),
+            );
+        }
+        _ => {}
+    }
+
+    let learning_action = matches!(
+        action,
+        CliSpeakerAction::Identify | CliSpeakerAction::Diarize
+    );
+    if !learning_action && !matches!(cli.speaker_learning, CliSpeakerLearningMode::Off) {
+        return Err(
+            "--speaker-learning is supported only with --speaker-identify or --speaker-diarize"
+                .to_string(),
+        );
+    }
+    if matches!(action, CliSpeakerAction::Diarize)
+        && cli.speaker_index.is_none()
+        && !matches!(cli.speaker_learning, CliSpeakerLearningMode::Off)
+    {
+        return Err(
+            "index-free diarization supports --speaker-learning off only; provide --speaker-index to refine known profiles"
+                .to_string(),
+        );
+    }
+    match cli.speaker_learning {
+        CliSpeakerLearningMode::Candidates => {
+            if cli.speaker_candidates.as_deref().is_none_or(str::is_empty) {
+                return Err(
+                    "--speaker-learning candidates requires --speaker-candidates <candidates.jsonl>"
+                        .to_string(),
+                );
+            }
+        }
+        CliSpeakerLearningMode::Off | CliSpeakerLearningMode::Auto => {
+            if cli.speaker_candidates.is_some() {
+                return Err(
+                    "--speaker-candidates requires --speaker-learning candidates".to_string(),
+                );
+            }
+        }
+    }
+    if (cli.speaker_threshold.is_some() || cli.speaker_margin.is_some())
+        && !matches!(action, CliSpeakerAction::Enroll(_))
+    {
+        return Err(
+            "--speaker-threshold/--speaker-margin are applied when enrolling or creating an index"
+                .to_string(),
+        );
+    }
+    if cli.speaker_force_enroll
+        && !matches!(
+            action,
+            CliSpeakerAction::Enroll(_) | CliSpeakerAction::Accept(_)
+        )
+    {
+        return Err(
+            "--speaker-force-enroll requires --speaker-enroll or --speaker-accept".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn speaker_action_requires_model(cli: &Cli, action: &CliSpeakerAction) -> bool {
+    match action {
+        CliSpeakerAction::Embed | CliSpeakerAction::Diarize => true,
+        CliSpeakerAction::Enroll(_) | CliSpeakerAction::Verify(_) | CliSpeakerAction::Identify => {
+            !cli.audios.is_empty()
+        }
+        CliSpeakerAction::Accept(_)
+        | CliSpeakerAction::List
+        | CliSpeakerAction::RemoveSpeaker(_)
+        | CliSpeakerAction::RemoveObservation(_) => false,
     }
 }
 
@@ -1207,6 +1591,198 @@ mod tests {
     }
 
     #[test]
+    fn speaker_embed_is_stateless_and_does_not_require_text_prompt() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-model",
+            "speaker.gguf",
+            "--speaker-embed",
+            "--audio",
+            "voice.wav",
+        ])
+        .expect("parse speaker embed flags");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        assert_eq!(action, Some(CliSpeakerAction::Embed));
+        assert!(validate_speaker_options(&cli, action.as_ref(), false).is_ok());
+        assert!(cli.prompt.is_empty());
+        assert!(cli.model.is_empty());
+    }
+
+    #[test]
+    fn speaker_enroll_accepts_multiple_additive_recordings() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-model",
+            "speaker.gguf",
+            "--speaker-index",
+            "speakers.spkidx",
+            "--speaker-enroll",
+            "alice",
+            "--audio",
+            "intro.wav",
+            "--audio",
+            "meeting.wav",
+        ])
+        .expect("parse speaker enrollment flags");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        assert_eq!(action, Some(CliSpeakerAction::Enroll("alice".to_string())));
+        assert!(validate_speaker_options(&cli, action.as_ref(), false).is_ok());
+        assert_eq!(cli.audios.len(), 2);
+    }
+
+    #[test]
+    fn speaker_enroll_accepts_exported_embeddings_without_audio() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-index",
+            "speakers.spkidx",
+            "--speaker-enroll",
+            "alice",
+            "--speaker-embedding-input",
+            "alice-embeddings.jsonl",
+        ])
+        .expect("parse exported-embedding enrollment flags");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        assert!(validate_speaker_options(&cli, action.as_ref(), false).is_ok());
+        assert!(cli.audios.is_empty());
+        assert_eq!(cli.speaker_embedding_inputs.len(), 1);
+    }
+
+    #[test]
+    fn exported_embedding_identification_does_not_require_a_model() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-index",
+            "speakers.spkidx",
+            "--speaker-identify",
+            "--speaker-embedding-input",
+            "voice.jsonl",
+        ])
+        .expect("parse model-free speaker identification");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        assert!(validate_speaker_options(&cli, action.as_ref(), false).is_ok());
+        assert!(cli.speaker_model.is_none());
+    }
+
+    #[test]
+    fn audio_identification_still_requires_a_model() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-index",
+            "speakers.spkidx",
+            "--speaker-identify",
+            "--audio",
+            "voice.wav",
+        ])
+        .expect("parse audio speaker identification");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        let error = validate_speaker_options(&cli, action.as_ref(), false).unwrap_err();
+        assert!(error.contains("requires --speaker-model"));
+    }
+
+    #[test]
+    fn profile_listing_does_not_require_a_model() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-index",
+            "speakers.spkidx",
+            "--speaker-list",
+        ])
+        .expect("parse model-free speaker listing");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        assert!(validate_speaker_options(&cli, action.as_ref(), false).is_ok());
+    }
+
+    #[test]
+    fn diarization_can_cluster_without_an_index() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-model",
+            "speaker.gguf",
+            "--speaker-diarize",
+            "--audio",
+            "meeting.wav",
+        ])
+        .expect("parse index-free diarization");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        assert!(validate_speaker_options(&cli, action.as_ref(), false).is_ok());
+        assert!(cli.speaker_index.is_none());
+    }
+
+    #[test]
+    fn index_free_diarization_rejects_profile_learning() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-model",
+            "speaker.gguf",
+            "--speaker-diarize",
+            "--speaker-learning",
+            "auto",
+            "--audio",
+            "meeting.wav",
+        ])
+        .expect("parse index-free diarization learning");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        let error = validate_speaker_options(&cli, action.as_ref(), false).unwrap_err();
+        assert!(error.contains("index-free diarization"));
+    }
+
+    #[test]
+    fn speaker_identification_rejects_audio_plus_exported_embedding() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-model",
+            "speaker.gguf",
+            "--speaker-index",
+            "speakers.spkidx",
+            "--speaker-identify",
+            "--audio",
+            "voice.wav",
+            "--speaker-embedding-input",
+            "voice.jsonl",
+        ])
+        .expect("parse mixed speaker inputs");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        let error = validate_speaker_options(&cli, action.as_ref(), false).unwrap_err();
+        assert!(error.contains("choose either"));
+    }
+
+    #[test]
+    fn speaker_actions_are_mutually_exclusive() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-model",
+            "speaker.gguf",
+            "--speaker-embed",
+            "--speaker-identify",
+            "--audio",
+            "voice.wav",
+        ])
+        .expect("parse raw speaker flags");
+        assert!(speaker_action_from_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn candidate_learning_requires_candidate_output() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--speaker-model",
+            "speaker.gguf",
+            "--speaker-index",
+            "speakers.spkidx",
+            "--speaker-identify",
+            "--speaker-learning",
+            "candidates",
+            "--audio",
+            "voice.wav",
+        ])
+        .expect("parse speaker candidate flags");
+        let action = speaker_action_from_cli(&cli).unwrap();
+        let error = validate_speaker_options(&cli, action.as_ref(), false).unwrap_err();
+        assert!(error.contains("--speaker-candidates"));
+    }
+
+    #[test]
     fn image_batch_does_not_require_a_global_prompt() {
         let cli = Cli::try_parse_from([
             "gguf-runner",
@@ -1265,5 +1841,13 @@ mod tests {
         assert_eq!(parse_kv_cache_mode("tq"), Ok(CliKvCacheMode::Turbo));
         assert!(parse_kv_cache_mode("auto").is_err());
         assert!(parse_kv_cache_mode("q4").is_err());
+    }
+
+    #[test]
+    fn speaker_margin_is_nonnegative_and_may_span_the_cosine_range() {
+        assert_eq!(parse_identification_margin("0.25"), Ok(0.25));
+        assert_eq!(parse_identification_margin("2"), Ok(2.0));
+        assert!(parse_identification_margin("-0.01").is_err());
+        assert!(parse_identification_margin("2.01").is_err());
     }
 }

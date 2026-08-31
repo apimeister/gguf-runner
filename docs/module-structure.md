@@ -1,7 +1,8 @@
 # Module Structure Reference
 
 This project provides a binary entrypoint (`src/main.rs`) plus a small library facade (`src/lib.rs`)
-for `EmbeddedRuntime`; both share the same internal app, vendor, and engine modules.
+for `EmbeddedRuntime`, `SpeakerRuntime`, and `SpeakerIndexRuntime`; they share the same internal app,
+vendor, and engine modules.
 
 ## Maintenance Rule
 
@@ -24,6 +25,8 @@ src/
     generation.rs
     agent.rs
     repl.rs
+    speaker.rs
+    speaker_index.rs
   cli.rs
   rag/
     mod.rs
@@ -38,6 +41,8 @@ src/
       mod.rs
       decode.rs
       features.rs
+    speaker/
+      mod.rs
     io/
       mod.rs
       gguf.rs
@@ -75,6 +80,7 @@ src/
     qwen3next.rs
     qwen3_asr.rs
     qwen_common.rs
+    speaker_xvector.rs
 ```
 
 ## Module Responsibilities
@@ -109,6 +115,8 @@ src/
   - validates complete `--audio-batch` and `--image-batch` manifests before model load, retains one
     runtime per job, and routes records through the matching app batch module; image batches
     pre-encode bounded compatible chunks before independent ordered text generation
+  - routes speaker actions to `app::speaker` before language-model construction, so a dedicated
+    speaker GGUF never allocates text-model weights or generation state
   - tool-agent support is orthogonal to operation mode:
     - default `allowed-tools=none` in `oneshot`
     - default `allowed-tools=all` in `repl`
@@ -142,6 +150,36 @@ src/
   uses `generate_text_with_images(...)` with fresh inference state while retaining the loaded text
   model, `mmproj` sidecar, and the matching pre-encoded embedding.
 - Batches at most four records; encoder-specific shape and token limits may split a chunk further.
+
+### `src/app/speaker.rs`
+
+- Owns the public `SpeakerRuntime` library facade and CLI orchestration for stateless embedding,
+  additive enrollment, verification, open-set identification, candidate review/acceptance,
+  guarded automatic refinement, profile inspection/removal, and meeting diarization.
+- Loads a dedicated speaker GGUF directly, obtains model-family policy from `vendors`, and consumes
+  the generic `engine::speaker::SpeakerEncoder` without loading the language-model runtime.
+- Keeps identity matching and refinement policy in app: applies model/index thresholds, top-one/
+  top-two margin gates, explicit unknown results, high-confidence candidate production, and atomic
+  multi-record enrollment.
+- Reads strict, bounded, versioned embedding JSONL before model construction and permits the same
+  exported vector to be enrolled, verified, or identified after exact model/dimension validation.
+- Exposes `SpeakerIndexRuntime`, which retains a validated index for model-free exported-vector
+  matching and profile mutations; CLI index-only actions take this path even if `--speaker-model`
+  was supplied.
+- Implements finite meeting orchestration over engine-produced embeddings: energy VAD regions,
+  bounded non-overlapping windows, known-profile association, unknown-speaker clustering, adjacent
+  label merging, and per-speaker candidate coalescing. Overlap separation is explicitly unsupported.
+- Exposes structured JSON result types through `src/lib.rs`; supports speaker GGUF loading from a
+  file or static embedded bytes and model-free retained-index loading from a file.
+
+### `src/app/speaker_index.rs`
+
+- Owns the strict versioned `.spkidx` JSON schema and persistence limits.
+- Stores exact model identity, dimension, thresholds, speaker profiles, and every enrolled
+  observation with provenance and quality metadata.
+- Rebuilds quality/duration-weighted normalized centroids after additions or removals; rejects
+  duplicate or inconsistent additions unless the caller explicitly forces enrollment.
+- Replaces indexes through a same-directory temporary file, sync, and atomic rename.
 
 ### `src/app/repl.rs`
 
@@ -345,11 +383,22 @@ src/
   - `--audio <path>` for one-file offline transcription
   - `--audio-language <language>` for optional forced-language transcription
   - `--audio-batch <manifest.jsonl>` for serial offline jobs with structured JSONL output
+- Includes mutually exclusive speaker actions and their scoped options:
+  - `--speaker-embed`, `--speaker-enroll`, `--speaker-verify`, `--speaker-identify`,
+    `--speaker-diarize`, `--speaker-accept`, `--speaker-list`, `--speaker-remove`, and
+    `--speaker-remove-observation`
+  - `--speaker-model`, `--speaker-index`, conservative `--speaker-learning` modes, candidate output,
+    reusable `--speaker-embedding-input` JSONL, calibrated threshold/margin overrides, and explicit
+    forced enrollment
+- Requires `--speaker-model` only for audio-consuming actions, permits index-free unknown
+  diarization, and routes index/exported-vector-only actions without constructing an encoder.
+- Speaker-mode validation prevents accidental text-model loading and rejects generation/batch/tool
+  combinations before runtime construction.
 
 ### `src/engine/mod.rs`
 
 - Aggregates engine submodules:
-  - `audio`, `io`, `kernels`, `multimodal`, `profiling`, `runtime`, `switches`, `tokenizer`,
+  - `audio`, `io`, `kernels`, `multimodal`, `profiling`, `runtime`, `speaker`, `switches`, `tokenizer`,
     `types`, `vision`, `weights`.
 
 ### `src/engine/types.rs`
@@ -418,6 +467,8 @@ src/
   - bounds every chunk by the bytes present, so streams written without seeking keep their complete
     frames while a file whose declared data size fits must be frame-aligned
   - enforces vendor-provided file, channel, source-rate, and decoded-sample limits
+  - exposes a decode-only target-rate mono result so speaker inference can reuse the checked WAV
+    path without constructing Qwen3-ASR feature windows
   - averages channels deterministically into mono and uses a miniaudio-compatible linear converter
     with a fourth-order Butterworth low-pass filter for sample-rate conversion
   - plans bounded sample chunks while retaining one contiguous target-rate mono buffer
@@ -445,6 +496,20 @@ src/
 - The official 48-kHz/24-bit speech sample matches miniaudio across 240,820 resampled samples with
   maximum/mean absolute error `1.788139343e-7/3.564497433e-9`; short upsample and downsample impulse
   regressions lock the converter's filter transient and latency semantics.
+
+### `src/engine/speaker/mod.rs`
+
+- Defines generic speaker model policy/domain types consumed from `vendors`, including frontend
+  dimensions, TDNN context offsets, segment layers, duration limits, and calibrated thresholds.
+- Validates and loads the `speaker_xvector` tensor graph into generic quantized matrix handles.
+- Runs deterministic speaker inference: shared WAV decode/resample, Slaney log-Mel windows,
+  per-Mel utterance centering, edge-replicated TDNN context expansion, affine/ReLU frame layers,
+  mean/standard-deviation statistics pooling, segment projections, long-window aggregation, and
+  final L2 normalization.
+- Computes bounded recording-quality metadata and rejects silent, too-short, heavily clipped, or
+  inactive inputs before profile operations.
+- Provides model-independent normalized cosine scoring and vector normalization; it has no CLI,
+  app-index, user-id, or vendor-family dependency.
 
 ### `src/engine/multimodal/*`
 
@@ -593,6 +658,8 @@ src/
 - Vendor/model-family specific config parsing and prompt templating.
 - `vendors/mod.rs`:
   - Detects model family from GGUF metadata.
+  - Dispatches dedicated speaker GGUF metadata through `speaker_model_policy(...)`; generic
+    app/engine speaker flow contains no architecture string branch.
   - Rejects unsupported DeepSeek architectures (`deepseek*`) with a clear config error.
   - Builds `Config` from family-specific key conventions.
   - Detects `qwen35` explicitly and maps it onto the Qwen3Next-style runtime path.
@@ -627,18 +694,28 @@ src/
   - Tokenizer initialization honors `tokenizer.ggml.add_bos_token`; this prevents Qwen3-ASR's
     converted `<|im_end|>` BOS ID from being inserted when its source tokenizer says
     `add_bos_token=false`.
+- `vendors/speaker_xvector.rs`:
+  - recognizes only `general.architecture=speaker_xvector`
+  - validates required frontend, duration, TDNN context, segment-count, and calibrated-threshold
+    metadata with bounded layer/context counts
+  - maps family-owned metadata and tensor-name conventions into `engine::speaker::SpeakerModelPolicy`.
 
 ## Runtime Data Flow
 
 1. `main.rs` invokes `app::run()`.
 2. `app::run()` parses CLI (`CliOptions`).
 3. `app::run()` builds `RuntimeSwitchConfig` and calls `engine::switches::init_runtime_config(...)`.
-4. GGUF parsed via `engine::io::parse_gguf_file(...)`.
-5. Vendor config built with `vendors::build_config_from_gguf(...)`.
-6. Vendor tokenizer, multimodal, and runtime debug policies are built (`vendors::{tokenizer_policy,multimodal_policy,runtime_debug_policy}(...)`) and tokenizer is initialized (`engine::tokenizer::init_tokenizer_from_gguf(...)`).
-7. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`), with vendor runtime-context debug logging handled in app.
-8. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
-9. Standard mode:
+4. Speaker actions branch to `app::speaker` and exit before the language-model flow below. Actions
+   that consume audio load `--speaker-model`, obtain a vendor policy, and construct
+   `engine::speaker::SpeakerEncoder`; exported-vector and index-only actions instead retain a
+   `SpeakerIndexRuntime` and do not parse or fingerprint model weights. Diarization may run with or
+   without an index.
+5. GGUF parsed via `engine::io::parse_gguf_file(...)`.
+6. Vendor config built with `vendors::build_config_from_gguf(...)`.
+7. Vendor tokenizer, multimodal, and runtime debug policies are built (`vendors::{tokenizer_policy,multimodal_policy,runtime_debug_policy}(...)`) and tokenizer is initialized (`engine::tokenizer::init_tokenizer_from_gguf(...)`).
+8. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`), with vendor runtime-context debug logging handled in app.
+9. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
+10. Standard mode:
   - CLI media inputs are normalized into `engine::types::GenerationRequest` with `ContentPart` items.
   - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths and image spans on Gemma multimodal path.
   - runtime validates prompt/media alignment before starting preprocessing.
@@ -649,12 +726,12 @@ src/
   - the internal transcription route obtains its policy from the loaded `AudioEncoderBackend`, keeps
     context as the exact system turn (without RAG augmentation), uses a plain ChatML assistant prefix,
     and parses the raw continuation into `AudioTranscriptionResult` after generation.
-10. Agent mode:
+11. Agent mode:
   - tool transcript prompt encoded per turn
   - model emits JSON `tool_call` / `final`
   - host executes tool call (`tools`) and loops until final response or limit.
   - `shell_exec` calls are restricted to CLI/env-provided allowed commands; model can request missing commands with `shell_request_allowed`.
-11. Profiling/timings printed from `engine::profiling` + `app::run()`.
+12. Profiling/timings printed from `engine::profiling` + `app::run()`.
 
 ## Placement Rules For Future Changes
 
