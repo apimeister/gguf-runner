@@ -161,6 +161,43 @@ Q8_0 appears in neither `batch_fast_supported` (Q2_K..Q6_K) nor `batch_exact_sup
 cache locality remains. A K-quant build of the same model is the cheapest way to get the larger
 win; a batched Q8_0 kernel is the open work item.
 
+### Multimodal F16/BF16 encoder matrices
+
+Vision and Qwen3-ASR sidecar encoders batch F16/BF16 matrix projections across their token axis.
+The kernel expands each stored weight row once, evaluates all token dots, and retains parallel row
+execution; other storage types keep their existing per-token path. BF16 batches convert each F32
+activation to GGML's BF16 dot type once, then reuse the packed batch across all stored weight rows.
+On AArch64 hosts with `FEAT_BF16` (including Apple M5), runtime dispatch uses native `BFDOT` while
+retaining the portable NEON widening/F32 FMA implementation as the fallback. Set
+`GGUF_AARCH64_BF16=0` to force that fallback for comparison or rollback. x86_64 keeps its AVX2
+widening/FMA path.
+
+`--image-batch` additionally groups up to four same-shape Qwen3-VL/Qwen3.5 images into these token
+batches. Vision RoPE and attention remain isolated per image, and a 4096-patch-token bound splits
+large inputs before allocating encoder activations. Text prefill and decoding remain independent.
+
+An alternating width-1/width-4 check on `mac-m5-local` (2026-08-30) used the
+`Qwen3.5-2B-Q4_K_M` model with its F16 sidecar, four non-deduplicated path aliases for the same
+512x384 prepared crop, `--max-tokens 1 --think no --seed 1`, and a warm local release build. The
+one-token budget intentionally isolates media processing; it is not an output-quality setting.
+
+| encoder chunk width | total seconds, four trials | median total | mean seconds/image |
+|---:|---|---:|---:|
+| 1 | 36.193, 46.602, 44.406, 53.550 | 45.504 | 11.297 |
+| 4 | 37.390, 42.425, 48.309, 67.842 | 45.367 | 12.248 |
+
+All records completed with identical status/text output. The medians are effectively equal
+(-0.3% for width 4), while width 4 is 8.4% slower by mean and shows more variance. A fixed-eight-
+thread pair likewise did not show a gain. The honest result for this workload is therefore no
+demonstrated cross-record throughput improvement: a single 768-patch image already supplies a large
+matrix batch, and independent text prefill/decode remains. Treat the microbatch as a bounded
+execution path, not a speed claim, until a quieter multi-workload benchmark establishes otherwise.
+
+The Apple M5 enablement was checked with a 4096-element synthetic BF16 dot using already-packed
+activations: native `BFDOT` was about 4.1x faster than widening to F32 before FMA. Treat this as a
+kernel-level sanity check rather than an end-to-end model claim; sidecar shape, token count,
+threading, thermal state, and background load determine the realized encoder speedup.
+
 ### Threads
 
 30 s audio, warm cache:

@@ -22,6 +22,9 @@ Currently unsupported:
 
 Supported tensor data paths include:
 - `F32`, `F16`, `BF16`
+- F16/BF16 multimodal encoder matrices reuse each expanded weight row across a token batch; BF16
+  batches pack activations once and use native `BFDOT` on compatible AArch64 hosts (including
+  Apple M5), with portable NEON widening/F32 FMA as the fallback; x86_64 uses AVX2 widening/FMA
 - `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`
 - `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`
 - `IQ4_NL`
@@ -105,6 +108,10 @@ Supported tensor data paths include:
   - `--audio-batch <manifest.jsonl>` validates a strict `{id,path,language?,context?}` JSONL schema
     before model load, resolves relative audio paths from the manifest directory, retains one
     runtime, processes records serially, and flushes ordered structured success/error results
+  - `--image-batch <manifest.jsonl>` provides the same retained-runtime, prevalidated, ordered,
+    per-record-error contract for strict `{id,path,prompt,system_prompt?}` image jobs; bounded
+    four-record chunks jointly encode compatible same-shape Qwen3-VL/Qwen3.5 images while preserving
+    image-isolated attention, then run independent text generation in input order
   - `EmbeddedRuntime::transcribe_audio(...)` exposes the typed raw/language/transcript result and
     supports serial offline batch loops with one retained model/runtime
   - current runtime returns explicit errors for native video execution, mixed audio/image/video
@@ -140,12 +147,14 @@ Supported tensor data paths include:
 
 User-facing CLI options are defined in `src/cli.rs`.
 
-Audio-specific options:
+Media batch and audio-specific options:
 
 - `--audio <path>`: one finite file for offline Qwen3-ASR transcription
 - `--audio-language <language>`: optional canonical forced language; requires `--audio`
 - `--prompt <text>`: transcription context/hotword hint when `--audio` is present
 - `--audio-batch <manifest.jsonl>`: serial offline transcription with one model load and JSONL output
+- `--image-batch <manifest.jsonl>`: bounded vision microbatches plus ordered independent image
+  generation with one model/sidecar load and JSONL output
 
 Agent config file (optional):
 - `~/.gguf-runner/config.toml`
@@ -180,11 +189,13 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_PAR_ATTN_MIN_HEADS`
 - `GGUF_PAR_QWEN3NEXT_MIN_HEADS`
 - `GGUF_KV_CACHE_MODE` (`q8`, `turbo`)
+- `GGUF_MM_FLOAT_BATCH` (`0` restores per-token F16/BF16 multimodal encoder matmul)
 - `GGUF_KERNEL_VALIDATION_WARNINGS` (`1`/`true` to print one-time kernel self-check disable warnings)
 - `GGUF_LAYER_DEBUG`
 - `GGUF_LAYER_DEBUG_POS`
 - `GGUF_AARCH64_DOTPROD_Q8` (aarch64 only)
 - `GGUF_AARCH64_QK_MR4` (aarch64 only)
+- `GGUF_AARCH64_BF16` (`0` disables native `BFDOT` BF16 batch matmul; aarch64 only)
 - `GGUF_X86_AVX2` (x86_64 only)
 - `GGUF_X86_F16C` (x86_64 only)
 - `GGUF_X86_QK_MR4` (x86_64 only)

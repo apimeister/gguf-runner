@@ -57,6 +57,18 @@ pub(crate) fn bf16_to_fp32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
+/// Convert F32 to BF16 with round-to-nearest, ties-to-even. NaNs retain a
+/// non-zero payload so the conversion cannot turn them into infinities.
+#[inline]
+pub(crate) fn fp32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if bits & 0x7fff_ffff > 0x7f80_0000 {
+        ((bits >> 16) | 64) as u16
+    } else {
+        ((bits + (0x7fff + ((bits >> 16) & 1))) >> 16) as u16
+    }
+}
+
 fn read_exact_array<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
     let mut b = [0u8; N];
     r.read_exact(&mut b)?;

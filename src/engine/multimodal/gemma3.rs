@@ -3,13 +3,15 @@ use crate::engine::io::{
     get_gguf_int_from_map,
 };
 use crate::engine::kernels::{
-    axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size, matmul_quantized,
+    axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size,
     scale_slice_inplace,
 };
 use crate::engine::multimodal::injection::MediaEmbeddingSequence;
 use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
 use crate::engine::vision::PreparedImageTensor;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+
+use super::{FloatBatchMatmulScratch, matmul_encoder_batch};
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n_elements = 1usize;
@@ -688,6 +690,9 @@ impl Gemma3VisionEncoder {
         let mut proj_out = vec![0.0f32; n_tokens * self.dim];
         let dim = self.dim;
         let ff_dim = self.ff_dim;
+        let mut ffn_up_batch = vec![0.0f32; n_tokens * ff_dim];
+        let mut ffn_down_batch = vec![0.0f32; n_tokens * dim];
+        let mut batch_scratch = FloatBatchMatmulScratch::default();
         let eps = self.eps;
         let use_gelu = self.use_gelu;
 
@@ -699,20 +704,38 @@ impl Gemma3VisionEncoder {
                 layer_norm_affine(dst, src, &layer.ln1_w, &layer.ln1_b, eps);
             });
 
+            matmul_encoder_batch(
+                &mut q,
+                &x_norm,
+                &layer.attn_q_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
+            matmul_encoder_batch(
+                &mut k,
+                &x_norm,
+                &layer.attn_k_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
+            matmul_encoder_batch(
+                &mut v,
+                &x_norm,
+                &layer.attn_v_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
             q.par_chunks_mut(dim)
                 .zip(k.par_chunks_mut(dim))
                 .zip(v.par_chunks_mut(dim))
-                .enumerate()
-                .try_for_each(|(t, ((q_dst, k_dst), v_dst))| -> Result<(), String> {
-                    let src = &x_norm[t * dim..(t + 1) * dim];
-                    matmul_quantized(q_dst, src, &layer.attn_q_w, mapped)?;
+                .for_each(|((q_dst, k_dst), v_dst)| {
                     Self::add_bias(q_dst, &layer.attn_q_b);
-                    matmul_quantized(k_dst, src, &layer.attn_k_w, mapped)?;
                     Self::add_bias(k_dst, &layer.attn_k_b);
-                    matmul_quantized(v_dst, src, &layer.attn_v_w, mapped)?;
                     Self::add_bias(v_dst, &layer.attn_v_b);
-                    Ok(())
-                })?;
+                });
 
             let inv_scale = 1.0 / (self.head_dim as f32).sqrt();
             let head_dim = self.head_dim;
@@ -762,14 +785,17 @@ impl Gemma3VisionEncoder {
                 }
             }
 
-            proj_out.par_chunks_mut(dim).enumerate().try_for_each(
-                |(t, dst)| -> Result<(), String> {
-                    let src = &attn_out[t * dim..(t + 1) * dim];
-                    matmul_quantized(dst, src, &layer.attn_out_w, mapped)?;
-                    Self::add_bias(dst, &layer.attn_out_b);
-                    Ok(())
-                },
+            matmul_encoder_batch(
+                &mut proj_out,
+                &attn_out,
+                &layer.attn_out_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
             )?;
+            proj_out
+                .par_chunks_mut(dim)
+                .for_each(|dst| Self::add_bias(dst, &layer.attn_out_b));
             for i in 0..x.len() {
                 x[i] += proj_out[i];
             }
@@ -779,25 +805,38 @@ impl Gemma3VisionEncoder {
                 layer_norm_affine(dst, src, &layer.ln2_w, &layer.ln2_b, eps);
             });
 
-            x.par_chunks_mut(dim).enumerate().try_for_each_init(
-                || (vec![0.0f32; ff_dim], vec![0.0f32; dim]),
-                |(ffn_up, ffn_down), (t, dst)| -> Result<(), String> {
-                    let src = &x_norm[t * dim..(t + 1) * dim];
-                    matmul_quantized(ffn_up, src, &layer.ffn_up_w, mapped)?;
-                    Self::add_bias(ffn_up, &layer.ffn_up_b);
-                    for v in ffn_up.iter_mut() {
-                        *v = if use_gelu {
-                            Self::gelu(*v)
-                        } else {
-                            Self::quick_gelu(*v)
-                        };
-                    }
-                    matmul_quantized(ffn_down, ffn_up, &layer.ffn_down_w, mapped)?;
-                    Self::add_bias(ffn_down, &layer.ffn_down_b);
-                    axpy_inplace(dst, 1.0, ffn_down);
-                    Ok(())
-                },
+            matmul_encoder_batch(
+                &mut ffn_up_batch,
+                &x_norm,
+                &layer.ffn_up_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
             )?;
+            ffn_up_batch.par_chunks_mut(ff_dim).for_each(|values| {
+                Self::add_bias(values, &layer.ffn_up_b);
+                for value in values {
+                    *value = if use_gelu {
+                        Self::gelu(*value)
+                    } else {
+                        Self::quick_gelu(*value)
+                    };
+                }
+            });
+            matmul_encoder_batch(
+                &mut ffn_down_batch,
+                &ffn_up_batch,
+                &layer.ffn_down_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
+            x.par_chunks_mut(dim)
+                .zip(ffn_down_batch.par_chunks_mut(dim))
+                .for_each(|(destination, down)| {
+                    Self::add_bias(down, &layer.ffn_down_b);
+                    axpy_inplace(destination, 1.0, down);
+                });
         }
 
         for t in 0..n_tokens {

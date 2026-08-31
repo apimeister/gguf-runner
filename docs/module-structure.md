@@ -16,7 +16,9 @@ src/
   lib.rs
   app/
     mod.rs
+    batch.rs
     audio_batch.rs
+    image_batch.rs
     embed.rs
     events.rs
     generation.rs
@@ -102,8 +104,11 @@ src/
   - routes plain text-only non-agent turns through `generate_text(...)`; uses structured `GenerationRequest` execution only when media inputs are present
   - routes one-shot audio-only requests through `transcribe_audio(...)`, treating `--prompt` as
     context/hotword text and keeping transcript-only stdout separate from stderr diagnostics
-  - validates a complete `--audio-batch` manifest before model load, retains one runtime for the
-    serial job, and routes per-record file checks/transcription through `app::audio_batch`
+  - routes image-only one-shot requests through the same vendor-policy-aware
+    `generate_text_with_images(...)` path as image batch records and rejects empty successful output
+  - validates complete `--audio-batch` and `--image-batch` manifests before model load, retains one
+    runtime per job, and routes records through the matching app batch module; image batches
+    pre-encode bounded compatible chunks before independent ordered text generation
   - tool-agent support is orthogonal to operation mode:
     - default `allowed-tools=none` in `oneshot`
     - default `allowed-tools=all` in `repl`
@@ -121,6 +126,22 @@ src/
   success/error record per item, and flushes every result.
 - Keeps batch orchestration out of `engine`; each item uses the normal transcription request path
   and therefore receives fresh inference state while reusing loaded model and sidecar weights.
+
+### `src/app/batch.rs`
+
+- Shared bounded JSONL reader used by media batch modes.
+- Performs the full constant-space validation pass, records the manifest-relative base directory,
+  rewinds for execution, and detects record-count changes between validation and processing.
+
+### `src/app/image_batch.rs`
+
+- Owns the strict `{id,path,prompt,system_prompt?}` image batch schema and bounded chunk loop.
+- Resolves relative paths from the manifest directory, preserves input order, flushes each JSONL
+  success/error result, and continues after per-record failures.
+- Keeps image job orchestration in `app`; each chunk pre-encodes valid image paths, then each item
+  uses `generate_text_with_images(...)` with fresh inference state while retaining the loaded text
+  model, `mmproj` sidecar, and the matching pre-encoded embedding.
+- Batches at most four records; encoder-specific shape and token limits may split a chunk further.
 
 ### `src/app/repl.rs`
 
@@ -166,7 +187,7 @@ src/
   - llama-style local `mmproj*.gguf` sidecar discovery/probe for multimodal models (no extra CLI switch)
   - sidecar probe enforces checkpoint variant token matching (for example `2b`, `35b`, `a3b`) to prevent silent cross-size pairing
   - metadata-first Qwen3-ASR audio-only sidecar recognition records the validated `qwen3_asr` backend independently from vision capability
-  - eager and lazy loading construct `VisionEncoder` only for image/video requests when the selected sidecar exposes both vision encoder and projector tensors
+  - eager and lazy loading construct `VisionEncoder` for image/video requests and image batches when the selected sidecar exposes both vision encoder and projector tensors
   - eager and lazy audio requests construct a dedicated Qwen3-ASR `AudioEncoder`; diagnostics
     report loaded weights and effective execution readiness
   - embedded mmproj loading supports either the existing vision encoders or the Qwen3-ASR audio weight contract
@@ -439,12 +460,20 @@ src/
   - reads `clip.vision.image_mean/std` normalization metadata from mmproj GGUF when available
   - loads and applies optional `v.deepstack.*` layer branches, fused into projected media embeddings
   - uses SIMD dot products + rayon head-parallel attention for the vision self-attention hot path
+  - batches F16/BF16 QKV, output, FFN, and projector matrices across image tokens so each expanded
+    weight row is reused instead of decoded independently for every token
+  - jointly encodes up to four same-shape images per call, keeps attention and RoPE image-local,
+    restores input ordering, and caps each microbatch at 4096 patch tokens
   - emits language-space image token embeddings for prompt injection
 - `multimodal/gemma3.rs`:
   - Gemma3 CLIP/mmproj image encoder path (`clip.projector_type='gemma3'`)
   - runs ViT layers with separate q/k/v projections, patch-grid average pooling, RMS normalization, and `mm.input_projection` into text embedding space
   - full-resolution ViT path is default; optional pre-attention fast-pooling shortcut is opt-in via `GGUF_GEMMA3_ENABLE_FAST_POOL=1`
+  - batches F16/BF16 ViT projection and FFN matrices across image tokens
   - emits language-space image token embeddings for prompt injection
+- `multimodal/idefics3.rs`:
+  - Idefics3/SigLIP vision transformer, pixel shuffle, and language-space projection path
+  - batches F16/BF16 ViT projection, FFN, and final projector matrices across image tokens
 - `multimodal/qwen3_asr.rs`:
   - parses Qwen3-ASR `clip.audio.*` metadata into `Qwen3AsrAudioConfig`
   - validates all `a.*` convolution/transformer and `mm.a.*` projector shapes in GGML dimension order
@@ -457,12 +486,18 @@ src/
   - adds the first 13 positional rows repeatedly for each chunk, then executes every pre-LayerNorm audio transformer block with full-window bidirectional multi-head attention, GELU-ERF FFNs, optional biases, and residual connections
   - applies required `a.post_ln.*` normal LayerNorm after the transformer and before the audio projector
   - rounds F16/BF16 activations to GGML's matrix dot type; BF16 ties-to-even and matmul behavior have focused regressions
+  - batches F16/BF16 convolution projection, transformer projection/FFN, and audio projector
+    matrices across tokens while preserving the GGML activation-rounding contract
   - executes `mm.a.mlp.1` -> GELU-ERF -> `mm.a.mlp.2` through quantized matrix kernels and returns 13 text-model-width audio embeddings per padded 100-frame chunk
   - retains every padding-derived output token, matching the pinned source graph until model-backed fixtures establish whether a later trim is required
 - `multimodal/mod.rs`:
   - backend construction (`build_vision_encoder_from_mmproj`, `build_audio_encoder_from_mmproj`)
   - enables external vision `mmproj` construction for `gemma3`, `qwen3vl`, and `qwen35`, plus Qwen3-ASR audio weight-contract construction
   - encoder abstractions (`VisionEncoder`, `AudioEncoder`), including internal typed dispatch for isolated audio convolution, transformer, and language-space projector execution
+  - shared F16/BF16 token-batch dispatch for vision encoders, with the prior parallel per-token
+    matmul retained for other tensor types; macOS F16 batches use Accelerate SGEMM after parallel
+    weight expansion, while BF16 activations are packed once per batch for native AArch64 `BFDOT`
+    reuse when runtime `FEAT_BF16` is available
   - predicts Qwen3-ASR output counts from planned padded feature windows, dispatches each window through the complete sidecar graph, and concatenates adjacent chunks inside one audio marker envelope
   - `examples/audio_encoder_dump.rs` probes official sidecars and dumps convolution, per-layer,
     post-transformer, and projected F32 tensors from synthetic input, PCM WAV, or a captured
@@ -492,7 +527,7 @@ src/
 
 - Numerical and sampling kernels used by inference.
 - `math.rs`: normalization, softmax, vector math, Qwen3Next SSM linear attention helpers.
-- `quant.rs`: quantized dequant/dot/matmul paths, reusable activation scratch and explicit prepared-activation matmul entry points for allocation-free Q8 prequantized fast paths and x86 Q2_K/Q4_K/Q5_K/Q6_K VNNI activation reuse (including half-block activation sums for Q2_K min correction), architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K MR4 dispatch, ARM Q2_K/Q3_K and legacy Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL MR4 NEON coverage, x86 Q2_K/Q3_K plus legacy Q4_0/Q4_1/Q5_0/Q5_1 and IQ4_NL MR4 AVX2/FMA table-shuffle coverage, and x86 Q2_K/Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation (int8-aware scalar references for the VNNI dispatch paths), architecture-specific matmul row prefetch helpers (x86 + aarch64), exact batched-prefill helpers including serial and parallel tiled Q2_K/Q3_K/Q4_K/Q5_K/Q6_K scalar-exact dispatch for non-MR4 row windows, and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
+- `quant.rs`: quantized dequant/dot/matmul paths, reusable activation scratch and explicit prepared-activation matmul entry points for allocation-free Q8 prequantized fast paths and x86 Q2_K/Q4_K/Q5_K/Q6_K VNNI activation reuse (including half-block activation sums for Q2_K min correction), architecture-specific fast paths (including portable AArch64 NEON and x86 AVX2 BF16 widening/FMA dots, macOS Accelerate SGEMM for multimodal F16 token batches, runtime-gated AArch64 `BFDOT` token-batch matmul with reusable packed BF16 activation scratch, pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K MR4 dispatch, ARM Q2_K/Q3_K and legacy Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL MR4 NEON coverage, x86 Q2_K/Q3_K plus legacy Q4_0/Q4_1/Q5_0/Q5_1 and IQ4_NL MR4 AVX2/FMA table-shuffle coverage, and x86 Q2_K/Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation (int8-aware scalar references for the VNNI dispatch paths), architecture-specific matmul row prefetch helpers (x86 + aarch64), exact batched-prefill helpers including serial and parallel tiled Q2_K/Q3_K/Q4_K/Q5_K/Q6_K scalar-exact dispatch for non-MR4 row windows, an F16/BF16 token-batch kernel for multimodal encoders, and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
   - one-time kernel self-check disable warnings are now quiet by default and can be re-enabled with `GGUF_KERNEL_VALIDATION_WARNINGS=1`
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
 
@@ -539,6 +574,8 @@ src/
   - AArch64 matmul row prefetch distance switch (`aarch64_matmul_prefetch_rows`)
     - default values for non-x86 matmul thresholds and aarch64 prefetch distance are now derived from `available_parallelism()` heuristics (with CLI/env overrides preserved)
   - KV cache selection switch (`kv_cache_mode`: `q8` / `turbo`, default `turbo`)
+  - multimodal F16/BF16 token-batch kill switch (`use_mm_float_batch`, enabled by default)
+  - AArch64 native BF16 dot switch (`use_aarch64_bf16`, runtime-detected and enabled by default)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
     - default behavior uses runtime CPU feature detection for architecture fast paths (for example aarch64 `dotprod` Q8 and x86 `AVX512VNNI` Q8), while `RuntimeSwitchConfig`/CLI/env can still force-disable paths
   - Layer debug toggles

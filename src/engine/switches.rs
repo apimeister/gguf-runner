@@ -95,6 +95,8 @@ static AARCH64_DOTPROD_Q8_CFG: OnceLock<bool> = OnceLock::new();
 static AARCH64_QK_MR4_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "aarch64")]
 static AARCH64_I8MM_Q8_CFG: OnceLock<bool> = OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+static AARCH64_BF16_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
 static X86_AVX2_FMA_CFG: OnceLock<bool> = OnceLock::new();
 #[cfg(target_arch = "x86_64")]
@@ -153,6 +155,7 @@ static KV_CACHE_MODE_CFG: OnceLock<KvCacheMode> = OnceLock::new();
 static BATCH_PREFILL_CFG: OnceLock<bool> = OnceLock::new();
 static BATCH_PREFILL_EXACT_CFG: OnceLock<bool> = OnceLock::new();
 static BATCH_PREFILL_CHUNK_CFG: OnceLock<usize> = OnceLock::new();
+static MM_FLOAT_BATCH_CFG: OnceLock<bool> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvCacheMode {
@@ -173,6 +176,8 @@ pub(crate) struct RuntimeSwitchConfig {
     pub(crate) aarch64_qk_mr4: Option<bool>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) aarch64_i8mm: Option<bool>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_bf16: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_avx2: Option<bool>,
     #[cfg(target_arch = "x86_64")]
@@ -264,6 +269,17 @@ pub(crate) fn batch_prefill_chunk() -> usize {
     })
 }
 
+/// Multimodal F16/BF16 encoder token batching: on by default,
+/// `GGUF_MM_FLOAT_BATCH=0` restores the parallel per-token path.
+#[inline]
+pub(crate) fn use_mm_float_batch() -> bool {
+    *MM_FLOAT_BATCH_CFG.get_or_init(|| {
+        std::env::var("GGUF_MM_FLOAT_BATCH")
+            .map(|value| value.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn use_aarch64_dotprod_q8() -> bool {
@@ -280,6 +296,12 @@ pub(crate) fn use_aarch64_qk_mr4() -> bool {
 #[inline]
 pub(crate) fn use_aarch64_i8mm_q8() -> bool {
     *AARCH64_I8MM_Q8_CFG.get_or_init(|| std::arch::is_aarch64_feature_detected!("i8mm"))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn use_aarch64_bf16() -> bool {
+    *AARCH64_BF16_CFG.get_or_init(|| std::arch::is_aarch64_feature_detected!("bf16"))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -363,6 +385,10 @@ pub(crate) fn init_runtime_config(config: &RuntimeSwitchConfig) {
         if let Some(v) = config.aarch64_i8mm {
             let enabled = v && std::arch::is_aarch64_feature_detected!("i8mm");
             let _ = AARCH64_I8MM_Q8_CFG.set(enabled);
+        }
+        if let Some(v) = config.aarch64_bf16 {
+            let enabled = v && std::arch::is_aarch64_feature_detected!("bf16");
+            let _ = AARCH64_BF16_CFG.set(enabled);
         }
     }
 

@@ -317,6 +317,32 @@ In REPL mode, attach images with the `/image` command before your prompt:
 
 If required multimodal tensors/components are missing, the runner fails fast with a clear error.
 
+For an image batch with one text-model and `mmproj` load, pass a JSONL manifest:
+
+```json
+{"id":"scan-001","path":"images/invoice.jpg","prompt":"Extract the invoice total.","system_prompt":"Return only the value and currency."}
+{"id":"scan-002","path":"images/diagram.png","prompt":"Summarize this diagram."}
+```
+
+```bash
+gguf-runner \
+  --model ./Qwen3.5-2B-Q4_K_M.gguf \
+  --image-batch ./images.jsonl > results.jsonl
+```
+
+The complete strict `{id,path,prompt,system_prompt?}` schema is validated before either model is
+loaded. Relative image paths resolve from the manifest directory. Each record gets fresh inference
+state while the loaded model and sidecar remain resident. Results stay in input order and are
+flushed one JSON object per line; failed items produce `status:"error"`, later items continue, and
+the command exits nonzero after the batch if any item failed.
+
+The runner prepares records in bounded chunks of four. Compatible Qwen3-VL/Qwen3.5 images with the
+same preprocessed shape share one vision-encoder token batch; image attention remains isolated and
+the 4096-patch-token cap automatically splits large inputs. Text generation remains independent and
+ordered for every record. Other vision backends and incompatible shapes retain their normal encoder
+path. For short extraction jobs, use a direct prompt and the smallest `--max-tokens` value that
+reliably contains the answer; `--think no` can reduce decoding work for reasoning models.
+
 ## Audio Transcription
 
 Qwen3-ASR supports offline transcription of finite audio files. Place the matching

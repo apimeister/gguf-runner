@@ -3,13 +3,15 @@ use crate::engine::io::{
     get_gguf_int_from_map,
 };
 use crate::engine::kernels::{
-    axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size, matmul_quantized,
+    axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size,
     scale_slice_inplace,
 };
 use crate::engine::multimodal::injection::MediaEmbeddingSequence;
 use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
 use crate::engine::vision::PreparedImageTensor;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+
+use super::{FloatBatchMatmulScratch, matmul_encoder_batch};
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n = 1usize;
@@ -506,6 +508,9 @@ impl Idefics3VisionEncoder {
         let mut attn_head_major = vec![0.0f32; self.head_count * head_token_stride];
         let mut attn_out = vec![0.0f32; n_tokens * dim];
         let mut proj_out = vec![0.0f32; n_tokens * dim];
+        let mut intermediate_batch = vec![0.0f32; n_tokens * ff_dim];
+        let mut ffn_output_batch = vec![0.0f32; n_tokens * dim];
+        let mut batch_scratch = FloatBatchMatmulScratch::default();
 
         for l in 0..self.n_layers {
             let layer = &self.layers[l];
@@ -515,20 +520,38 @@ impl Idefics3VisionEncoder {
                 layer_norm_affine(dst, src, &layer.ln1_w, &layer.ln1_b, eps);
             });
 
+            matmul_encoder_batch(
+                &mut q,
+                &x_norm,
+                &layer.attn_q_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
+            matmul_encoder_batch(
+                &mut k,
+                &x_norm,
+                &layer.attn_k_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
+            matmul_encoder_batch(
+                &mut v,
+                &x_norm,
+                &layer.attn_v_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
             q.par_chunks_mut(dim)
                 .zip(k.par_chunks_mut(dim))
                 .zip(v.par_chunks_mut(dim))
-                .enumerate()
-                .try_for_each(|(t, ((q_dst, k_dst), v_dst))| -> Result<(), String> {
-                    let src = &x_norm[t * dim..(t + 1) * dim];
-                    matmul_quantized(q_dst, src, &layer.attn_q_w, mapped)?;
+                .for_each(|((q_dst, k_dst), v_dst)| {
                     Self::add_bias(q_dst, &layer.attn_q_b);
-                    matmul_quantized(k_dst, src, &layer.attn_k_w, mapped)?;
                     Self::add_bias(k_dst, &layer.attn_k_b);
-                    matmul_quantized(v_dst, src, &layer.attn_v_w, mapped)?;
                     Self::add_bias(v_dst, &layer.attn_v_b);
-                    Ok(())
-                })?;
+                });
 
             let inv_scale = 1.0 / (self.head_dim as f32).sqrt();
             let head_dim = self.head_dim;
@@ -575,14 +598,17 @@ impl Idefics3VisionEncoder {
                 }
             }
 
-            proj_out.par_chunks_mut(dim).enumerate().try_for_each(
-                |(t, dst)| -> Result<(), String> {
-                    let src = &attn_out[t * dim..(t + 1) * dim];
-                    matmul_quantized(dst, src, &layer.attn_out_w, mapped)?;
-                    Self::add_bias(dst, &layer.attn_out_b);
-                    Ok(())
-                },
+            matmul_encoder_batch(
+                &mut proj_out,
+                &attn_out,
+                &layer.attn_out_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
             )?;
+            proj_out
+                .par_chunks_mut(dim)
+                .for_each(|dst| Self::add_bias(dst, &layer.attn_out_b));
             for i in 0..tokens.len() {
                 tokens[i] += proj_out[i];
             }
@@ -592,28 +618,43 @@ impl Idefics3VisionEncoder {
                 layer_norm_affine(dst, src, &layer.ln2_w, &layer.ln2_b, eps);
             });
 
-            tokens.par_chunks_mut(dim).enumerate().try_for_each_init(
-                // intermediate=ff_dim (expand stage), output=dim (contract stage)
-                || (vec![0.0f32; ff_dim], vec![0.0f32; dim]),
-                |(intermediate, output), (t, dst)| -> Result<(), String> {
-                    let src = &x_norm[t * dim..(t + 1) * dim];
-                    // Expand: dim → ff_dim (ffn_down in this GGUF's naming)
-                    matmul_quantized(intermediate, src, &layer.ffn_down_w, mapped)?;
+            // Expand: dim -> ff_dim (ffn_down in this GGUF's naming).
+            matmul_encoder_batch(
+                &mut intermediate_batch,
+                &x_norm,
+                &layer.ffn_down_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
+            )?;
+            intermediate_batch
+                .par_chunks_mut(ff_dim)
+                .for_each(|intermediate| {
                     Self::add_bias(intermediate, &layer.ffn_down_b);
-                    for v in intermediate.iter_mut() {
-                        *v = if use_gelu {
-                            Self::gelu(*v)
+                    for value in intermediate {
+                        *value = if use_gelu {
+                            Self::gelu(*value)
                         } else {
-                            Self::quick_gelu(*v)
+                            Self::quick_gelu(*value)
                         };
                     }
-                    // Contract: ff_dim → dim (ffn_up in this GGUF's naming)
-                    matmul_quantized(output, intermediate, &layer.ffn_up_w, mapped)?;
-                    Self::add_bias(output, &layer.ffn_up_b);
-                    axpy_inplace(dst, 1.0, output);
-                    Ok(())
-                },
+                });
+            // Contract: ff_dim -> dim (ffn_up in this GGUF's naming).
+            matmul_encoder_batch(
+                &mut ffn_output_batch,
+                &intermediate_batch,
+                &layer.ffn_up_w,
+                mapped,
+                n_tokens,
+                &mut batch_scratch,
             )?;
+            tokens
+                .par_chunks_mut(dim)
+                .zip(ffn_output_batch.par_chunks_mut(dim))
+                .for_each(|(destination, output)| {
+                    Self::add_bias(output, &layer.ffn_up_b);
+                    axpy_inplace(destination, 1.0, output);
+                });
         }
         Ok(())
     }
@@ -689,15 +730,19 @@ impl Idefics3VisionEncoder {
 
         // 4. Linear projection: [n_out, expanded_dim] → [n_out, target_dim]
         let target_dim = self.proj_target_dim;
-        let mut projected = vec![0.0f32; target_dim];
-        let mut result_tokens: Vec<Vec<f32>> = Vec::with_capacity(n_out_tokens);
-
-        for t in 0..n_out_tokens {
-            let src = &shuffled[t * expanded_dim..(t + 1) * expanded_dim];
-            projected.fill(0.0);
-            matmul_quantized(&mut projected, src, &self.proj_fc_w, mapped)?;
-            result_tokens.push(projected.clone());
-        }
+        let mut projected = vec![0.0f32; n_out_tokens * target_dim];
+        matmul_encoder_batch(
+            &mut projected,
+            &shuffled,
+            &self.proj_fc_w,
+            mapped,
+            n_out_tokens,
+            &mut FloatBatchMatmulScratch::default(),
+        )?;
+        let result_tokens = projected
+            .chunks_exact(target_dim)
+            .map(<[f32]>::to_vec)
+            .collect();
 
         Ok(MediaEmbeddingSequence {
             tokens: result_tokens,

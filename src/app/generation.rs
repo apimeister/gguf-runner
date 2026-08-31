@@ -1554,6 +1554,7 @@ pub(crate) struct ModelRuntime {
     mmproj_sidecar: Option<MmprojSidecarProbe>,
     mmproj_candidates: Vec<String>,
     vision_encoder: Option<VisionEncoder>,
+    preencoded_image_embeddings: HashMap<String, MediaEmbeddingSequence>,
     audio_encoder: Option<AudioEncoder>,
     document_encoder: Option<DocumentEncoder>,
     rag_index: Option<RagIndex>,
@@ -2597,6 +2598,7 @@ impl ModelRuntime {
             mmproj_sidecar: None,
             mmproj_candidates: Vec::new(),
             vision_encoder: None,
+            preencoded_image_embeddings: HashMap::new(),
             audio_encoder: None,
             document_encoder: None,
             rag_index: None,
@@ -2720,6 +2722,7 @@ impl ModelRuntime {
             mmproj_sidecar: None,
             mmproj_candidates: Vec::new(),
             vision_encoder: None,
+            preencoded_image_embeddings: HashMap::new(),
             audio_encoder: None,
             document_encoder: None,
             rag_index: None,
@@ -2775,7 +2778,8 @@ impl ModelRuntime {
             debug_mode,
         )?;
         tokenizer.use_sentencepiece = config.is_gemma3;
-        let vision_requested = !cli.images.is_empty() || !cli.videos.is_empty();
+        let vision_requested =
+            !cli.images.is_empty() || !cli.videos.is_empty() || cli.image_batch.is_some();
         let media_requested = vision_requested || !cli.audios.is_empty();
         let (mmproj_sidecar, mmproj_candidates) = if media_requested
             && config.capabilities.multimodal_backend != MultimodalBackend::None
@@ -2994,6 +2998,7 @@ impl ModelRuntime {
             mmproj_sidecar,
             mmproj_candidates,
             vision_encoder,
+            preencoded_image_embeddings: HashMap::new(),
             audio_encoder,
             document_encoder,
             rag_index,
@@ -3485,6 +3490,145 @@ impl ModelRuntime {
         self.generate_request_with_rag(request, stream_stdout, true)
     }
 
+    /// Prepare and jointly encode a bounded set of independent image jobs.
+    /// The resulting embeddings are consumed by subsequent normal generation
+    /// requests whose image paths match this chunk.
+    pub(crate) fn preencode_image_batch(
+        &mut self,
+        image_paths: &[String],
+    ) -> Vec<Result<(), String>> {
+        self.preencoded_image_embeddings.clear();
+        if image_paths.is_empty() {
+            return Vec::new();
+        }
+
+        let mut unique_paths = Vec::new();
+        let mut unique_by_path = HashMap::new();
+        let mut request_to_unique = Vec::with_capacity(image_paths.len());
+        for path in image_paths {
+            let unique_index = if let Some(&index) = unique_by_path.get(path) {
+                index
+            } else {
+                let index = unique_paths.len();
+                unique_paths.push(path.clone());
+                unique_by_path.insert(path.clone(), index);
+                index
+            };
+            request_to_unique.push(unique_index);
+        }
+
+        if let Err(error) = self.ensure_external_multimodal_initialized(unique_paths.len(), 0, 0) {
+            return vec![Err(error); image_paths.len()];
+        }
+        if let Err(error) = self.ensure_native_media_support(unique_paths.len(), 0, 0) {
+            return vec![
+                Err(format!(
+                    "native multimodal execution required (fallback disabled): {error}"
+                ));
+                image_paths.len()
+            ];
+        }
+        let Some(encoder) = self.vision_encoder.as_ref() else {
+            return vec![
+                Err(format!(
+                    "image batch requires a compatible native vision encoder; {}",
+                    self.mmproj_summary()
+                ));
+                image_paths.len()
+            ];
+        };
+
+        let image_profile = self.image_preprocess_profile();
+        let mut unique_errors = vec![None; unique_paths.len()];
+        let mut prepared_unique_indices = Vec::new();
+        let mut prepared_images = Vec::new();
+        for (unique_index, path) in unique_paths.iter().enumerate() {
+            match prepare_images_for_multimodal(std::slice::from_ref(path), image_profile) {
+                Ok(mut prepared) => {
+                    prepared_unique_indices.push(unique_index);
+                    prepared_images.push(prepared.remove(0));
+                }
+                Err(error) => unique_errors[unique_index] = Some(error),
+            }
+        }
+
+        if !prepared_images.is_empty() {
+            match encoder.encode_images(&prepared_images) {
+                Ok(sequences) if sequences.len() == prepared_images.len() => {
+                    for ((&unique_index, prepared), sequence) in prepared_unique_indices
+                        .iter()
+                        .zip(prepared_images.iter())
+                        .zip(sequences)
+                    {
+                        self.preencoded_image_embeddings
+                            .insert(prepared.path.clone(), sequence);
+                        unique_errors[unique_index] = None;
+                    }
+                }
+                batch_result => {
+                    let batch_error = match batch_result {
+                        Ok(_) => "vision microbatch returned the wrong result count".to_string(),
+                        Err(error) => error,
+                    };
+                    if self.settings.debug_mode {
+                        emit_debug_line(
+                            self.settings.runtime_event_callback.as_ref(),
+                            format!(
+                                "Image vision microbatch failed ({batch_error}); retrying each image independently"
+                            ),
+                        );
+                    }
+                    for (&unique_index, prepared) in
+                        prepared_unique_indices.iter().zip(prepared_images.iter())
+                    {
+                        match encoder.encode_images(std::slice::from_ref(prepared)) {
+                            Ok(mut sequence) if sequence.len() == 1 => {
+                                self.preencoded_image_embeddings
+                                    .insert(prepared.path.clone(), sequence.remove(0));
+                                unique_errors[unique_index] = None;
+                            }
+                            Ok(_) => {
+                                unique_errors[unique_index] = Some(
+                                    "vision encoder returned the wrong result count".to_string(),
+                                );
+                            }
+                            Err(error) => unique_errors[unique_index] = Some(error),
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.settings.debug_mode {
+            emit_debug_line(
+                self.settings.runtime_event_callback.as_ref(),
+                format!(
+                    "Image vision microbatch: records={}, unique={}, encoded={}, failed={}",
+                    image_paths.len(),
+                    unique_paths.len(),
+                    self.preencoded_image_embeddings.len(),
+                    unique_errors.iter().filter(|error| error.is_some()).count()
+                ),
+            );
+        }
+
+        request_to_unique
+            .into_iter()
+            .map(|unique_index| {
+                if let Some(error) = &unique_errors[unique_index] {
+                    Err(error.clone())
+                } else if self
+                    .preencoded_image_embeddings
+                    .contains_key(&unique_paths[unique_index])
+                {
+                    Ok(())
+                } else {
+                    Err("vision microbatch did not retain an embedding".to_string())
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn transcribe_audio(
         &mut self,
         audio_path: &str,
@@ -3911,7 +4055,37 @@ impl ModelRuntime {
                         mmproj_note
                     )
                 })?;
-                image_embeddings = encoder.encode_images(&prepared_images)?;
+                let mut resolved_embeddings = vec![None; prepared_images.len()];
+                let mut missing_indices = Vec::new();
+                let mut missing_images = Vec::new();
+                for (index, prepared) in prepared_images.iter().enumerate() {
+                    if let Some(sequence) = self.preencoded_image_embeddings.get(&prepared.path) {
+                        resolved_embeddings[index] = Some(sequence.clone());
+                    } else {
+                        missing_indices.push(index);
+                        missing_images.push(prepared.clone());
+                    }
+                }
+                if !missing_images.is_empty() {
+                    let encoded_missing = encoder.encode_images(&missing_images)?;
+                    if encoded_missing.len() != missing_indices.len() {
+                        return Err(
+                            "vision encoder returned the wrong number of image embeddings"
+                                .to_string(),
+                        );
+                    }
+                    for (index, sequence) in missing_indices.into_iter().zip(encoded_missing) {
+                        resolved_embeddings[index] = Some(sequence);
+                    }
+                }
+                image_embeddings = resolved_embeddings
+                    .into_iter()
+                    .map(|sequence| {
+                        sequence.ok_or_else(|| {
+                            "vision encoder did not return an image embedding".to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 if self.settings.debug_mode
                     && let Some(first) = image_embeddings.first()
                 {

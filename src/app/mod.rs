@@ -5,21 +5,23 @@
 
 mod agent;
 mod audio_batch;
+mod batch;
 pub mod embed;
 mod events;
 mod generation;
+mod image_batch;
 pub(crate) mod prefill_cache;
 mod repl;
 
 use crate::cli::CliOperationMode;
 use crate::cli::CliOptions;
 use crate::engine::profiling::{print_profile_report, profiling_reset, set_profiling_enabled};
-#[cfg(target_arch = "aarch64")]
-use crate::engine::switches::aarch64_matmul_prefetch_rows;
 use crate::engine::switches::{
     KvCacheMode, RuntimeSwitchConfig, init_runtime_config, kv_cache_mode, par_attn_min_heads,
     par_matmul_chunk_rows, par_matmul_min_rows, par_qwen3next_min_heads,
 };
+#[cfg(target_arch = "aarch64")]
+use crate::engine::switches::{aarch64_matmul_prefetch_rows, use_aarch64_bf16};
 use crate::engine::types::{ContentPart, GenerationRequest, MediaRef};
 use std::fs;
 use std::io;
@@ -87,6 +89,11 @@ fn print_cpu_features() {
                 std::arch::is_aarch64_feature_detected!("fp16"),
             ),
             (
+                "bf16",
+                "ARMv8.6-A",
+                std::arch::is_aarch64_feature_detected!("bf16"),
+            ),
+            (
                 "i8mm",
                 "ARMv8.6-A",
                 std::arch::is_aarch64_feature_detected!("i8mm"),
@@ -111,7 +118,11 @@ fn print_cpu_features() {
         println!("gguf-runner kernels (aarch64):");
         println!("  NEON matmul Q4/Q5/Q6-K MR4:  always enabled");
         println!("  FCVTL fp16 loads:             always enabled (base AArch64)");
-        println!("  VSHLL bf16 loads:             always enabled (base AArch64)");
+        println!("  USHLL/SHL bf16 loads:         always enabled (base AArch64)");
+        println!(
+            "  BFDOT bf16 batch matmul:       runtime={}",
+            yn(std::arch::is_aarch64_feature_detected!("bf16"))
+        );
         println!(
             "  dotprod Q8_0:                 runtime={}",
             yn(std::arch::is_aarch64_feature_detected!("dotprod"))
@@ -166,6 +177,11 @@ fn print_cpu_features() {
                 std::arch::is_x86_feature_detected!("avx512vnni"),
             ),
             (
+                "avx512bf16",
+                "Intel Cooper Lk. 2020",
+                std::arch::is_x86_feature_detected!("avx512bf16"),
+            ),
+            (
                 "avx512vl",
                 "Intel Skylake-X 2017",
                 std::arch::is_x86_feature_detected!("avx512vl"),
@@ -187,6 +203,11 @@ fn print_cpu_features() {
             "  F16C fp16 loads:              runtime={}",
             yn(std::arch::is_x86_feature_detected!("avx")
                 && std::arch::is_x86_feature_detected!("f16c"))
+        );
+        println!(
+            "  AVX2 bf16 loads:              runtime={}",
+            yn(std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma"))
         );
         println!(
             "  AVX-VNNI Q8_0:                runtime={}",
@@ -224,6 +245,8 @@ pub(crate) fn run() -> Result<(), String> {
         aarch64_qk_mr4: cli.aarch64_qk_mr4,
         #[cfg(target_arch = "aarch64")]
         aarch64_i8mm: cli.aarch64_i8mm,
+        #[cfg(target_arch = "aarch64")]
+        aarch64_bf16: cli.aarch64_bf16,
         #[cfg(target_arch = "x86_64")]
         x86_avx2: cli.x86_avx2,
         #[cfg(target_arch = "x86_64")]
@@ -265,6 +288,12 @@ pub(crate) fn run() -> Result<(), String> {
                 .map(Path::new)
                 .map(audio_batch::open_and_validate_manifest)
                 .transpose()?;
+            let mut image_batch_manifest = cli
+                .image_batch
+                .as_deref()
+                .map(Path::new)
+                .map(image_batch::open_and_validate_manifest)
+                .transpose()?;
             let mut runtime = generation::ModelRuntime::load(&cli)?;
             if let Some(out) = &cli.render_prefill_cache {
                 let blob = runtime.render_prefill_cache_blob(&cli.system_prompt)?;
@@ -278,6 +307,8 @@ pub(crate) fn run() -> Result<(), String> {
                 }
                 if let Some(manifest) = audio_batch_manifest.as_mut() {
                     run_audio_batch_mode(&mut runtime, manifest)?;
+                } else if let Some(manifest) = image_batch_manifest.as_mut() {
+                    run_image_batch_mode(&mut runtime, manifest, &cli.system_prompt)?;
                 } else {
                     run_oneshot_mode(&mut runtime, &cli)?;
                 }
@@ -298,6 +329,86 @@ pub(crate) fn run() -> Result<(), String> {
         );
     }
 
+    Ok(())
+}
+
+fn run_image_batch_mode(
+    runtime: &mut generation::ModelRuntime,
+    manifest: &mut image_batch::ImageBatchManifest,
+    default_system_prompt: &str,
+) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let summary = image_batch::run_manifest(
+        manifest,
+        &mut output,
+        image_batch::IMAGE_BATCH_CHUNK_SIZE,
+        |jobs| {
+            let mut results = std::iter::repeat_with(|| None)
+                .take(jobs.len())
+                .collect::<Vec<Option<Result<String, String>>>>();
+            let mut valid_job_indices = Vec::new();
+            let mut valid_paths = Vec::new();
+            for (index, job) in jobs.iter().enumerate() {
+                let validation = job
+                    .resolved_path
+                    .to_str()
+                    .ok_or_else(|| "image batch path contains non-UTF8 characters".to_string())
+                    .and_then(|path| {
+                        validate_media_paths(
+                            &[path.to_string()],
+                            "image",
+                            1,
+                            MAX_IMAGE_BYTES,
+                            Some(IMAGE_EXTENSIONS),
+                        )
+                    });
+                match validation {
+                    Ok(mut paths) => {
+                        valid_job_indices.push(index);
+                        valid_paths.push(paths.remove(0));
+                    }
+                    Err(error) => results[index] = Some(Err(error)),
+                }
+            }
+
+            let preencoded = runtime.preencode_image_batch(&valid_paths);
+            for ((job_index, path), preencode_result) in valid_job_indices
+                .into_iter()
+                .zip(valid_paths)
+                .zip(preencoded)
+            {
+                let job = &jobs[job_index];
+                results[job_index] = Some(match preencode_result {
+                    Ok(()) => runtime
+                        .generate_text_with_images(
+                            &job.prompt,
+                            job.system_prompt
+                                .as_deref()
+                                .unwrap_or(default_system_prompt),
+                            std::slice::from_ref(&path),
+                            false,
+                        )
+                        .and_then(require_image_response_text),
+                    Err(error) => Err(error),
+                });
+            }
+
+            results
+                .into_iter()
+                .map(|result| {
+                    result
+                        .unwrap_or_else(|| Err("image batch did not produce a result".to_string()))
+                })
+                .collect()
+        },
+    )?;
+    if summary.failed > 0 {
+        return Err(format!(
+            "image batch completed with {} succeeded and {} failed item(s)",
+            summary.succeeded, summary.failed
+        ));
+    }
     Ok(())
 }
 
@@ -370,9 +481,23 @@ fn run_oneshot_mode(
         println!("{}", result.transcript);
         return Ok(());
     }
+    if !images.is_empty() && videos.is_empty() {
+        let output =
+            runtime.generate_text_with_images(&cli.prompt, &cli.system_prompt, &images, true)?;
+        require_image_response_text(output)?;
+        return Ok(());
+    }
     let request = build_generation_request(&cli.prompt, &cli.system_prompt, images, videos, audios);
     let _ = runtime.generate_request(&request, true)?;
     Ok(())
+}
+
+fn require_image_response_text(output: String) -> Result<String, String> {
+    if output.trim().is_empty() {
+        Err("image generation completed without response text".to_string())
+    } else {
+        Ok(output)
+    }
 }
 
 fn run_rag_build_mode(cli: &CliOptions) -> Result<(), String> {
@@ -657,8 +782,9 @@ pub(crate) fn collect_debug_banner_lines(cli: &CliOptions) -> Vec<String> {
     ));
     #[cfg(target_arch = "aarch64")]
     lines.push(format!(
-        "AArch64 prefetch: matmul_prefetch_rows={}",
-        aarch64_matmul_prefetch_rows()
+        "AArch64 kernels: matmul_prefetch_rows={}, bf16_bfdot={}",
+        aarch64_matmul_prefetch_rows(),
+        use_aarch64_bf16()
     ));
     lines.push(format!("KV cache mode request: {:?}", kv_cache_mode()));
     lines
@@ -738,7 +864,7 @@ fn build_generation_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{CWD_TEST_LOCK, expand_repl_tab_completion};
+    use super::{CWD_TEST_LOCK, expand_repl_tab_completion, require_image_response_text};
     use std::fs;
 
     #[test]
@@ -755,6 +881,16 @@ mod tests {
     fn repl_tab_completion_extends_shared_prefix_for_ambiguous_commands() {
         assert_eq!(expand_repl_tab_completion("/ima"), "/image");
         assert_eq!(expand_repl_tab_completion("/cl"), "/clear");
+    }
+
+    #[test]
+    fn image_generation_rejects_silent_success() {
+        assert!(require_image_response_text(String::new()).is_err());
+        assert!(require_image_response_text(" \n".to_string()).is_err());
+        assert_eq!(
+            require_image_response_text("chip name".to_string()).unwrap(),
+            "chip name"
+        );
     }
 
     #[test]

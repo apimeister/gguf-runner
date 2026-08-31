@@ -590,6 +590,10 @@ struct Cli {
     #[arg(long = "audio-batch", value_name = "manifest.jsonl")]
     audio_batch: Option<String>,
 
+    /// Process a JSONL manifest of independent image generation requests.
+    #[arg(long = "image-batch", value_name = "manifest.jsonl")]
+    image_batch: Option<String>,
+
     /// Sampling temperature (default: model hint or 0.9).
     #[arg(long)]
     temperature: Option<f32>,
@@ -774,6 +778,15 @@ struct Cli {
     )]
     aarch64_i8mm: Option<bool>,
 
+    #[cfg(target_arch = "aarch64")]
+    #[arg(
+        long = "aarch64-bf16",
+        hide = true,
+        env = "GGUF_AARCH64_BF16",
+        value_parser = parse_boolish
+    )]
+    aarch64_bf16: Option<bool>,
+
     #[cfg(target_arch = "x86_64")]
     #[arg(
         long = "x86-avx2",
@@ -891,6 +904,7 @@ pub(crate) struct CliOptions {
     pub(crate) audios: Vec<String>,
     pub(crate) audio_language: Option<String>,
     pub(crate) audio_batch: Option<String>,
+    pub(crate) image_batch: Option<String>,
     pub(crate) temperature: Option<f32>,
     pub(crate) top_k: Option<usize>,
     pub(crate) top_p: Option<f32>,
@@ -929,6 +943,8 @@ pub(crate) struct CliOptions {
     pub(crate) aarch64_qk_mr4: Option<bool>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) aarch64_i8mm: Option<bool>,
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) aarch64_bf16: Option<bool>,
     #[cfg(target_arch = "x86_64")]
     pub(crate) x86_avx2: Option<bool>,
     #[cfg(target_arch = "x86_64")]
@@ -982,10 +998,11 @@ impl CliOptions {
             && cli.prompt.trim().is_empty()
             && cli.audios.is_empty()
             && cli.audio_batch.is_none()
+            && cli.image_batch.is_none()
         {
             return Err("`--prompt` is required in oneshot mode".to_string());
         }
-        validate_audio_options(&cli, mode, requested_tools_enabled)?;
+        validate_batch_options(&cli, mode, requested_tools_enabled)?;
         let tool_prompt_specs = default_tool_prompt_specs();
         let loaded_shell = if requested_tools_enabled {
             load_shell_config_from_config()?
@@ -1018,6 +1035,7 @@ impl CliOptions {
             audios: cli.audios,
             audio_language: cli.audio_language,
             audio_batch: cli.audio_batch,
+            image_batch: cli.image_batch,
             temperature: cli.temperature,
             top_k: cli.top_k,
             top_p: cli.top_p,
@@ -1056,6 +1074,8 @@ impl CliOptions {
             aarch64_qk_mr4: cli.aarch64_qk_mr4,
             #[cfg(target_arch = "aarch64")]
             aarch64_i8mm: cli.aarch64_i8mm,
+            #[cfg(target_arch = "aarch64")]
+            aarch64_bf16: cli.aarch64_bf16,
             #[cfg(target_arch = "x86_64")]
             x86_avx2: cli.x86_avx2,
             #[cfg(target_arch = "x86_64")]
@@ -1079,7 +1099,7 @@ impl CliOptions {
     }
 }
 
-fn validate_audio_options(
+fn validate_batch_options(
     cli: &Cli,
     mode: CliOperationMode,
     requested_tools_enabled: bool,
@@ -1087,31 +1107,46 @@ fn validate_audio_options(
     if cli.audio_language.is_some() && cli.audios.is_empty() && cli.audio_batch.is_none() {
         return Err("`--audio-language` requires `--audio <path>`".to_string());
     }
-    if cli.audio_batch.is_none() {
-        return Ok(());
+    if cli.audio_batch.is_some() && cli.image_batch.is_some() {
+        return Err("`--audio-batch` and `--image-batch` are mutually exclusive".to_string());
     }
+    let batch_kind = if cli.audio_batch.is_some() {
+        "audio"
+    } else if cli.image_batch.is_some() {
+        "image"
+    } else {
+        return Ok(());
+    };
     if !matches!(mode, CliOperationMode::Oneshot) {
-        return Err("`--audio-batch` is supported only in oneshot mode".to_string());
+        return Err(format!(
+            "`--{batch_kind}-batch` is supported only in oneshot mode"
+        ));
     }
     if requested_tools_enabled {
-        return Err("`--audio-batch` cannot be combined with tools mode".to_string());
+        return Err(format!(
+            "`--{batch_kind}-batch` cannot be combined with tools mode"
+        ));
     }
     if !cli.audios.is_empty() || !cli.images.is_empty() || !cli.videos.is_empty() {
-        return Err(
-            "`--audio-batch` cannot be combined with `--audio`, `--image`, or `--video`"
-                .to_string(),
-        );
+        return Err(format!(
+            "`--{batch_kind}-batch` cannot be combined with `--audio`, `--image`, or `--video`"
+        ));
     }
-    if cli.audio_language.is_some() || !cli.prompt.trim().is_empty() {
+    if !cli.prompt.trim().is_empty() {
+        return Err(format!(
+            "batch prompt data belongs in each manifest record; do not combine `--{batch_kind}-batch` with `--prompt`"
+        ));
+    }
+    if cli.audio_batch.is_some() && cli.audio_language.is_some() {
         return Err(
-            "batch language and context belong in each manifest record; do not combine `--audio-batch` with `--audio-language` or `--prompt`"
+            "batch language and context belong in each manifest record; do not combine `--audio-batch` with `--audio-language`"
                 .to_string(),
         );
     }
     if cli.render_prefill_cache.is_some() || cli.prefill_cache.is_some() || cli.rag_build {
-        return Err(
-            "`--audio-batch` cannot be combined with prefill-cache or RAG build modes".to_string(),
-        );
+        return Err(format!(
+            "`--{batch_kind}-batch` cannot be combined with prefill-cache or RAG build modes"
+        ));
     }
     Ok(())
 }
@@ -1150,7 +1185,7 @@ mod tests {
         .expect("parse batch flags");
         assert!(cli.prompt.is_empty());
         assert!(
-            validate_audio_options(&cli, cli.mode, false).is_ok(),
+            validate_batch_options(&cli, cli.mode, false).is_ok(),
             "batch-only CLI should be valid"
         );
     }
@@ -1167,8 +1202,54 @@ mod tests {
             "global context",
         ])
         .expect("parse batch flags");
-        let error = validate_audio_options(&cli, cli.mode, false).expect_err("conflicting prompt");
+        let error = validate_batch_options(&cli, cli.mode, false).expect_err("conflicting prompt");
         assert!(error.contains("each manifest record"));
+    }
+
+    #[test]
+    fn image_batch_does_not_require_a_global_prompt() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--model",
+            "model.gguf",
+            "--image-batch",
+            "batch.jsonl",
+        ])
+        .expect("parse image batch flags");
+        assert!(cli.prompt.is_empty());
+        assert!(validate_batch_options(&cli, cli.mode, false).is_ok());
+    }
+
+    #[test]
+    fn image_batch_rejects_regular_media_flags() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--model",
+            "model.gguf",
+            "--image-batch",
+            "batch.jsonl",
+            "--image",
+            "one.jpg",
+        ])
+        .expect("parse image batch flags");
+        let error = validate_batch_options(&cli, cli.mode, false).expect_err("conflicting image");
+        assert!(error.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn media_batch_modes_are_mutually_exclusive() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--model",
+            "model.gguf",
+            "--audio-batch",
+            "audio.jsonl",
+            "--image-batch",
+            "images.jsonl",
+        ])
+        .expect("parse batch flags");
+        let error = validate_batch_options(&cli, cli.mode, false).expect_err("conflicting batches");
+        assert!(error.contains("mutually exclusive"));
     }
 
     #[test]

@@ -1,10 +1,8 @@
+use crate::app::batch::JsonlBatchManifest;
 use crate::engine::types::AudioTranscriptionResult;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-
-const MAX_MANIFEST_LINE_BYTES: usize = 1024 * 1024;
+use std::io::Write;
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,12 +40,7 @@ impl AudioBatchRecord {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct AudioBatchManifest {
-    file: File,
-    base_dir: PathBuf,
-    record_count: usize,
-}
+pub(crate) type AudioBatchManifest = JsonlBatchManifest;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AudioBatchSummary {
@@ -69,35 +62,11 @@ struct AudioBatchOutput<'a> {
 }
 
 pub(crate) fn open_and_validate_manifest(path: &Path) -> Result<AudioBatchManifest, String> {
-    let mut file = File::open(path)
-        .map_err(|err| format!("open audio batch manifest '{}': {err}", path.display()))?;
-    let record_count = {
-        let mut reader = BufReader::new(&mut file);
-        visit_records(&mut reader, |_record, _line_number| Ok(()))?
-    };
-    if record_count == 0 {
-        return Err(format!(
-            "audio batch manifest '{}' contains no records",
-            path.display()
-        ));
-    }
-    file.seek(SeekFrom::Start(0))
-        .map_err(|err| format!("rewind audio batch manifest '{}': {err}", path.display()))?;
-
-    let manifest_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let base_dir = if manifest_dir.is_absolute() {
-        manifest_dir.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|err| format!("resolve current directory for audio batch: {err}"))?
-            .join(manifest_dir)
-    };
-
-    Ok(AudioBatchManifest {
-        file,
-        base_dir,
-        record_count,
-    })
+    JsonlBatchManifest::open_and_validate::<AudioBatchRecord, _>(
+        path,
+        "audio batch",
+        AudioBatchRecord::validate,
+    )
 }
 
 pub(crate) fn run_manifest<W, F>(
@@ -109,98 +78,53 @@ where
     W: Write,
     F: FnMut(&Path, &str, Option<&str>) -> Result<AudioTranscriptionResult, String>,
 {
-    manifest
-        .file
-        .seek(SeekFrom::Start(0))
-        .map_err(|err| format!("rewind audio batch manifest: {err}"))?;
     let mut summary = AudioBatchSummary::default();
-    let base_dir = manifest.base_dir.clone();
-    let mut reader = BufReader::new(&mut manifest.file);
-    let processed = visit_records(&mut reader, |record, _line_number| {
-        let input_path = Path::new(&record.path);
-        let resolved_path = if input_path.is_absolute() {
-            input_path.to_path_buf()
-        } else {
-            base_dir.join(input_path)
-        };
+    let base_dir = manifest.base_dir().to_path_buf();
+    manifest.visit::<AudioBatchRecord, _, _>(
+        AudioBatchRecord::validate,
+        |record, _line_number| {
+            let input_path = Path::new(&record.path);
+            let resolved_path = if input_path.is_absolute() {
+                input_path.to_path_buf()
+            } else {
+                base_dir.join(input_path)
+            };
 
-        match transcribe(&resolved_path, &record.context, record.language.as_deref()) {
-            Ok(result) => {
-                summary.succeeded += 1;
-                write_output(
-                    writer,
-                    &AudioBatchOutput {
-                        id: &record.id,
-                        path: &record.path,
-                        status: "ok",
-                        language: (!result.language.is_empty()).then_some(result.language.as_str()),
-                        text: Some(&result.transcript),
-                        error: None,
-                    },
-                )?;
+            match transcribe(&resolved_path, &record.context, record.language.as_deref()) {
+                Ok(result) => {
+                    summary.succeeded += 1;
+                    write_output(
+                        writer,
+                        &AudioBatchOutput {
+                            id: &record.id,
+                            path: &record.path,
+                            status: "ok",
+                            language: (!result.language.is_empty())
+                                .then_some(result.language.as_str()),
+                            text: Some(&result.transcript),
+                            error: None,
+                        },
+                    )?;
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    write_output(
+                        writer,
+                        &AudioBatchOutput {
+                            id: &record.id,
+                            path: &record.path,
+                            status: "error",
+                            language: None,
+                            text: None,
+                            error: Some(&error),
+                        },
+                    )?;
+                }
             }
-            Err(error) => {
-                summary.failed += 1;
-                write_output(
-                    writer,
-                    &AudioBatchOutput {
-                        id: &record.id,
-                        path: &record.path,
-                        status: "error",
-                        language: None,
-                        text: None,
-                        error: Some(&error),
-                    },
-                )?;
-            }
-        }
-        Ok(())
-    })?;
-    if processed != manifest.record_count {
-        return Err(format!(
-            "audio batch manifest changed after validation: expected {} records, found {processed}",
-            manifest.record_count
-        ));
-    }
+            Ok(())
+        },
+    )?;
     Ok(summary)
-}
-
-fn visit_records<R, F>(reader: &mut R, mut visit: F) -> Result<usize, String>
-where
-    R: BufRead,
-    F: FnMut(AudioBatchRecord, usize) -> Result<(), String>,
-{
-    let mut line = String::new();
-    let mut line_number = 0usize;
-    let mut record_count = 0usize;
-    loop {
-        line.clear();
-        // Read at most one byte past the limit so a manifest without newlines
-        // cannot pull an unbounded line into memory before the check below.
-        let bytes = reader
-            .by_ref()
-            .take(MAX_MANIFEST_LINE_BYTES as u64 + 1)
-            .read_line(&mut line)
-            .map_err(|err| format!("read audio batch manifest line {}: {err}", line_number + 1))?;
-        if bytes == 0 {
-            break;
-        }
-        line_number += 1;
-        if bytes > MAX_MANIFEST_LINE_BYTES {
-            return Err(format!(
-                "audio batch manifest line {line_number} exceeds {MAX_MANIFEST_LINE_BYTES} bytes"
-            ));
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record = serde_json::from_str::<AudioBatchRecord>(&line)
-            .map_err(|err| format!("invalid audio batch manifest line {line_number}: {err}"))?;
-        record.validate(line_number)?;
-        visit(record, line_number)?;
-        record_count += 1;
-    }
-    Ok(record_count)
 }
 
 fn write_output<W: Write>(writer: &mut W, output: &AudioBatchOutput<'_>) -> Result<(), String> {
@@ -278,7 +202,7 @@ mod tests {
     fn rejects_a_record_longer_than_the_line_limit() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("huge.jsonl");
-        let padding = "x".repeat(super::MAX_MANIFEST_LINE_BYTES);
+        let padding = "x".repeat(crate::app::batch::MAX_MANIFEST_LINE_BYTES);
         fs::write(
             &path,
             format!("{{\"id\":\"one\",\"path\":\"one.wav\",\"context\":\"{padding}\"}}\n"),

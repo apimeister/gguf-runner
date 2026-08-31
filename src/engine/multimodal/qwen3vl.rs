@@ -10,7 +10,19 @@ use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
 use crate::engine::vision::PreparedImageTensor;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
+use super::{FloatBatchMatmulScratch, matmul_encoder_batch};
+
 type PatchTokenGrid = (Vec<f32>, Vec<(usize, usize)>, usize, usize);
+
+const MAX_VISION_MICROBATCH_IMAGES: usize = 4;
+const MAX_VISION_MICROBATCH_PATCH_TOKENS: usize = 4096;
+
+fn vision_microbatch_image_limit(tokens_per_image: usize) -> usize {
+    if tokens_per_image == 0 {
+        return 1;
+    }
+    (MAX_VISION_MICROBATCH_PATCH_TOKENS / tokens_per_image).clamp(1, MAX_VISION_MICROBATCH_IMAGES)
+}
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n_elements = 1usize;
@@ -723,13 +735,30 @@ impl Qwen3VlVisionEncoder {
         }
     }
 
-    fn encode_single_image(
+    fn encode_same_shape_images(
         &self,
-        image: &PreparedImageTensor,
-    ) -> Result<MediaEmbeddingSequence, String> {
+        images: &[&PreparedImageTensor],
+    ) -> Result<Vec<MediaEmbeddingSequence>, String> {
+        let Some(first_image) = images.first() else {
+            return Ok(Vec::new());
+        };
         let mapped = self.gguf.mapped.as_slice();
-        let (mut x, positions, pw, ph) = self.patch_embed_and_reorder(image)?;
+        let (mut x, positions, pw, ph) = self.patch_embed_and_reorder(first_image)?;
         let n_tokens = x.len() / self.dim;
+        for image in &images[1..] {
+            let (tokens, image_positions, image_pw, image_ph) =
+                self.patch_embed_and_reorder(image)?;
+            if image_pw != pw
+                || image_ph != ph
+                || tokens.len() != n_tokens * self.dim
+                || image_positions != positions
+            {
+                return Err("qwen3vl vision microbatch requires matching patch grids".to_string());
+            }
+            x.extend(tokens);
+        }
+        let image_count = images.len();
+        let total_tokens = n_tokens * image_count;
         let merge = self.spatial_merge * self.spatial_merge;
         let n_out = (pw / self.spatial_merge) * (ph / self.spatial_merge);
         if n_tokens != n_out * merge {
@@ -743,19 +772,25 @@ impl Qwen3VlVisionEncoder {
         let ff_dim = self.ff_dim;
         let eps = self.eps;
 
-        let mut x_norm = vec![0.0f32; n_tokens * dim];
-        let mut q = vec![0.0f32; n_tokens * dim];
-        let mut k = vec![0.0f32; n_tokens * dim];
-        let mut v = vec![0.0f32; n_tokens * dim];
+        let mut x_norm = vec![0.0f32; total_tokens * dim];
+        let mut q = vec![0.0f32; total_tokens * dim];
+        let mut k = vec![0.0f32; total_tokens * dim];
+        let mut v = vec![0.0f32; total_tokens * dim];
+        let mut qkv_batch = vec![0.0f32; total_tokens * dim * 3];
         let head_token_stride = n_tokens * self.head_dim;
-        let mut attn_head_major = vec![0.0f32; self.head_count * head_token_stride];
-        let mut attn_out = vec![0.0f32; n_tokens * dim];
-        let mut proj_out = vec![0.0f32; n_tokens * dim];
+        let image_head_stride = self.head_count * head_token_stride;
+        let mut attn_head_major = vec![0.0f32; image_count * image_head_stride];
+        let mut attn_out = vec![0.0f32; total_tokens * dim];
+        let mut proj_out = vec![0.0f32; total_tokens * dim];
+        let mut ffn_up_batch = vec![0.0f32; total_tokens * ff_dim];
+        let mut ffn_down_batch = vec![0.0f32; total_tokens * dim];
+        let mut batch_scratch = FloatBatchMatmulScratch::default();
         let token_dim = self.mm2_b.len();
+        let total_output_tokens = n_out * image_count;
         let mut deepstack_tokens = if self.deepstack_layers.is_empty() {
             Vec::new()
         } else {
-            vec![0.0f32; n_out * self.deepstack_layers.len() * token_dim]
+            vec![0.0f32; total_output_tokens * self.deepstack_layers.len() * token_dim]
         };
         let deepstack_token_stride = self.deepstack_layers.len() * token_dim;
 
@@ -767,40 +802,53 @@ impl Qwen3VlVisionEncoder {
                 layer_norm_affine(dst, src, &layer.ln1_w, &layer.ln1_b, eps);
             });
 
-            q.par_chunks_mut(dim)
+            matmul_encoder_batch(
+                &mut qkv_batch,
+                &x_norm,
+                &layer.attn_qkv_w,
+                mapped,
+                total_tokens,
+                &mut batch_scratch,
+            )?;
+            qkv_batch
+                .par_chunks_mut(dim * 3)
+                .zip(q.par_chunks_mut(dim))
                 .zip(k.par_chunks_mut(dim))
                 .zip(v.par_chunks_mut(dim))
-                .enumerate()
-                .try_for_each_init(
-                    || vec![0.0f32; dim * 3],
-                    |tok_qkv, (t, ((q_dst, k_dst), v_dst))| -> Result<(), String> {
-                        let src = &x_norm[t * dim..(t + 1) * dim];
-                        matmul_quantized(tok_qkv, src, &layer.attn_qkv_w, mapped)?;
-                        Self::add_bias(tok_qkv, &layer.attn_qkv_b);
-                        q_dst.copy_from_slice(&tok_qkv[..dim]);
-                        k_dst.copy_from_slice(&tok_qkv[dim..2 * dim]);
-                        v_dst.copy_from_slice(&tok_qkv[2 * dim..3 * dim]);
-                        Ok(())
-                    },
-                )?;
+                .for_each(|(((tok_qkv, q_dst), k_dst), v_dst)| {
+                    Self::add_bias(tok_qkv, &layer.attn_qkv_b);
+                    q_dst.copy_from_slice(&tok_qkv[..dim]);
+                    k_dst.copy_from_slice(&tok_qkv[dim..2 * dim]);
+                    v_dst.copy_from_slice(&tok_qkv[2 * dim..3 * dim]);
+                });
 
-            self.apply_vision_rope(&mut q, &mut k, &positions);
+            for image_index in 0..image_count {
+                let start = image_index * n_tokens * dim;
+                let end = start + n_tokens * dim;
+                self.apply_vision_rope(&mut q[start..end], &mut k[start..end], &positions);
+            }
             let inv_scale = 1.0 / (self.head_dim as f32).sqrt();
             let head_dim = self.head_dim;
+            let head_count = self.head_count;
             attn_head_major
                 .par_chunks_mut(head_dim)
                 .enumerate()
                 .for_each(|(row_idx, out)| {
-                    let h = row_idx / n_tokens;
-                    let i = row_idx % n_tokens;
+                    let image_index = row_idx / (head_count * n_tokens);
+                    let image_row = row_idx % (head_count * n_tokens);
+                    let h = image_row / n_tokens;
+                    let i = image_row % n_tokens;
                     let h_off = h * head_dim;
-                    let qi = &q[i * dim + h_off..i * dim + h_off + head_dim];
+                    let token_base = image_index * n_tokens;
+                    let qi_start = (token_base + i) * dim + h_off;
+                    let qi = &q[qi_start..qi_start + head_dim];
 
                     out.fill(0.0);
                     let mut max_score = f32::NEG_INFINITY;
                     let mut score_sum = 0.0f32;
                     for j in 0..n_tokens {
-                        let kj = &k[j * dim + h_off..j * dim + h_off + head_dim];
+                        let key_start = (token_base + j) * dim + h_off;
+                        let kj = &k[key_start..key_start + head_dim];
                         let score = dot_f32_simd(qi, kj) * inv_scale;
 
                         if score > max_score {
@@ -814,7 +862,8 @@ impl Qwen3VlVisionEncoder {
 
                         let weight = (score - max_score).exp();
                         score_sum += weight;
-                        let vj = &v[j * dim + h_off..j * dim + h_off + head_dim];
+                        let value_start = (token_base + j) * dim + h_off;
+                        let vj = &v[value_start..value_start + head_dim];
                         axpy_inplace(out, weight, vj);
                     }
 
@@ -823,24 +872,32 @@ impl Qwen3VlVisionEncoder {
                         scale_slice_inplace(out, inv);
                     }
                 });
-            for t in 0..n_tokens {
-                let dst = &mut attn_out[t * self.dim..(t + 1) * self.dim];
-                for h in 0..self.head_count {
-                    let src = &attn_head_major[h * head_token_stride + t * self.head_dim
-                        ..h * head_token_stride + (t + 1) * self.head_dim];
-                    let off = h * self.head_dim;
-                    dst[off..off + self.head_dim].copy_from_slice(src);
+            for image_index in 0..image_count {
+                for t in 0..n_tokens {
+                    let output_token = image_index * n_tokens + t;
+                    let dst = &mut attn_out[output_token * self.dim..(output_token + 1) * self.dim];
+                    for h in 0..self.head_count {
+                        let source_start = image_index * image_head_stride
+                            + h * head_token_stride
+                            + t * self.head_dim;
+                        let src = &attn_head_major[source_start..source_start + self.head_dim];
+                        let off = h * self.head_dim;
+                        dst[off..off + self.head_dim].copy_from_slice(src);
+                    }
                 }
             }
 
-            proj_out.par_chunks_mut(dim).enumerate().try_for_each(
-                |(t, dst)| -> Result<(), String> {
-                    let src = &attn_out[t * dim..(t + 1) * dim];
-                    matmul_quantized(dst, src, &layer.attn_out_w, mapped)?;
-                    Self::add_bias(dst, &layer.attn_out_b);
-                    Ok(())
-                },
+            matmul_encoder_batch(
+                &mut proj_out,
+                &attn_out,
+                &layer.attn_out_w,
+                mapped,
+                total_tokens,
+                &mut batch_scratch,
             )?;
+            proj_out
+                .par_chunks_mut(dim)
+                .for_each(|dst| Self::add_bias(dst, &layer.attn_out_b));
             for i in 0..x.len() {
                 x[i] += proj_out[i];
             }
@@ -850,21 +907,34 @@ impl Qwen3VlVisionEncoder {
                 layer_norm_affine(dst, src, &layer.ln2_w, &layer.ln2_b, eps);
             });
 
-            x.par_chunks_mut(dim).enumerate().try_for_each_init(
-                || (vec![0.0f32; ff_dim], vec![0.0f32; dim]),
-                |(ffn_up, ffn_down), (t, dst)| -> Result<(), String> {
-                    let src = &x_norm[t * dim..(t + 1) * dim];
-                    matmul_quantized(ffn_up, src, &layer.ffn_up_w, mapped)?;
-                    Self::add_bias(ffn_up, &layer.ffn_up_b);
-                    for v in ffn_up.iter_mut() {
-                        *v = Self::gelu(*v);
-                    }
-                    matmul_quantized(ffn_down, ffn_up, &layer.ffn_down_w, mapped)?;
-                    Self::add_bias(ffn_down, &layer.ffn_down_b);
-                    axpy_inplace(dst, 1.0, ffn_down);
-                    Ok(())
-                },
+            matmul_encoder_batch(
+                &mut ffn_up_batch,
+                &x_norm,
+                &layer.ffn_up_w,
+                mapped,
+                total_tokens,
+                &mut batch_scratch,
             )?;
+            ffn_up_batch.par_chunks_mut(ff_dim).for_each(|ffn_up| {
+                Self::add_bias(ffn_up, &layer.ffn_up_b);
+                for value in ffn_up {
+                    *value = Self::gelu(*value);
+                }
+            });
+            matmul_encoder_batch(
+                &mut ffn_down_batch,
+                &ffn_up_batch,
+                &layer.ffn_down_w,
+                mapped,
+                total_tokens,
+                &mut batch_scratch,
+            )?;
+            x.par_chunks_mut(dim)
+                .zip(ffn_down_batch.par_chunks_mut(dim))
+                .for_each(|(destination, ffn_down)| {
+                    Self::add_bias(ffn_down, &layer.ffn_down_b);
+                    axpy_inplace(destination, 1.0, ffn_down);
+                });
 
             if let Some(ds_idx) = self.deepstack_by_layer[l] {
                 let deepstack = &self.deepstack_layers[ds_idx];
@@ -917,46 +987,71 @@ impl Qwen3VlVisionEncoder {
             }
         }
 
-        for t in 0..n_tokens {
+        for t in 0..total_tokens {
             let src = &x[t * dim..(t + 1) * dim];
             let dst = &mut x_norm[t * dim..(t + 1) * dim];
             self.layer_norm(dst, src, &self.post_ln_w, &self.post_ln_b);
         }
         std::mem::swap(&mut x, &mut x_norm);
 
-        let mut merged = vec![0.0f32; merged_dim];
-        let mut hidden = vec![0.0f32; merged_dim];
-        let mut out = vec![0.0f32; token_dim];
-        let mut tokens = Vec::with_capacity(n_out);
-
-        for out_idx in 0..n_out {
+        let mut merged_batch = vec![0.0f32; total_output_tokens * merged_dim];
+        for out_idx in 0..total_output_tokens {
             for m in 0..merge {
                 let src = &x[(out_idx * merge + m) * dim..(out_idx * merge + m + 1) * dim];
-                let dst = &mut merged[m * dim..(m + 1) * dim];
+                let dst = &mut merged_batch
+                    [out_idx * merged_dim + m * dim..out_idx * merged_dim + (m + 1) * dim];
                 dst.copy_from_slice(src);
             }
-
-            matmul_quantized(&mut hidden, &merged, &self.mm0_w, mapped)?;
-            Self::add_bias(&mut hidden, &self.mm0_b);
-            for v in &mut hidden {
-                *v = Self::gelu(*v);
+        }
+        let mut hidden_batch = vec![0.0f32; total_output_tokens * merged_dim];
+        matmul_encoder_batch(
+            &mut hidden_batch,
+            &merged_batch,
+            &self.mm0_w,
+            mapped,
+            total_output_tokens,
+            &mut batch_scratch,
+        )?;
+        for hidden in hidden_batch.chunks_mut(merged_dim) {
+            Self::add_bias(hidden, &self.mm0_b);
+            for value in hidden {
+                *value = Self::gelu(*value);
             }
-
-            matmul_quantized(&mut out, &hidden, &self.mm2_w, mapped)?;
-            Self::add_bias(&mut out, &self.mm2_b);
-            let mut token = Vec::with_capacity(token_dim * (1 + self.deepstack_layers.len()));
-            token.extend_from_slice(&out);
-            if !deepstack_tokens.is_empty() {
-                let base = out_idx * self.deepstack_layers.len() * token_dim;
-                for ds_idx in 0..self.deepstack_layers.len() {
-                    let ds_off = base + ds_idx * token_dim;
-                    token.extend_from_slice(&deepstack_tokens[ds_off..ds_off + token_dim]);
+        }
+        let mut output_batch = vec![0.0f32; total_output_tokens * token_dim];
+        matmul_encoder_batch(
+            &mut output_batch,
+            &hidden_batch,
+            &self.mm2_w,
+            mapped,
+            total_output_tokens,
+            &mut batch_scratch,
+        )?;
+        for output in output_batch.chunks_mut(token_dim) {
+            Self::add_bias(output, &self.mm2_b);
+        }
+        let mut sequences = Vec::with_capacity(image_count);
+        for image_index in 0..image_count {
+            let mut tokens = Vec::with_capacity(n_out);
+            for image_out_idx in 0..n_out {
+                let out_idx = image_index * n_out + image_out_idx;
+                let mut token = Vec::with_capacity(token_dim * (1 + self.deepstack_layers.len()));
+                token.extend_from_slice(
+                    &output_batch[out_idx * token_dim..(out_idx + 1) * token_dim],
+                );
+                if !deepstack_tokens.is_empty() {
+                    let base = out_idx * self.deepstack_layers.len() * token_dim;
+                    for ds_idx in 0..self.deepstack_layers.len() {
+                        let ds_off = base + ds_idx * token_dim;
+                        token.extend_from_slice(&deepstack_tokens[ds_off..ds_off + token_dim]);
+                    }
                 }
+                tokens.push(token);
             }
-            tokens.push(token);
+            sequences.push(MediaEmbeddingSequence { tokens });
         }
 
-        Ok(MediaEmbeddingSequence { tokens })
+        Ok(sequences)
     }
 
     pub(crate) fn encode_images(
@@ -966,10 +1061,60 @@ impl Qwen3VlVisionEncoder {
         if images.is_empty() {
             return Ok(Vec::new());
         }
-        let mut out = Vec::with_capacity(images.len());
-        for image in images {
-            out.push(self.encode_single_image(image)?);
+        let mut out = vec![None; images.len()];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (index, image) in images.iter().enumerate() {
+            if let Some(group) = groups.iter_mut().find(|group| {
+                let first = &images[group[0]];
+                first.width == image.width && first.height == image.height
+            }) {
+                group.push(index);
+            } else {
+                groups.push(vec![index]);
+            }
         }
-        Ok(out)
+        for group in groups {
+            let first = &images[group[0]];
+            let tokens_per_image = (first.width / self.patch_size)
+                .checked_mul(first.height / self.patch_size)
+                .ok_or_else(|| "qwen3vl vision patch token count overflow".to_string())?;
+            let image_limit = vision_microbatch_image_limit(tokens_per_image);
+            for group_chunk in group.chunks(image_limit) {
+                let group_images = group_chunk
+                    .iter()
+                    .map(|&index| &images[index])
+                    .collect::<Vec<_>>();
+                let sequences = self.encode_same_shape_images(&group_images)?;
+                if sequences.len() != group_chunk.len() {
+                    return Err(
+                        "qwen3vl vision microbatch returned the wrong result count".to_string()
+                    );
+                }
+                for (&index, sequence) in group_chunk.iter().zip(sequences) {
+                    out[index] = Some(sequence);
+                }
+            }
+        }
+        out.into_iter()
+            .map(|sequence| {
+                sequence.ok_or_else(|| "qwen3vl vision microbatch lost an image".to_string())
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_VISION_MICROBATCH_IMAGES, vision_microbatch_image_limit};
+
+    #[test]
+    fn vision_microbatch_limit_bounds_images_and_patch_tokens() {
+        assert_eq!(vision_microbatch_image_limit(0), 1);
+        assert_eq!(vision_microbatch_image_limit(512), 4);
+        assert_eq!(vision_microbatch_image_limit(1_024), 4);
+        assert_eq!(vision_microbatch_image_limit(1_365), 3);
+        assert_eq!(vision_microbatch_image_limit(2_048), 2);
+        assert_eq!(vision_microbatch_image_limit(4_097), 1);
+        assert_eq!(MAX_VISION_MICROBATCH_IMAGES, 4);
     }
 }

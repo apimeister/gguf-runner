@@ -1,7 +1,9 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, read_u32_le};
+use crate::engine::io::{
+    bf16_to_fp32, fp16_to_fp32, fp32_to_bf16, read_f32_le, read_u16_le, read_u32_le,
+};
 use crate::engine::profiling::{PROF_MATMUL_NS, prof_end, prof_start};
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::{
@@ -9,7 +11,7 @@ use crate::engine::switches::{
     AARCH64_Q4_0_MR4_STATUS, AARCH64_Q4_1_MR4_STATUS, AARCH64_Q4K_MR4_STATUS,
     AARCH64_Q5_0_MR4_STATUS, AARCH64_Q5_1_MR4_STATUS, AARCH64_Q5K_MR4_STATUS,
     AARCH64_Q6K_MR4_STATUS, AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows,
-    use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
+    use_aarch64_bf16, use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
@@ -30,13 +32,39 @@ use crate::engine::types::{
 /// type_size for BIN1 (types 40/41): f16 scale (2 bytes) + 16 bytes packed 1-bit values
 /// for 128 elements. Layout follows all other GGML types: scale first, data after.
 const BIN1_TYPE_SIZE: usize = 18;
-use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+    ParallelSliceMut,
+};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::cmp::Ordering;
+#[cfg(target_os = "macos")]
+use std::ffi::c_int;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: c_int,
+        trans_a: c_int,
+        trans_b: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: f32,
+        a: *const f32,
+        lda: c_int,
+        b: *const f32,
+        ldb: c_int,
+        beta: f32,
+        c: *mut f32,
+        ldc: c_int,
+    );
+}
 
 #[cfg(target_arch = "x86_64")]
 const X86_MATMUL_PREFETCH_ROWS: usize = 6;
@@ -695,6 +723,25 @@ unsafe fn vec_dot_f16_f16c_prefix(x: *const f32, w: *const u8, n: usize) -> f32 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_bf16_avx2_prefix(x: *const f32, w: *const u8, n: usize) -> f32 {
+    let mut i = 0usize;
+    let mut acc = _mm256_setzero_ps();
+    while i + 8 <= n {
+        let xv = _mm256_loadu_ps(x.add(i));
+        let packed = _mm_loadu_si128(w.add(i * 2) as *const __m128i);
+        let widened = _mm256_cvtepu16_epi32(packed);
+        let shifted = _mm256_slli_epi32::<16>(widened);
+        let wv = _mm256_castsi256_ps(shifted);
+        acc = _mm256_fmadd_ps(xv, wv, acc);
+        i += 8;
+    }
+    let mut tmp = [0.0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+    tmp.iter().copied().sum::<f32>()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn hsum256_ps(v: __m256) -> f32 {
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), v);
@@ -1091,6 +1138,23 @@ unsafe fn load_f16x4_as_f32x4(ptr: *const u8) -> float32x4_t {
     result
 }
 
+/// Load 4 bf16 values and expand them to f32 by widening and shifting their bit patterns.
+/// USHLL/SHL are base AArch64 NEON; native FEAT_BF16 arithmetic is not required.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn load_bf16x4_as_f32x4(ptr: *const u8) -> float32x4_t {
+    let result: float32x4_t;
+    core::arch::asm!(
+        "ld1 {{v8.4h}}, [{ptr}]",
+        "ushll v8.4s, v8.4h, #0",
+        "shl v8.4s, v8.4s, #16",
+        ptr = in(reg) ptr,
+        out("v8") result,
+        options(nostack, pure, readonly),
+    );
+    result
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_f16(x: &[f32], w: &[u8], n: usize) -> f32 {
     let mut sum = 0.0f32;
@@ -1154,8 +1218,89 @@ pub(crate) fn vec_dot_f16(x: &[f32], w: &[u8], n: usize) -> f32 {
 #[inline(always)]
 pub(crate) fn vec_dot_bf16(x: &[f32], w: &[u8], n: usize) -> f32 {
     let mut sum = 0.0f32;
-    for i in 0..n {
+    let mut i = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        while i + 8 <= n {
+            let xv0 = vld1q_f32(x.as_ptr().add(i));
+            let xv1 = vld1q_f32(x.as_ptr().add(i + 4));
+            let wv0 = load_bf16x4_as_f32x4(w.as_ptr().add(i * 2));
+            let wv1 = load_bf16x4_as_f32x4(w.as_ptr().add((i + 4) * 2));
+            acc0 = vfmaq_f32(acc0, xv0, wv0);
+            acc1 = vfmaq_f32(acc1, xv1, wv1);
+            i += 8;
+        }
+        let mut acc = vaddq_f32(acc0, acc1);
+        while i + 4 <= n {
+            let xv = vld1q_f32(x.as_ptr().add(i));
+            let wv = load_bf16x4_as_f32x4(w.as_ptr().add(i * 2));
+            acc = vfmaq_f32(acc, xv, wv);
+            i += 4;
+        }
+        sum += vaddvq_f32(acc);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if use_x86_avx2_fma() {
+            let n8 = n & !7;
+            if n8 > 0 {
+                sum += vec_dot_bf16_avx2_prefix(x.as_ptr(), w.as_ptr(), n8);
+                i = n8;
+            }
+        }
+    }
+    while i < n {
         sum += x[i] * bf16_to_fp32(read_u16_le(w, i * 2));
+        i += 1;
+    }
+    sum
+}
+
+/// Native Arm BF16 dot for an activation vector that has already been packed
+/// to BF16. Packing is deliberately outside this function so a token's
+/// activation can be reused across every weight row in a matrix.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "bf16")]
+unsafe fn vec_dot_bf16_bfdot(x: &[u16], w: &[u8], n: usize) -> f32 {
+    debug_assert!(x.len() >= n);
+    debug_assert!(w.len() >= n * 2);
+
+    let n16 = n & !15;
+    let mut sum = 0.0f32;
+    if n16 > 0 {
+        let result: float32x4_t;
+        let x_ptr = x.as_ptr();
+        let w_ptr = w.as_ptr();
+        let remaining = n16;
+        core::arch::asm!(
+            "movi v8.4s, #0",
+            "movi v11.4s, #0",
+            "2:",
+            "ld1 {{v9.8h}}, [{x_ptr}], #16",
+            "ld1 {{v10.8h}}, [{w_ptr}], #16",
+            "bfdot v8.4s, v9.8h, v10.8h",
+            "ld1 {{v9.8h}}, [{x_ptr}], #16",
+            "ld1 {{v10.8h}}, [{w_ptr}], #16",
+            "bfdot v11.4s, v9.8h, v10.8h",
+            "subs {remaining}, {remaining}, #16",
+            "b.ne 2b",
+            "fadd v8.4s, v8.4s, v11.4s",
+            x_ptr = inout(reg) x_ptr => _,
+            w_ptr = inout(reg) w_ptr => _,
+            remaining = inout(reg) remaining => _,
+            out("v8") result,
+            lateout("v9") _,
+            lateout("v10") _,
+            lateout("v11") _,
+            options(nostack, readonly),
+        );
+        sum = vaddvq_f32(result);
+    }
+
+    for i in n16..n {
+        sum += bf16_to_fp32(x[i]) * bf16_to_fp32(read_u16_le(w, i * 2));
     }
     sum
 }
@@ -9486,6 +9631,27 @@ pub(crate) fn batch_fast_supported(ttype: GgmlType) -> bool {
     )
 }
 
+/// Whether a floating-point tensor can use the dequantize-once batch kernel.
+///
+/// This is kept separate from [`batch_fast_supported`] because language-model
+/// prefill intentionally preserves the existing per-token F16/BF16 numerics,
+/// while multimodal encoders can opt into tolerance-equivalent batched dots.
+pub(crate) fn float_batch_supported(ttype: GgmlType) -> bool {
+    matches!(ttype.0, GGML_TYPE_F16 | GGML_TYPE_BF16)
+}
+
+/// Caller-owned storage for floating-point token batches. BF16 activation
+/// packing is retained across calls so multimodal encoders do not allocate a
+/// temporary buffer for every projection.
+#[derive(Default)]
+pub(crate) struct FloatBatchMatmulScratch {
+    row_major: Vec<f32>,
+    #[cfg(target_os = "macos")]
+    weights_f32: Vec<f32>,
+    bf16_input: Vec<u16>,
+    bf16_input_f32: Vec<f32>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_quantized_batch_fast(
     out: &mut [f32],
@@ -9497,16 +9663,293 @@ pub(crate) fn matmul_quantized_batch_fast(
     n_rows: usize,
     tmp: &mut Vec<f32>,
 ) -> Result<(), String> {
-    let d = n_rows;
-    let n = qw.cols;
     if !batch_fast_supported(qw.ttype) {
         return Err(format!(
             "matmul_quantized_batch_fast: unsupported type {}",
             qw.ttype.0
         ));
     }
+    matmul_quantized_batch_dequantized(out, inp, qw, mapped, m, row_start, n_rows, tmp)
+}
+
+/// F16/BF16 batch matmul for multimodal encoders.
+///
+/// Each stored weight row is expanded once and reused across every token in
+/// the batch. The caller-owned row-major scratch also lets large matrices run
+/// in parallel before the result is transposed back to token-major storage.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_quantized_batch_float(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    scratch: &mut FloatBatchMatmulScratch,
+) -> Result<(), String> {
+    if !float_batch_supported(qw.ttype) {
+        return Err(format!(
+            "matmul_quantized_batch_float: unsupported type {}",
+            qw.ttype.0
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    if qw.ttype.0 == GGML_TYPE_F16 && m >= 8 {
+        return matmul_quantized_batch_f16_accelerate(
+            out,
+            inp,
+            qw,
+            mapped,
+            m,
+            row_start,
+            n_rows,
+            &mut scratch.weights_f32,
+        );
+    }
+
+    if qw.ttype.0 == GGML_TYPE_BF16 {
+        scratch.bf16_input.resize(inp.len(), 0);
+        scratch
+            .bf16_input
+            .par_iter_mut()
+            .zip(inp.par_iter())
+            .for_each(|(destination, source)| *destination = fp32_to_bf16(*source));
+
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        if use_aarch64_bf16() {
+            return matmul_quantized_batch_bf16_bfdot(
+                out,
+                &scratch.bf16_input,
+                qw,
+                mapped,
+                m,
+                row_start,
+                n_rows,
+                &mut scratch.row_major,
+            );
+        }
+
+        scratch.bf16_input_f32.resize(inp.len(), 0.0);
+        scratch
+            .bf16_input_f32
+            .par_iter_mut()
+            .zip(scratch.bf16_input.par_iter())
+            .for_each(|(destination, source)| *destination = bf16_to_fp32(*source));
+        return matmul_quantized_batch_dequantized(
+            out,
+            &scratch.bf16_input_f32,
+            qw,
+            mapped,
+            m,
+            row_start,
+            n_rows,
+            &mut scratch.row_major,
+        );
+    }
+
+    matmul_quantized_batch_dequantized(
+        out,
+        inp,
+        qw,
+        mapped,
+        m,
+        row_start,
+        n_rows,
+        &mut scratch.row_major,
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_f16_accelerate(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    weights_f32: &mut Vec<f32>,
+) -> Result<(), String> {
+    let d = n_rows;
+    let n = qw.cols;
+    if qw.ttype.0 != GGML_TYPE_F16 {
+        return Err("Accelerate float batch requires F16 weights".to_string());
+    }
     if row_start + n_rows > qw.rows {
-        return Err("matmul_quantized_batch_fast row window out of bounds".to_string());
+        return Err("Accelerate F16 row window out of bounds".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if out.len() < m * d || inp.len() < m * n {
+        return Err("Accelerate F16 batch shape mismatch".to_string());
+    }
+    let m_i32 = c_int::try_from(m)
+        .map_err(|_| "Accelerate F16 batch token count exceeds c_int".to_string())?;
+    let d_i32 = c_int::try_from(d)
+        .map_err(|_| "Accelerate F16 batch row count exceeds c_int".to_string())?;
+    let n_i32 = c_int::try_from(n)
+        .map_err(|_| "Accelerate F16 batch column count exceeds c_int".to_string())?;
+
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "Accelerate F16 row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "Accelerate F16 tensor offset overflow".to_string())?;
+    let data_size = d
+        .checked_mul(row_size)
+        .ok_or_else(|| "Accelerate F16 tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "Accelerate F16 tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("Accelerate F16 row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    weights_f32.resize(d * n, 0.0);
+    weights_f32
+        .par_chunks_mut(n)
+        .enumerate()
+        .for_each(|(row, destination)| {
+            let source_offset = data_offset + row * row_size;
+            dequantize_row_f16(
+                &mapped[source_offset..source_offset + row_size],
+                destination,
+                n,
+            );
+        });
+
+    const CBLAS_ROW_MAJOR: c_int = 101;
+    const CBLAS_NO_TRANS: c_int = 111;
+    const CBLAS_TRANS: c_int = 112;
+    let prof_t0 = prof_start();
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            CBLAS_NO_TRANS,
+            CBLAS_TRANS,
+            m_i32,
+            d_i32,
+            n_i32,
+            1.0,
+            inp.as_ptr(),
+            n_i32,
+            weights_f32.as_ptr(),
+            n_i32,
+            0.0,
+            out.as_mut_ptr(),
+            d_i32,
+        );
+    }
+    prof_end(&PROF_MATMUL_NS, prof_t0);
+    Ok(())
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_bf16_bfdot(
+    out: &mut [f32],
+    inp: &[u16],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    tmp: &mut Vec<f32>,
+) -> Result<(), String> {
+    let d = n_rows;
+    let n = qw.cols;
+    if qw.ttype.0 != GGML_TYPE_BF16 {
+        return Err("matmul_quantized_batch_bf16_bfdot requires BF16 weights".to_string());
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_bf16_bfdot row window out of bounds".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if out.len() < m * d || inp.len() < m * n {
+        return Err("matmul_quantized_batch_bf16_bfdot shape mismatch".to_string());
+    }
+
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "BF16 row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "BF16 tensor offset overflow".to_string())?;
+    let data_size = d
+        .checked_mul(row_size)
+        .ok_or_else(|| "BF16 tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "BF16 tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("BF16 row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    if tmp.len() < d * m {
+        tmp.resize(d * m, 0.0);
+    }
+    let prof_t0 = prof_start();
+    let fill = |base_row: usize, block: &mut [f32]| {
+        let rows_here = block.len() / m;
+        for i in 0..rows_here {
+            matmul_prefetch_row(mapped, data_offset, row_size, base_row + i, d);
+            let row_off = data_offset + (base_row + i) * row_size;
+            let row = &mapped[row_off..row_off + row_size];
+            for token in 0..m {
+                let activation = &inp[token * n..(token + 1) * n];
+                // Runtime dispatch checked FEAT_BF16 before entering this kernel.
+                block[i * m + token] = unsafe { vec_dot_bf16_bfdot(activation, row, n) };
+            }
+        }
+    };
+
+    if d >= par_matmul_min_rows() {
+        let chunk_rows = par_matmul_chunk_rows();
+        tmp[..d * m]
+            .par_chunks_mut(chunk_rows * m)
+            .enumerate()
+            .for_each(|(chunk_idx, block)| fill(chunk_idx * chunk_rows, block));
+    } else {
+        fill(0, &mut tmp[..d * m]);
+    }
+
+    for token in 0..m {
+        for row in 0..d {
+            out[token * d + row] = tmp[row * m + token];
+        }
+    }
+    prof_end(&PROF_MATMUL_NS, prof_t0);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_dequantized(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    tmp: &mut Vec<f32>,
+) -> Result<(), String> {
+    let d = n_rows;
+    let n = qw.cols;
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_dequantized row window out of bounds".to_string());
     }
     if m == 0 {
         return Ok(());
@@ -9519,7 +9962,7 @@ pub(crate) fn matmul_quantized_batch_fast(
         };
     }
     if out.len() < m * d || inp.len() < m * n {
-        return Err("matmul_quantized_batch_fast shape mismatch".to_string());
+        return Err("matmul_quantized_batch_dequantized shape mismatch".to_string());
     }
     let row_size = get_row_size(n, qw.ttype);
     let row_off = row_start
@@ -9591,6 +10034,36 @@ pub(crate) fn matmul_quantized_batch_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bf16_dot_matches_scalar_for_vector_and_tail_lengths() {
+        for n in [1usize, 3, 4, 7, 8, 15, 33, 127] {
+            let x = (0..n)
+                .map(|i| ((i * 29 % 41) as f32 - 20.0) * 0.125)
+                .collect::<Vec<_>>();
+            let bf16_bits = (0..n)
+                .map(|i| {
+                    let value = ((i * 17 % 37) as f32 - 18.0) * 0.25;
+                    (value.to_bits() >> 16) as u16
+                })
+                .collect::<Vec<_>>();
+            let weights = bf16_bits
+                .iter()
+                .flat_map(|bits| bits.to_le_bytes())
+                .collect::<Vec<_>>();
+            let want = x
+                .iter()
+                .zip(bf16_bits.iter())
+                .map(|(activation, bits)| activation * bf16_to_fp32(*bits))
+                .sum::<f32>();
+            let got = vec_dot_bf16(&x, &weights, n);
+            let tolerance = 1e-5 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "n={n}: SIMD={got}, scalar={want}, tolerance={tolerance}"
+            );
+        }
+    }
 
     // Activations that the kernels' per-32-block Q8 quantization represents
     // exactly: integers in [-127, 127] with abs-max 127 in every block, so
@@ -9734,6 +10207,177 @@ mod tests {
 
         for (got, want) in batch_out.iter().zip(repeated_out.iter()) {
             assert!((got - want).abs() < 1e-6, "got={got} want={want}");
+        }
+    }
+
+    #[test]
+    fn bf16_batch_matmul_matches_repeated_rows() {
+        let rows = par_matmul_min_rows() + 1;
+        let cols = 17usize;
+        let batch = 5usize;
+        let mapped = (0..rows * cols)
+            .flat_map(|i| {
+                let value = ((i * 19 % 53) as f32 - 26.0) * 0.125;
+                ((value.to_bits() >> 16) as u16).to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        let qw = QuantizedTensor {
+            data_offset: 0,
+            ttype: GgmlType(GGML_TYPE_BF16),
+            rows,
+            cols,
+        };
+        let input = (0..batch * cols)
+            .map(|i| ((i * 23 % 47) as f32 - 23.0) * 0.0625)
+            .collect::<Vec<_>>();
+
+        let mut batch_out = vec![0.0f32; batch * rows];
+        let mut scratch = FloatBatchMatmulScratch::default();
+        matmul_quantized_batch_float(
+            &mut batch_out,
+            &input,
+            &qw,
+            &mapped,
+            batch,
+            0,
+            rows,
+            &mut scratch,
+        )
+        .unwrap();
+
+        let mut repeated_out = vec![0.0f32; batch * rows];
+        for batch_idx in 0..batch {
+            matmul_quantized_rows(
+                &mut repeated_out[batch_idx * rows..(batch_idx + 1) * rows],
+                &input[batch_idx * cols..(batch_idx + 1) * cols],
+                &qw,
+                0,
+                rows,
+                &mapped,
+            )
+            .unwrap();
+        }
+
+        for (index, (got, want)) in batch_out.iter().zip(repeated_out.iter()).enumerate() {
+            let tolerance = 1e-5 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "index={index}: batch={got}, repeated={want}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[test]
+    fn f16_batch_matmul_matches_repeated_rows() {
+        let rows = 11usize;
+        let cols = 37usize;
+        let batch = 8usize;
+        let mapped = (0..rows * cols)
+            .flat_map(|i| {
+                let magnitude = 0x3000u16 + (i as u16 * 29 % 0x0800);
+                let bits = if i % 3 == 0 {
+                    magnitude | 0x8000
+                } else {
+                    magnitude
+                };
+                bits.to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        let qw = QuantizedTensor {
+            data_offset: 0,
+            ttype: GgmlType(GGML_TYPE_F16),
+            rows,
+            cols,
+        };
+        let input = (0..batch * cols)
+            .map(|i| ((i * 23 % 47) as f32 - 23.0) * 0.0625)
+            .collect::<Vec<_>>();
+
+        let mut batch_out = vec![0.0f32; batch * rows];
+        matmul_quantized_batch_float(
+            &mut batch_out,
+            &input,
+            &qw,
+            &mapped,
+            batch,
+            0,
+            rows,
+            &mut FloatBatchMatmulScratch::default(),
+        )
+        .unwrap();
+
+        let mut repeated_out = vec![0.0f32; batch * rows];
+        for batch_idx in 0..batch {
+            matmul_quantized_rows(
+                &mut repeated_out[batch_idx * rows..(batch_idx + 1) * rows],
+                &input[batch_idx * cols..(batch_idx + 1) * cols],
+                &qw,
+                0,
+                rows,
+                &mapped,
+            )
+            .unwrap();
+        }
+
+        for (index, (got, want)) in batch_out.iter().zip(repeated_out.iter()).enumerate() {
+            let tolerance = 1e-5 * want.abs().max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "index={index}: batch={got}, repeated={want}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[test]
+    fn bf16_batch_matmul_packs_activations_with_ties_to_even() {
+        let rows = 3usize;
+        let cols = 19usize;
+        let batch = 2usize;
+        let weight_bits = (0..rows * cols)
+            .map(|i| fp32_to_bf16(((i * 13 % 31) as f32 - 15.0) * 0.2))
+            .collect::<Vec<_>>();
+        let mapped = weight_bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        let qw = QuantizedTensor {
+            data_offset: 0,
+            ttype: GgmlType(GGML_TYPE_BF16),
+            rows,
+            cols,
+        };
+        let input = (0..batch * cols)
+            .map(|i| f32::from_bits(0x3f80_8001 + (i as u32 % 11) * 0x1_0101))
+            .collect::<Vec<_>>();
+
+        let mut got = vec![0.0f32; batch * rows];
+        matmul_quantized_batch_float(
+            &mut got,
+            &input,
+            &qw,
+            &mapped,
+            batch,
+            0,
+            rows,
+            &mut FloatBatchMatmulScratch::default(),
+        )
+        .unwrap();
+
+        for token in 0..batch {
+            for row in 0..rows {
+                let want = (0..cols)
+                    .map(|col| {
+                        bf16_to_fp32(fp32_to_bf16(input[token * cols + col]))
+                            * bf16_to_fp32(weight_bits[row * cols + col])
+                    })
+                    .sum::<f32>();
+                let value = got[token * rows + row];
+                let tolerance = 1e-5 * want.abs().max(1.0);
+                assert!(
+                    (value - want).abs() <= tolerance,
+                    "token={token} row={row}: native={value}, scalar={want}, tolerance={tolerance}"
+                );
+            }
         }
     }
 

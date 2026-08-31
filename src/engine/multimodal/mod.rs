@@ -5,11 +5,67 @@ mod qwen3_asr;
 mod qwen3vl;
 
 use crate::engine::audio::{PreparedAudioFeatureWindow, PreparedAudioFeatureWindowPlan};
-use crate::engine::types::{AudioEncoderBackend, Config, GGUFFile, MultimodalBackend};
+use crate::engine::kernels::{
+    FloatBatchMatmulScratch, float_batch_supported, matmul_quantized, matmul_quantized_batch_float,
+};
+use crate::engine::switches::use_mm_float_batch;
+use crate::engine::types::{
+    AudioEncoderBackend, Config, GGUFFile, MultimodalBackend, QuantizedTensor,
+};
 use crate::engine::vision::PreparedImageTensor;
 pub(crate) use injection::{
     MediaEmbeddingSequence, expand_prompt_with_media_embeddings, preflight_media_context,
 };
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+
+/// Run a full token batch when an encoder matrix is stored as F16/BF16.
+/// Returns `false` for other tensor types so the backend can preserve its
+/// architecture-specific per-token path.
+fn try_matmul_float_batch(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &QuantizedTensor,
+    mapped: &[u8],
+    token_count: usize,
+    scratch: &mut FloatBatchMatmulScratch,
+) -> Result<bool, String> {
+    if token_count <= 1 || !use_mm_float_batch() || !float_batch_supported(weight.ttype) {
+        return Ok(false);
+    }
+    matmul_quantized_batch_float(
+        output,
+        input,
+        weight,
+        mapped,
+        token_count,
+        0,
+        weight.rows,
+        scratch,
+    )?;
+    Ok(true)
+}
+
+/// Token-major encoder matmul with a dequantize-once F16/BF16 path and the
+/// existing parallel per-token behavior as the fallback for other types.
+fn matmul_encoder_batch(
+    output: &mut [f32],
+    input: &[f32],
+    weight: &QuantizedTensor,
+    mapped: &[u8],
+    token_count: usize,
+    scratch: &mut FloatBatchMatmulScratch,
+) -> Result<(), String> {
+    if try_matmul_float_batch(output, input, weight, mapped, token_count, scratch)? {
+        return Ok(());
+    }
+    output
+        .par_chunks_mut(weight.rows)
+        .enumerate()
+        .try_for_each(|(token, destination)| {
+            let source = &input[token * weight.cols..(token + 1) * weight.cols];
+            matmul_quantized(destination, source, weight, mapped)
+        })
+}
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
