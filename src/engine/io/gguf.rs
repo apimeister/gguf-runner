@@ -57,6 +57,53 @@ pub(crate) fn bf16_to_fp32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
+/// Convert F32 to F16 with round-to-nearest, ties-to-even. NaNs retain a
+/// non-zero payload so the conversion cannot turn them into infinities.
+#[inline]
+pub(crate) fn fp32_to_fp16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ff_ff;
+
+    if exponent == 0xff {
+        if mantissa == 0 {
+            return sign | 0x7c00;
+        }
+        let payload = ((mantissa >> 13) as u16) | 0x0200;
+        return sign | 0x7c00 | payload;
+    }
+
+    let unbiased_exponent = exponent - 127;
+    if unbiased_exponent > 15 {
+        return sign | 0x7c00;
+    }
+    if unbiased_exponent < -25 {
+        return sign;
+    }
+
+    if unbiased_exponent < -14 {
+        let significand = mantissa | 0x80_00_00;
+        let shift = (-1 - unbiased_exponent) as u32;
+        let mut rounded = significand >> shift;
+        let remainder_mask = (1u32 << shift) - 1;
+        let remainder = significand & remainder_mask;
+        let halfway = 1u32 << (shift - 1);
+        if remainder > halfway || (remainder == halfway && rounded & 1 != 0) {
+            rounded += 1;
+        }
+        return sign | rounded as u16;
+    }
+
+    let half_exponent = ((unbiased_exponent + 15) as u32) << 10;
+    let mut rounded_mantissa = mantissa >> 13;
+    let remainder = mantissa & 0x1fff;
+    if remainder > 0x1000 || (remainder == 0x1000 && rounded_mantissa & 1 != 0) {
+        rounded_mantissa += 1;
+    }
+    sign | (half_exponent + rounded_mantissa) as u16
+}
+
 /// Convert F32 to BF16 with round-to-nearest, ties-to-even. NaNs retain a
 /// non-zero payload so the conversion cannot turn them into infinities.
 #[inline]
@@ -494,4 +541,24 @@ pub(crate) fn find_gguf_tensor_names_with_any_prefix(
         })
         .map(|tensor| tensor.name.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fp32_to_fp16;
+
+    #[test]
+    fn fp32_to_fp16_matches_ieee_ties_and_subnormal_boundaries() {
+        assert_eq!(fp32_to_fp16(0.0), 0x0000);
+        assert_eq!(fp32_to_fp16(-0.0), 0x8000);
+        assert_eq!(fp32_to_fp16(1.0), 0x3c00);
+        assert_eq!(fp32_to_fp16(-2.0), 0xc000);
+        assert_eq!(fp32_to_fp16(65_504.0), 0x7bff);
+        assert_eq!(fp32_to_fp16(f32::INFINITY), 0x7c00);
+        assert_eq!(fp32_to_fp16(f32::from_bits(0x3f80_1000)), 0x3c00);
+        assert_eq!(fp32_to_fp16(f32::from_bits(0x3f80_3000)), 0x3c02);
+        assert_eq!(fp32_to_fp16(f32::from_bits(0x3300_0000)), 0x0000);
+        assert_eq!(fp32_to_fp16(f32::from_bits(0x3300_0001)), 0x0001);
+        assert_eq!(fp32_to_fp16(f32::from_bits(0x3380_0000)), 0x0001);
+    }
 }

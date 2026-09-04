@@ -161,16 +161,35 @@ Q8_0 appears in neither `batch_fast_supported` (Q2_K..Q6_K) nor `batch_exact_sup
 cache locality remains. A K-quant build of the same model is the cheapest way to get the larger
 win; a batched Q8_0 kernel is the open work item.
 
-### Multimodal F16/BF16 encoder matrices
+Qwen3Next/Qwen3.5 dense prefill also batches the independent QKV, gate, and output projections
+around each SSM layer. The convolution and Gated DeltaNet state transition still execute in token
+order, preserving causality and the sequential state update. A synthetic fused/split-gate
+regression test is bit-identical to the prior per-token path with F32 weights. No timing claim is
+recorded yet for this change.
+
+### Multimodal encoder matrices and attention
 
 Vision and Qwen3-ASR sidecar encoders batch F16/BF16 matrix projections across their token axis.
-The kernel expands each stored weight row once, evaluates all token dots, and retains parallel row
-execution; other storage types keep their existing per-token path. BF16 batches convert each F32
-activation to GGML's BF16 dot type once, then reuse the packed batch across all stored weight rows.
-On AArch64 hosts with `FEAT_BF16` (including Apple M5), runtime dispatch uses native `BFDOT` while
-retaining the portable NEON widening/F32 FMA implementation as the fallback. Set
+The F16 kernel expands each stored weight row once for an Accelerate SGEMM; the BF16 kernel consumes
+the stored rows directly across packed activation pairs. Other storage types keep their existing
+per-token path. Both the batched path and its
+per-token fallback narrow F32 activations to the F16/BF16 dot type selected by GGML for the stored
+matrix. The batch conversion is retained in reusable scratch across weight-row evaluation. On
+AArch64 hosts with `FEAT_BF16` (including Apple M5), runtime dispatch uses native 2-token x 2-row
+`BFMMLA` tiles, with `BFDOT` handling odd rows/tokens and the portable NEON widening/F32 FMA
+implementation retained as the fallback. Set
 `GGUF_AARCH64_BF16=0` to force that fallback for comparison or rollback. x86_64 keeps its AVX2
 widening/FMA path.
+
+Full self-attention in Qwen3-VL/Qwen3.5, Gemma3, Idefics3, and Qwen3-ASR encoders shares a blocked
+implementation. On macOS, each 128-query block uses Accelerate SGEMM for `Q*K^T` and `P*V`, with
+vForce exponentiation between them; the bounded block avoids allocating a full score matrix for
+every head. Other hosts retain the online-softmax SIMD-dot fallback. Image microbatches pass an
+explicit sequence count, so attention never crosses from one image into another.
+
+Qwen3-VL/Qwen3.5 vision M-RoPE now computes its frequency/trigonometric table once per patch grid
+instead of once per vision layer. The cached table is reused by every compatible image and applied
+across token rows in parallel; a scalar-reference regression test is bit-identical.
 
 `--image-batch` additionally groups up to four same-shape Qwen3-VL/Qwen3.5 images into these token
 batches. Vision RoPE and attention remain isolated per image, and a 4096-patch-token bound splits
@@ -186,7 +205,8 @@ one-token budget intentionally isolates media processing; it is not an output-qu
 | 1 | 36.193, 46.602, 44.406, 53.550 | 45.504 | 11.297 |
 | 4 | 37.390, 42.425, 48.309, 67.842 | 45.367 | 12.248 |
 
-All records completed with identical status/text output. The medians are effectively equal
+Within this F16 width-1/width-4 comparison, all records completed with identical status/text output.
+The medians are effectively equal
 (-0.3% for width 4), while width 4 is 8.4% slower by mean and shows more variance. A fixed-eight-
 thread pair likewise did not show a gain. The honest result for this workload is therefore no
 demonstrated cross-record throughput improvement: a single 768-patch image already supplies a large
@@ -197,6 +217,10 @@ The Apple M5 enablement was checked with a 4096-element synthetic BF16 dot using
 activations: native `BFDOT` was about 4.1x faster than widening to F32 before FMA. Treat this as a
 kernel-level sanity check rather than an end-to-end model claim; sidecar shape, token count,
 threading, thermal state, and background load determine the realized encoder speedup.
+
+That historical probe predates both the blocked Accelerate attention path and the `BFMMLA` matrix
+tile. No end-to-end timing claim is recorded for those changes until they can be benchmarked under
+controlled load.
 
 ### Threads
 

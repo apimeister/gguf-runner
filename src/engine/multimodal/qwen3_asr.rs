@@ -1,23 +1,21 @@
 use crate::engine::audio::{PreparedAudioFeatureWindow, PreparedAudioFeatureWindowPlan};
 use crate::engine::io::{
-    bf16_to_fp32, find_gguf_tensor, fp16_to_fp32, fp32_to_bf16, get_gguf_bool_from_map,
-    get_gguf_float_from_map, get_gguf_int_from_map, get_gguf_string_from_map,
+    find_gguf_tensor, get_gguf_bool_from_map, get_gguf_float_from_map, get_gguf_int_from_map,
+    get_gguf_string_from_map,
 };
 use crate::engine::kernels::{
-    FloatBatchMatmulScratch, axpy_inplace, dequantize_tensor, dot_f32_simd, float_batch_supported,
-    get_block_size, get_type_size, matmul_quantized, matmul_quantized_batch_float,
-    scale_slice_inplace,
+    FloatBatchMatmulScratch, axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size,
+    get_type_size,
 };
-use crate::engine::switches::use_mm_float_batch;
 use crate::engine::types::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGUFFile, GgmlType, Gguftensor, QuantizedTensor,
 };
-use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
-    ParallelSlice, ParallelSliceMut,
-};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice, ParallelSliceMut};
 
-use super::{AudioEncoderFrontendOutput, MediaEmbeddingSequence};
+use super::{
+    AudioEncoderFrontendOutput, EncoderAttentionScratch, MediaEmbeddingSequence,
+    encoder_self_attention, matmul_encoder_batch, round_to_f16,
+};
 
 const CONV_KERNEL: usize = 3;
 const CONV_STRIDE: usize = 2;
@@ -195,122 +193,6 @@ fn erf_f32(value: f32) -> f32 {
 #[inline]
 fn gelu_erf(value: f32) -> f32 {
     0.5 * value * (1.0 + erf_f32(value * std::f32::consts::FRAC_1_SQRT_2))
-}
-
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x7f_ff_ff;
-
-    if exponent == 0xff {
-        if mantissa == 0 {
-            return sign | 0x7c00;
-        }
-        let payload = ((mantissa >> 13) as u16) | 0x0200;
-        return sign | 0x7c00 | payload;
-    }
-
-    let unbiased_exponent = exponent - 127;
-    if unbiased_exponent > 15 {
-        return sign | 0x7c00;
-    }
-    if unbiased_exponent < -24 {
-        return sign;
-    }
-
-    if unbiased_exponent < -14 {
-        let significand = mantissa | 0x80_00_00;
-        let shift = (-1 - unbiased_exponent) as u32;
-        let mut rounded = significand >> shift;
-        let remainder_mask = (1u32 << shift) - 1;
-        let remainder = significand & remainder_mask;
-        let halfway = 1u32 << (shift - 1);
-        if remainder > halfway || (remainder == halfway && rounded & 1 != 0) {
-            rounded += 1;
-        }
-        return sign | rounded as u16;
-    }
-
-    let half_exponent = ((unbiased_exponent + 15) as u32) << 10;
-    let mut rounded_mantissa = mantissa >> 13;
-    let remainder = mantissa & 0x1fff;
-    if remainder > 0x1000 || (remainder == 0x1000 && rounded_mantissa & 1 != 0) {
-        rounded_mantissa += 1;
-    }
-    sign | (half_exponent + rounded_mantissa) as u16
-}
-
-#[inline]
-fn round_to_f16(value: f32) -> f32 {
-    fp16_to_fp32(f32_to_f16_bits(value))
-}
-
-#[inline]
-fn round_to_bf16(value: f32) -> f32 {
-    bf16_to_fp32(fp32_to_bf16(value))
-}
-
-fn matmul_with_ggml_activation_type(
-    output: &mut [f32],
-    input: &[f32],
-    weight: &QuantizedTensor,
-    mapped: &[u8],
-) -> Result<(), String> {
-    let rounded_input = match weight.ttype.0 {
-        GGML_TYPE_F16 => Some(input.iter().copied().map(round_to_f16).collect::<Vec<_>>()),
-        GGML_TYPE_BF16 => Some(input.iter().copied().map(round_to_bf16).collect::<Vec<_>>()),
-        _ => None,
-    };
-    matmul_quantized(
-        output,
-        rounded_input.as_deref().unwrap_or(input),
-        weight,
-        mapped,
-    )
-}
-
-fn matmul_token_batch_with_ggml_activation_type(
-    output: &mut [f32],
-    input: &[f32],
-    weight: &QuantizedTensor,
-    mapped: &[u8],
-    token_count: usize,
-    rounded_input: &mut Vec<f32>,
-    batch_scratch: &mut FloatBatchMatmulScratch,
-) -> Result<(), String> {
-    if token_count > 1 && use_mm_float_batch() && float_batch_supported(weight.ttype) {
-        rounded_input.resize(input.len(), 0.0);
-        match weight.ttype.0 {
-            GGML_TYPE_F16 => rounded_input
-                .par_iter_mut()
-                .zip(input.par_iter())
-                .for_each(|(destination, source)| *destination = round_to_f16(*source)),
-            GGML_TYPE_BF16 => rounded_input
-                .par_iter_mut()
-                .zip(input.par_iter())
-                .for_each(|(destination, source)| *destination = round_to_bf16(*source)),
-            _ => unreachable!("float batch support and activation rounding disagree"),
-        }
-        return matmul_quantized_batch_float(
-            output,
-            rounded_input,
-            weight,
-            mapped,
-            token_count,
-            0,
-            weight.rows,
-            batch_scratch,
-        );
-    }
-
-    output
-        .par_chunks_mut(weight.rows)
-        .enumerate()
-        .try_for_each(|(token, destination)| {
-            let source = &input[token * weight.cols..(token + 1) * weight.cols];
-            matmul_with_ggml_activation_type(destination, source, weight, mapped)
-        })
 }
 
 fn positive_metadata_usize(gguf: &GGUFFile, key: &str) -> Result<usize, String> {
@@ -850,15 +732,13 @@ fn project_conv_features(
         .checked_mul(projection.rows)
         .ok_or_else(|| "qwen3_asr convolution projection output overflow".to_string())?;
     let mut data_token_major = vec![0.0f32; output_len];
-    let mut rounded_input = Vec::new();
     let mut batch_scratch = FloatBatchMatmulScratch::default();
-    matmul_token_batch_with_ggml_activation_type(
+    matmul_encoder_batch(
         &mut data_token_major,
         &flattened,
         projection,
         mapped,
         token_count,
-        &mut rounded_input,
         &mut batch_scratch,
     )?;
 
@@ -979,15 +859,13 @@ fn project_to_language_embeddings(
         .ok_or_else(|| "qwen3_asr projector output size overflow".to_string())?;
     let mut hidden = vec![0.0f32; frontend.token_count * hidden_dim];
     let mut projected = vec![0.0f32; output_values];
-    let mut rounded_input = Vec::new();
     let mut batch_scratch = FloatBatchMatmulScratch::default();
-    matmul_token_batch_with_ggml_activation_type(
+    matmul_encoder_batch(
         &mut hidden,
         &frontend.data_token_major,
         &weights.up_weight,
         mapped,
         frontend.token_count,
-        &mut rounded_input,
         &mut batch_scratch,
     )?;
     hidden.par_chunks_mut(hidden_dim).for_each(|values| {
@@ -996,13 +874,12 @@ fn project_to_language_embeddings(
             *value = gelu_erf(*value);
         }
     });
-    matmul_token_batch_with_ggml_activation_type(
+    matmul_encoder_batch(
         &mut projected,
         &hidden,
         &weights.down_weight,
         mapped,
         frontend.token_count,
-        &mut rounded_input,
         &mut batch_scratch,
     )?;
     projected
@@ -1067,20 +944,12 @@ fn run_audio_transformer_inner(
     let mut query = vec![0.0f32; token_values];
     let mut key = vec![0.0f32; token_values];
     let mut value = vec![0.0f32; token_values];
-    let head_token_stride = token_count
-        .checked_mul(config.head_dim)
-        .ok_or_else(|| "qwen3_asr attention head scratch overflow".to_string())?;
-    let attention_values = config
-        .head_count
-        .checked_mul(head_token_stride)
-        .ok_or_else(|| "qwen3_asr attention scratch size overflow".to_string())?;
-    let mut attention_head_major = vec![0.0f32; attention_values];
     let mut attention_token_major = vec![0.0f32; token_values];
     let mut projected_attention = vec![0.0f32; token_values];
     let mut feed_forward_up = vec![0.0f32; token_count * feed_forward_dim];
     let mut feed_forward_down = vec![0.0f32; token_values];
-    let mut rounded_input = Vec::new();
     let mut batch_scratch = FloatBatchMatmulScratch::default();
+    let mut attention_scratch = EncoderAttentionScratch::default();
     let epsilon = config.layer_norm_epsilon;
 
     for layer in &weights.layers {
@@ -1098,31 +967,28 @@ fn run_audio_transformer_inner(
                 );
             });
 
-        matmul_token_batch_with_ggml_activation_type(
+        matmul_encoder_batch(
             &mut query,
             &normalized,
             &layer.query_weight,
             mapped,
             token_count,
-            &mut rounded_input,
             &mut batch_scratch,
         )?;
-        matmul_token_batch_with_ggml_activation_type(
+        matmul_encoder_batch(
             &mut key,
             &normalized,
             &layer.key_weight,
             mapped,
             token_count,
-            &mut rounded_input,
             &mut batch_scratch,
         )?;
-        matmul_token_batch_with_ggml_activation_type(
+        matmul_encoder_batch(
             &mut value,
             &normalized,
             &layer.value_weight,
             mapped,
             token_count,
-            &mut rounded_input,
             &mut batch_scratch,
         )?;
         query
@@ -1135,61 +1001,24 @@ fn run_audio_transformer_inner(
                 add_bias(value_out, &layer.value_bias);
             });
 
-        let attention_scale = 1.0 / (config.head_dim as f32).sqrt();
-        attention_head_major
-            .par_chunks_mut(config.head_dim)
-            .enumerate()
-            .for_each(|(row, destination)| {
-                let head = row / token_count;
-                let query_token = row % token_count;
-                let head_offset = head * config.head_dim;
-                let query_values = &query[query_token * dim + head_offset
-                    ..query_token * dim + head_offset + config.head_dim];
+        encoder_self_attention(
+            &mut attention_token_major,
+            &query,
+            &key,
+            &value,
+            1,
+            token_count,
+            config.head_count,
+            config.head_dim,
+            &mut attention_scratch,
+        )?;
 
-                destination.fill(0.0);
-                let mut maximum_score = f32::NEG_INFINITY;
-                let mut score_sum = 0.0f32;
-                for key_token in 0..token_count {
-                    let key_values = &key[key_token * dim + head_offset
-                        ..key_token * dim + head_offset + config.head_dim];
-                    let score = dot_f32_simd(query_values, key_values) * attention_scale;
-                    if score > maximum_score {
-                        if score_sum > 0.0 {
-                            let rescale = (maximum_score - score).exp();
-                            scale_slice_inplace(destination, rescale);
-                            score_sum *= rescale;
-                        }
-                        maximum_score = score;
-                    }
-                    let attention_weight = (score - maximum_score).exp();
-                    score_sum += attention_weight;
-                    let values = &value[key_token * dim + head_offset
-                        ..key_token * dim + head_offset + config.head_dim];
-                    axpy_inplace(destination, attention_weight, values);
-                }
-                if score_sum > 0.0 {
-                    scale_slice_inplace(destination, 1.0 / score_sum);
-                }
-            });
-
-        for token in 0..token_count {
-            let destination = &mut attention_token_major[token * dim..(token + 1) * dim];
-            for head in 0..config.head_count {
-                let source = &attention_head_major[head * head_token_stride
-                    + token * config.head_dim
-                    ..head * head_token_stride + (token + 1) * config.head_dim];
-                let head_offset = head * config.head_dim;
-                destination[head_offset..head_offset + config.head_dim].copy_from_slice(source);
-            }
-        }
-
-        matmul_token_batch_with_ggml_activation_type(
+        matmul_encoder_batch(
             &mut projected_attention,
             &attention_token_major,
             &layer.output_weight,
             mapped,
             token_count,
-            &mut rounded_input,
             &mut batch_scratch,
         )?;
         projected_attention
@@ -1213,13 +1042,12 @@ fn run_audio_transformer_inner(
                 );
             });
 
-        matmul_token_batch_with_ggml_activation_type(
+        matmul_encoder_batch(
             &mut feed_forward_up,
             &normalized,
             &layer.feed_forward_up_weight,
             mapped,
             token_count,
-            &mut rounded_input,
             &mut batch_scratch,
         )?;
         feed_forward_up
@@ -1230,13 +1058,12 @@ fn run_audio_transformer_inner(
                     *value = gelu_erf(*value);
                 }
             });
-        matmul_token_batch_with_ggml_activation_type(
+        matmul_encoder_batch(
             &mut feed_forward_down,
             &feed_forward_up,
             &layer.feed_forward_down_weight,
             mapped,
             token_count,
-            &mut rounded_input,
             &mut batch_scratch,
         )?;
         output
@@ -1788,16 +1615,14 @@ mod tests {
     use super::{
         AudioProjectorWeights, AudioTransformerLayer, AudioTransformerWeights, Conv2dLayerWeights,
         ConvFeatureMap, Qwen3AsrAudioConfig, Qwen3AsrAudioEncoder, add_chunk_position_embeddings,
-        conv2d_stride2_gelu_erf, f32_to_f16_bits, flatten_conv_features, gelu_erf,
-        matmul_token_batch_with_ggml_activation_type, matmul_with_ggml_activation_type,
-        project_to_language_embeddings, round_to_bf16, run_audio_transformer,
+        conv2d_stride2_gelu_erf, flatten_conv_features, gelu_erf, project_to_language_embeddings,
+        run_audio_transformer,
     };
     use crate::engine::audio::{PreparedAudioFeatureWindow, PreparedAudioFeatureWindowPlan};
-    use crate::engine::kernels::FloatBatchMatmulScratch;
     use crate::engine::multimodal::AudioEncoderFrontendOutput;
     use crate::engine::types::{
-        GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGUFFile, GgmlType,
-        GgufValue, Gguftensor, MappedFile, QuantizedTensor,
+        GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q4_0, GGUFFile, GgmlType, GgufValue, Gguftensor,
+        MappedFile, QuantizedTensor,
     };
 
     fn add_tensor(tensors: &mut Vec<Gguftensor>, name: impl Into<String>, shape: &[u64]) {
@@ -1931,97 +1756,6 @@ mod tests {
         assert_eq!(config.position_count, 32);
         assert_eq!(config.projector_hidden_dim, 10);
         assert!(encoder.contract_summary().contains("output_dim=12"));
-    }
-
-    #[test]
-    fn f16_rounding_matches_known_ieee_values() {
-        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
-        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
-        assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
-        assert_eq!(f32_to_f16_bits(-2.0), 0xc000);
-        assert_eq!(f32_to_f16_bits(65_504.0), 0x7bff);
-        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
-    }
-
-    #[test]
-    fn bf16_activation_rounding_matches_ggml_ties_to_even() {
-        assert_eq!(
-            round_to_bf16(f32::from_bits(0x3f80_8000)).to_bits(),
-            0x3f80_0000
-        );
-        assert_eq!(
-            round_to_bf16(f32::from_bits(0x3f81_8000)).to_bits(),
-            0x3f82_0000
-        );
-        assert_eq!(
-            round_to_bf16(f32::from_bits(0x3f80_8001)).to_bits(),
-            0x3f81_0000
-        );
-        assert!(round_to_bf16(f32::NAN).is_nan());
-    }
-
-    #[test]
-    fn bf16_matmul_rounds_activations_before_the_dot_product() {
-        let mapped = 0x3f80u16.to_le_bytes();
-        let weight = QuantizedTensor {
-            data_offset: 0,
-            ttype: GgmlType(GGML_TYPE_BF16),
-            rows: 1,
-            cols: 1,
-        };
-        let input = [f32::from_bits(0x3f80_8001)];
-        let mut output = [0.0f32];
-
-        matmul_with_ggml_activation_type(&mut output, &input, &weight, &mapped).unwrap();
-
-        assert_eq!(output[0].to_bits(), 0x3f81_0000);
-    }
-
-    #[test]
-    fn bf16_batch_matmul_preserves_activation_rounding() {
-        let rows = 3usize;
-        let cols = 5usize;
-        let tokens = 4usize;
-        let mapped = (0..rows * cols)
-            .flat_map(|i| {
-                let value = ((i * 7 % 13) as f32 - 6.0) * 0.25;
-                ((value.to_bits() >> 16) as u16).to_le_bytes()
-            })
-            .collect::<Vec<_>>();
-        let weight = QuantizedTensor {
-            data_offset: 0,
-            ttype: GgmlType(GGML_TYPE_BF16),
-            rows,
-            cols,
-        };
-        let input = (0..tokens * cols)
-            .map(|i| f32::from_bits(0x3f80_8001 + (i as u32 % 4) * 0x1_0000))
-            .collect::<Vec<_>>();
-        let mut batch_output = vec![0.0f32; tokens * rows];
-        matmul_token_batch_with_ggml_activation_type(
-            &mut batch_output,
-            &input,
-            &weight,
-            &mapped,
-            tokens,
-            &mut Vec::new(),
-            &mut FloatBatchMatmulScratch::default(),
-        )
-        .unwrap();
-
-        let mut repeated_output = vec![0.0f32; tokens * rows];
-        for token in 0..tokens {
-            matmul_with_ggml_activation_type(
-                &mut repeated_output[token * rows..(token + 1) * rows],
-                &input[token * cols..(token + 1) * cols],
-                &weight,
-                &mapped,
-            )
-            .unwrap();
-        }
-        for (batch, repeated) in batch_output.iter().zip(&repeated_output) {
-            assert!((batch - repeated).abs() <= 1e-6);
-        }
     }
 
     #[test]

@@ -441,6 +441,7 @@ src/
 - `io/gguf.rs`:
   - Parses GGUF metadata/tensors.
   - Maps model file.
+  - Provides IEEE F16/BF16 conversion helpers with round-to-nearest, ties-to-even semantics.
   - Provides metadata access helpers:
     - `get_gguf_int_from_map`, `get_gguf_float_from_map`, `get_gguf_i64_array_from_map`, `get_gguf_string_from_map`, `find_gguf_tensor`.
 
@@ -524,9 +525,10 @@ src/
   - loads mmproj tensors, runs patch embedding + vision transformer + projector in Rust
   - reads `clip.vision.image_mean/std` normalization metadata from mmproj GGUF when available
   - loads and applies optional `v.deepstack.*` layer branches, fused into projected media embeddings
-  - uses SIMD dot products + rayon head-parallel attention for the vision self-attention hot path
-  - batches F16/BF16 QKV, output, FFN, and projector matrices across image tokens so each expanded
-    weight row is reused instead of decoded independently for every token
+  - uses the shared blocked encoder-attention path and caches vision M-RoPE coefficients once per
+    patch grid, applying them across token rows in parallel and reusing them for every vision layer
+  - batches F16/BF16 QKV, output, FFN, deepstack FC1/FC2, and projector matrices across image tokens
+    so each expanded weight row is reused instead of decoded independently for every token
   - jointly encodes up to four same-shape images per call, keeps attention and RoPE image-local,
     restores input ordering, and caps each microbatch at 4096 patch tokens
   - emits language-space image token embeddings for prompt injection
@@ -550,19 +552,23 @@ src/
   - mirrors llama.cpp's F16 im2col activation rounding for F16/F32 convolution kernels and resets token order at each padded 100-frame chunk boundary
   - adds the first 13 positional rows repeatedly for each chunk, then executes every pre-LayerNorm audio transformer block with full-window bidirectional multi-head attention, GELU-ERF FFNs, optional biases, and residual connections
   - applies required `a.post_ln.*` normal LayerNorm after the transformer and before the audio projector
-  - rounds F16/BF16 activations to GGML's matrix dot type; BF16 ties-to-even and matmul behavior have focused regressions
   - batches F16/BF16 convolution projection, transformer projection/FFN, and audio projector
-    matrices across tokens while preserving the GGML activation-rounding contract
+    matrices across tokens through the shared multimodal activation-rounding contract
   - executes `mm.a.mlp.1` -> GELU-ERF -> `mm.a.mlp.2` through quantized matrix kernels and returns 13 text-model-width audio embeddings per padded 100-frame chunk
   - retains every padding-derived output token, matching the pinned source graph until model-backed fixtures establish whether a later trim is required
 - `multimodal/mod.rs`:
   - backend construction (`build_vision_encoder_from_mmproj`, `build_audio_encoder_from_mmproj`)
   - enables external vision `mmproj` construction for `gemma3`, `qwen3vl`, and `qwen35`, plus Qwen3-ASR audio weight-contract construction
   - encoder abstractions (`VisionEncoder`, `AudioEncoder`), including internal typed dispatch for isolated audio convolution, transformer, and language-space projector execution
-  - shared F16/BF16 token-batch dispatch for vision encoders, with the prior parallel per-token
-    matmul retained for other tensor types; macOS F16 batches use Accelerate SGEMM after parallel
-    weight expansion, while BF16 activations are packed once per batch for native AArch64 `BFDOT`
-    reuse when runtime `FEAT_BF16` is available
+  - shared F16/BF16 activation narrowing and token-batch dispatch for vision and audio encoders;
+    batched and per-token fallback paths both match GGML's matrix dot type, macOS F16 batches use
+    Accelerate SGEMM after parallel weight expansion, and BF16 activations are packed once per batch
+    for native AArch64 2-token x 2-row `BFMMLA` tiles with `BFDOT` edges when runtime `FEAT_BF16`
+    is available
+  - shared unmasked encoder self-attention for vision and audio backends: a macOS implementation
+    uses 128-query blocks with Accelerate SGEMM for `Q*K^T` and `P*V` plus vForce exponentiation;
+    the portable online-softmax implementation remains available on other hosts, and sequence
+    boundaries keep same-shape image microbatches independent
   - predicts Qwen3-ASR output counts from planned padded feature windows, dispatches each window through the complete sidecar graph, and concatenates adjacent chunks inside one audio marker envelope
   - `examples/audio_encoder_dump.rs` probes official sidecars and dumps convolution, per-layer,
     post-transformer, and projected F32 tensors from synthetic input, PCM WAV, or a captured
@@ -592,7 +598,7 @@ src/
 
 - Numerical and sampling kernels used by inference.
 - `math.rs`: normalization, softmax, vector math, Qwen3Next SSM linear attention helpers.
-- `quant.rs`: quantized dequant/dot/matmul paths, reusable activation scratch and explicit prepared-activation matmul entry points for allocation-free Q8 prequantized fast paths and x86 Q2_K/Q4_K/Q5_K/Q6_K VNNI activation reuse (including half-block activation sums for Q2_K min correction), architecture-specific fast paths (including portable AArch64 NEON and x86 AVX2 BF16 widening/FMA dots, macOS Accelerate SGEMM for multimodal F16 token batches, runtime-gated AArch64 `BFDOT` token-batch matmul with reusable packed BF16 activation scratch, pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K MR4 dispatch, ARM Q2_K/Q3_K and legacy Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL MR4 NEON coverage, x86 Q2_K/Q3_K plus legacy Q4_0/Q4_1/Q5_0/Q5_1 and IQ4_NL MR4 AVX2/FMA table-shuffle coverage, and x86 Q2_K/Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation (int8-aware scalar references for the VNNI dispatch paths), architecture-specific matmul row prefetch helpers (x86 + aarch64), exact batched-prefill helpers including serial and parallel tiled Q2_K/Q3_K/Q4_K/Q5_K/Q6_K scalar-exact dispatch for non-MR4 row windows, an F16/BF16 token-batch kernel for multimodal encoders, and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
+- `quant.rs`: quantized dequant/dot/matmul paths, reusable activation scratch and explicit prepared-activation matmul entry points for allocation-free Q8 prequantized fast paths and x86 Q2_K/Q4_K/Q5_K/Q6_K VNNI activation reuse (including half-block activation sums for Q2_K min correction), architecture-specific fast paths (including portable AArch64 NEON and x86 AVX2 BF16 widening/FMA dots, macOS Accelerate SGEMM for multimodal F16 token batches, runtime-gated AArch64 `BFMMLA` 2-token x 2-row BF16 tiles with `BFDOT` edge handling and reusable F16/BF16 activation scratch, pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K MR4 dispatch, ARM Q2_K/Q3_K and legacy Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL MR4 NEON coverage, x86 Q2_K/Q3_K plus legacy Q4_0/Q4_1/Q5_0/Q5_1 and IQ4_NL MR4 AVX2/FMA table-shuffle coverage, and x86 Q2_K/Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation (int8-aware scalar references for the VNNI dispatch paths), architecture-specific matmul row prefetch helpers (x86 + aarch64), exact batched-prefill helpers including serial and parallel tiled Q2_K/Q3_K/Q4_K/Q5_K/Q6_K scalar-exact dispatch for non-MR4 row windows, an F16/BF16 token-batch kernel for multimodal encoders, and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
   - one-time kernel self-check disable warnings are now quiet by default and can be re-enabled with `GGUF_KERNEL_VALIDATION_WARNINGS=1`
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
 
@@ -608,15 +614,19 @@ src/
   - `transformer_with_embedding(...)` (prefill hook for external embedding vectors)
   - `transformer_with_embedding_without_logits(...)` for embedded prefill steps that only need KV/cache state
   - `transformer_prefill_batch(...)` runs a chunk of prompt positions through every layer, batching
-    the dense FFN while the attention half stays per token; `batch_prefill_supported(...)` gates it
-    (post-norm BERT, Gemma3 ordering, and per-token MoE routing fall back to the sequential loop)
+    full-attention projections and the dense FFN; Qwen3Next/Qwen3.5 SSM layers batch their input,
+    gate, and output projections around the still-token-ordered recurrent transition.
+    `batch_prefill_supported(...)` gates the path (post-norm BERT, Gemma3 ordering, and per-token MoE
+    routing fall back to the sequential loop)
   - `PrefillInput::{Token, Embedding}` lets that chunk mix vocabulary tokens with encoder-produced
     embeddings, so audio and image prompts prefill in batches instead of one position at a time.
     Embeddings must be `dim` wide; deepstack prompts, whose embeddings carry a per-layer tail that
     only the sequential path replays, stay on the per-token loop
   - accepts multimodal prefill vectors at either `dim` or `input_embedding_dim`
   - applies per-layer deepstack residual injection for Qwen3-VL-style expanded embeddings
-  - reuses kernel activation scratch across the high-frequency sequential projection calls in a token step, including prepared-activation reuse across compatible dense, BERT fused, Qwen3Next full-attention, and FFN gate/up projection groups
+  - reuses kernel activation scratch across high-frequency sequential projection calls in decode,
+    including prepared-activation reuse across compatible dense, BERT fused, Qwen3Next
+    full-attention, and FFN gate/up projection groups
   - applies llama-style Qwen3.5 M-RoPE cache reconstruction for text decode (`[t,h,w,e]=[pos,pos,pos,0]`)
   - owns reusable per-token scratch buffers for routed MoE experts, including selected-expert contribution staging in `RunState`
   - quantized KV cache storage for attention state:
@@ -640,7 +650,7 @@ src/
     - default values for non-x86 matmul thresholds and aarch64 prefetch distance are now derived from `available_parallelism()` heuristics (with CLI/env overrides preserved)
   - KV cache selection switch (`kv_cache_mode`: `q8` / `turbo`, default `turbo`)
   - multimodal F16/BF16 token-batch kill switch (`use_mm_float_batch`, enabled by default)
-  - AArch64 native BF16 dot switch (`use_aarch64_bf16`, runtime-detected and enabled by default)
+  - AArch64 native BF16 matrix switch (`use_aarch64_bf16`, runtime-detected and enabled by default)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
     - default behavior uses runtime CPU feature detection for architecture fast paths (for example aarch64 `dotprod` Q8 and x86 `AVX512VNNI` Q8), while `RuntimeSwitchConfig`/CLI/env can still force-disable paths
   - Layer debug toggles

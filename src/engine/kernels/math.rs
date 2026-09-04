@@ -545,15 +545,22 @@ pub(crate) fn qwen3next_state_head_step(
     sanitize_finite_inplace(out_h);
 }
 
-pub(crate) fn qwen3next_linear_attention_autoregressive(
+#[derive(Clone, Copy)]
+pub(crate) struct Qwen3NextLinearAttentionShape {
+    pub(crate) d_inner: usize,
+    pub(crate) n_k_heads: usize,
+    pub(crate) n_v_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) conv_kernel: usize,
+    pub(crate) conv_dim: usize,
+    pub(crate) has_fused_ba: bool,
+}
+
+pub(crate) fn qwen3next_linear_attention_shape(
     l: usize,
     p: &Config,
-    s: &mut RunState,
     w: &TransformerWeights,
-    mapped: &[u8],
-    eps: f32,
-) -> Result<(), String> {
-    let prof_t0 = prof_start();
+) -> Result<Qwen3NextLinearAttentionShape, String> {
     let d_inner = p.ssm_inner_size;
     let n_k_heads = p.ssm_group_count;
     let n_v_heads = p.ssm_time_step_rank;
@@ -625,49 +632,153 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
         ));
     }
 
+    Ok(Qwen3NextLinearAttentionShape {
+        d_inner,
+        n_k_heads,
+        n_v_heads,
+        head_dim,
+        conv_kernel,
+        conv_dim,
+        has_fused_ba,
+    })
+}
+
+pub(crate) fn qwen3next_linear_attention_autoregressive(
+    l: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    eps: f32,
+) -> Result<(), String> {
+    let prof_t0 = prof_start();
+    let shape = qwen3next_linear_attention_shape(l, p, w)?;
+
     matmul_quantized_rows(
-        &mut s.ssm_qkv[..conv_dim],
+        &mut s.ssm_qkv[..shape.conv_dim],
         &s.xb[..p.dim],
         &w.attn_qkv[l],
         0,
-        conv_dim,
+        shape.conv_dim,
         mapped,
     )?;
     matmul_quantized_rows(
-        &mut s.ssm_z[..d_inner],
+        &mut s.ssm_z[..shape.d_inner],
         &s.xb[..p.dim],
         &w.wo[l],
         0,
-        d_inner,
+        shape.d_inner,
         mapped,
     )?;
-    if has_fused_ba {
+    if shape.has_fused_ba {
         matmul_quantized_rows(
-            &mut s.ssm_ba[..2 * n_v_heads],
+            &mut s.ssm_ba[..2 * shape.n_v_heads],
             &s.xb[..p.dim],
             &w.ssm_ba[l],
             0,
-            2 * n_v_heads,
+            2 * shape.n_v_heads,
             mapped,
         )?;
     } else {
         matmul_quantized_rows(
-            &mut s.ssm_gate_exp[..n_v_heads],
+            &mut s.ssm_gate_exp[..shape.n_v_heads],
             &s.xb[..p.dim],
             &w.ssm_alpha[l],
             0,
-            n_v_heads,
+            shape.n_v_heads,
             mapped,
         )?;
         matmul_quantized_rows(
-            &mut s.ssm_beta[..n_v_heads],
+            &mut s.ssm_beta[..shape.n_v_heads],
             &s.xb[..p.dim],
             &w.ssm_beta[l],
             0,
-            n_v_heads,
+            shape.n_v_heads,
             mapped,
         )?;
     }
+
+    qwen3next_linear_attention_projected_state(l, s, w, shape, eps)?;
+
+    matmul_quantized(
+        &mut s.xb2[..p.dim],
+        &s.ssm_proj[..shape.d_inner],
+        &w.wv[l],
+        mapped,
+    )?;
+    sanitize_finite_inplace(&mut s.xb2[..p.dim]);
+    prof_end(&PROF_SSM_NS, prof_t0);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen3next_linear_attention_step_from_projections(
+    l: usize,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    shape: Qwen3NextLinearAttentionShape,
+    qkv: &[f32],
+    z: &[f32],
+    gate_a: &[f32],
+    gate_b: Option<&[f32]>,
+    eps: f32,
+) -> Result<(), String> {
+    if qkv.len() < shape.conv_dim || z.len() < shape.d_inner {
+        return Err(format!(
+            "blk.{l} projected SSM input is too small: qkv={} (need {}), z={} (need {})",
+            qkv.len(),
+            shape.conv_dim,
+            z.len(),
+            shape.d_inner
+        ));
+    }
+    s.ssm_qkv[..shape.conv_dim].copy_from_slice(&qkv[..shape.conv_dim]);
+    s.ssm_z[..shape.d_inner].copy_from_slice(&z[..shape.d_inner]);
+
+    if shape.has_fused_ba {
+        if gate_a.len() < 2 * shape.n_v_heads {
+            return Err(format!(
+                "blk.{l} fused projected SSM gates have {} values, expected {}",
+                gate_a.len(),
+                2 * shape.n_v_heads
+            ));
+        }
+        s.ssm_ba[..2 * shape.n_v_heads].copy_from_slice(&gate_a[..2 * shape.n_v_heads]);
+    } else {
+        let Some(beta) = gate_b else {
+            return Err(format!("blk.{l} is missing projected SSM beta gates"));
+        };
+        if gate_a.len() < shape.n_v_heads || beta.len() < shape.n_v_heads {
+            return Err(format!(
+                "blk.{l} split projected SSM gates are too small: alpha={} beta={} expected {}",
+                gate_a.len(),
+                beta.len(),
+                shape.n_v_heads
+            ));
+        }
+        s.ssm_gate_exp[..shape.n_v_heads].copy_from_slice(&gate_a[..shape.n_v_heads]);
+        s.ssm_beta[..shape.n_v_heads].copy_from_slice(&beta[..shape.n_v_heads]);
+    }
+
+    qwen3next_linear_attention_projected_state(l, s, w, shape, eps)
+}
+
+fn qwen3next_linear_attention_projected_state(
+    l: usize,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    shape: Qwen3NextLinearAttentionShape,
+    eps: f32,
+) -> Result<(), String> {
+    let Qwen3NextLinearAttentionShape {
+        d_inner,
+        n_k_heads,
+        n_v_heads,
+        head_dim,
+        conv_kernel,
+        conv_dim,
+        has_fused_ba,
+    } = shape;
 
     let conv_w = &w.ssm_conv1d[l];
     if conv_w.len() < conv_kernel * conv_dim {
@@ -838,14 +949,6 @@ pub(crate) fn qwen3next_linear_attention_autoregressive(
         }
     }
 
-    matmul_quantized(
-        &mut s.xb2[..p.dim],
-        &s.ssm_proj[..d_inner],
-        &w.wv[l],
-        mapped,
-    )?;
-    sanitize_finite_inplace(&mut s.xb2[..p.dim]);
-    prof_end(&PROF_SSM_NS, prof_t0);
     Ok(())
 }
 

@@ -11,7 +11,9 @@ use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
 use crate::engine::vision::PreparedImageTensor;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
-use super::{FloatBatchMatmulScratch, matmul_encoder_batch};
+use super::{
+    EncoderAttentionScratch, FloatBatchMatmulScratch, encoder_self_attention, matmul_encoder_batch,
+};
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n_elements = 1usize;
@@ -684,8 +686,6 @@ impl Gemma3VisionEncoder {
         let mut q = vec![0.0f32; n_tokens * self.dim];
         let mut k = vec![0.0f32; n_tokens * self.dim];
         let mut v = vec![0.0f32; n_tokens * self.dim];
-        let head_token_stride = n_tokens * self.head_dim;
-        let mut attn_head_major = vec![0.0f32; self.head_count * head_token_stride];
         let mut attn_out = vec![0.0f32; n_tokens * self.dim];
         let mut proj_out = vec![0.0f32; n_tokens * self.dim];
         let dim = self.dim;
@@ -693,6 +693,7 @@ impl Gemma3VisionEncoder {
         let mut ffn_up_batch = vec![0.0f32; n_tokens * ff_dim];
         let mut ffn_down_batch = vec![0.0f32; n_tokens * dim];
         let mut batch_scratch = FloatBatchMatmulScratch::default();
+        let mut attention_scratch = EncoderAttentionScratch::default();
         let eps = self.eps;
         let use_gelu = self.use_gelu;
 
@@ -737,53 +738,17 @@ impl Gemma3VisionEncoder {
                     Self::add_bias(v_dst, &layer.attn_v_b);
                 });
 
-            let inv_scale = 1.0 / (self.head_dim as f32).sqrt();
-            let head_dim = self.head_dim;
-            attn_head_major
-                .par_chunks_mut(head_dim)
-                .enumerate()
-                .for_each(|(row_idx, out)| {
-                    let h = row_idx / n_tokens;
-                    let i = row_idx % n_tokens;
-                    let h_off = h * head_dim;
-                    let qi = &q[i * dim + h_off..i * dim + h_off + head_dim];
-
-                    out.fill(0.0);
-                    let mut max_score = f32::NEG_INFINITY;
-                    let mut score_sum = 0.0f32;
-                    for j in 0..n_tokens {
-                        let kj = &k[j * dim + h_off..j * dim + h_off + head_dim];
-                        let score = dot_f32_simd(qi, kj) * inv_scale;
-
-                        if score > max_score {
-                            if score_sum > 0.0 {
-                                let rescale = (max_score - score).exp();
-                                scale_slice_inplace(out, rescale);
-                                score_sum *= rescale;
-                            }
-                            max_score = score;
-                        }
-
-                        let weight = (score - max_score).exp();
-                        score_sum += weight;
-                        let vj = &v[j * dim + h_off..j * dim + h_off + head_dim];
-                        axpy_inplace(out, weight, vj);
-                    }
-
-                    if score_sum > 0.0 {
-                        let inv = 1.0 / score_sum;
-                        scale_slice_inplace(out, inv);
-                    }
-                });
-            for t in 0..n_tokens {
-                let dst = &mut attn_out[t * self.dim..(t + 1) * self.dim];
-                for h in 0..self.head_count {
-                    let src = &attn_head_major[h * head_token_stride + t * self.head_dim
-                        ..h * head_token_stride + (t + 1) * self.head_dim];
-                    let off = h * self.head_dim;
-                    dst[off..off + self.head_dim].copy_from_slice(src);
-                }
-            }
+            encoder_self_attention(
+                &mut attn_out,
+                &q,
+                &k,
+                &v,
+                1,
+                n_tokens,
+                self.head_count,
+                self.head_dim,
+                &mut attention_scratch,
+            )?;
 
             matmul_encoder_batch(
                 &mut proj_out,

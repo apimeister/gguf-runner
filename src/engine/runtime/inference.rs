@@ -7,11 +7,14 @@ use crate::engine::kernels::{
     matmul_quantized_rows, matmul_quantized_rows_with_prepared_activation,
     matmul_quantized_rows_with_scratch, matmul_quantized_with_prepared_activation,
     matmul_quantized_with_scratch, prepare_matmul_activation,
-    qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma, rmsnorm_inplace,
+    qwen3next_linear_attention_autoregressive, qwen3next_linear_attention_shape,
+    qwen3next_linear_attention_step_from_projections, rmsnorm, rmsnorm_gemma, rmsnorm_inplace,
     rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace, scale_slice_inplace,
     select_topk_softmax, sigmoid_mul_inplace, silu_and_mul_inplace, softmax,
 };
-use crate::engine::profiling::{PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS, prof_end, prof_start};
+use crate::engine::profiling::{
+    PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS, PROF_SSM_NS, prof_end, prof_start,
+};
 use crate::engine::switches::{
     KvCacheMode as SwitchKvCacheMode, kv_cache_mode, layer_debug_enabled, layer_debug_pos,
     par_attn_min_heads,
@@ -2567,10 +2570,9 @@ pub(crate) fn qkv_bias_and_norm(p: &Config, s: &mut RunState, w: &TransformerWei
 /// Whether [`transformer_prefill_batch`] can process prompts for this model.
 /// Anything gated out falls back to the sequential per-token loop: post-norm
 /// (BERT) and Gemma3 ordering differ, and MoE FFN routing is per-token by
-/// construction. Qwen3Next/Qwen3.5 hybrids are supported: their attention half
-/// (including SSM layers, which are recurrent) runs per token via the shared
-/// [`layer_attention_token`]; the dense FFN — the bulk of prefill compute —
-/// is batched.
+/// construction. Qwen3Next/Qwen3.5 hybrids are supported: their full-attention
+/// projections and the independent projections around each recurrent SSM scan
+/// are batched, while state transitions remain ordered by token.
 pub(crate) fn batch_prefill_supported(p: &Config) -> bool {
     !p.is_bert_family && !p.is_gemma3 && !p.is_qwen3moe && p.n_experts == 0
 }
@@ -2594,6 +2596,14 @@ pub(crate) struct PrefillScratch {
     /// FFN gate/up activations, `m × hidden_dim`.
     hb: Vec<f32>,
     hb2: Vec<f32>,
+    /// Qwen3Next/Qwen3.5 SSM projections. The recurrent state transition
+    /// consumes these token-major rows serially, then `ssm_proj` is batched
+    /// through the output matrix.
+    ssm_qkv: Vec<f32>,
+    ssm_z: Vec<f32>,
+    ssm_gate_a: Vec<f32>,
+    ssm_gate_b: Vec<f32>,
+    ssm_proj: Vec<f32>,
     /// Row-major scratch for the batched matmul kernels.
     mm: Vec<f32>,
 }
@@ -2610,6 +2620,11 @@ impl PrefillScratch {
             xb2: Vec::new(),
             hb: Vec::new(),
             hb2: Vec::new(),
+            ssm_qkv: Vec::new(),
+            ssm_z: Vec::new(),
+            ssm_gate_a: Vec::new(),
+            ssm_gate_b: Vec::new(),
+            ssm_proj: Vec::new(),
             mm: Vec::new(),
         }
     }
@@ -2629,6 +2644,19 @@ impl PrefillScratch {
         grow(&mut self.xb2, m * dim);
         grow(&mut self.hb, m * hidden_dim);
         grow(&mut self.hb2, m * hidden_dim);
+    }
+
+    fn ensure_ssm(&mut self, m: usize, conv_dim: usize, d_inner: usize, n_v_heads: usize) {
+        let grow = |v: &mut Vec<f32>, len: usize| {
+            if v.len() < len {
+                v.resize(len, 0.0);
+            }
+        };
+        grow(&mut self.ssm_qkv, m * conv_dim);
+        grow(&mut self.ssm_z, m * d_inner);
+        grow(&mut self.ssm_gate_a, m * 2 * n_v_heads);
+        grow(&mut self.ssm_gate_b, m * n_v_heads);
+        grow(&mut self.ssm_proj, m * d_inner);
     }
 }
 
@@ -2685,11 +2713,10 @@ pub(crate) enum PrefillInput<'a> {
 /// through all layers, writing their KV-cache rows. Computes no logits — the
 /// caller runs the final prompt token through the sequential path.
 ///
-/// Structure: the **attention half runs per token** through the shared
-/// [`layer_attention_token`] (byte-identical to the sequential path — this
-/// also covers Qwen3Next/Qwen3.5 SSM layers, whose recurrence is inherently
-/// sequential), while the **dense FFN — the bulk of prefill compute — is
-/// batched** across the chunk. With the exact batched kernel
+/// Structure: full-attention projections and the dense FFN are batched across
+/// the chunk. Qwen3Next/Qwen3.5 SSM input/gate projections are also batched,
+/// followed by the same token-ordered recurrent transition and a batched output
+/// projection. With the exact batched kernel
 /// (`GGUF_BATCH_PREFILL_EXACT=1`) or per-token fallbacks the whole pass is
 /// bit-identical to sequential prefill; the default fast kernel is
 /// tolerance-level equivalent on K-quant tensors. Causality holds because
@@ -2748,25 +2775,118 @@ pub(crate) fn transformer_prefill_batch(
         }
     }
 
-    let mut matmul_scratch = MatmulActivationScratch::new();
-
     for l in 0..p.n_layers {
         let is_ssm_layer = p.is_qwen3next && w.attn_qkv[l].rows > 0;
         if is_ssm_layer {
-            // SSM (linear-attention) layers are recurrent across positions —
-            // run the whole attention half per token via the shared helper.
+            let ssm_prof = prof_start();
+            let shape = qwen3next_linear_attention_shape(l, p, w)?;
+            scratch.ensure_ssm(m, shape.conv_dim, shape.d_inner, shape.n_v_heads);
+
             for i in 0..m {
-                let pos = base_pos + i;
                 rmsnorm(
-                    &mut s.xb[..dim],
+                    &mut scratch.xn[i * dim..(i + 1) * dim],
                     &scratch.x[i * dim..(i + 1) * dim],
                     &w.rms_att_weight[l * dim..(l + 1) * dim],
                     dim,
                     eps,
                 );
-                layer_attention_token(p, s, w, mapped, &mut matmul_scratch, l, pos)?;
-                accum(&mut scratch.x[i * dim..(i + 1) * dim], &s.xb2[..dim], dim);
             }
+
+            // The SSM recurrence depends on prior tokens, but these projections
+            // depend only on each token's normalized input.
+            bmm_prefill(
+                &mut scratch.ssm_qkv[..m * shape.conv_dim],
+                &scratch.xn[..m * dim],
+                &w.attn_qkv[l],
+                mapped,
+                m,
+                0,
+                shape.conv_dim,
+                &mut scratch.mm,
+            )?;
+            bmm_prefill(
+                &mut scratch.ssm_z[..m * shape.d_inner],
+                &scratch.xn[..m * dim],
+                &w.wo[l],
+                mapped,
+                m,
+                0,
+                shape.d_inner,
+                &mut scratch.mm,
+            )?;
+            let gate_rows = if shape.has_fused_ba {
+                2 * shape.n_v_heads
+            } else {
+                shape.n_v_heads
+            };
+            let gate_weights = if shape.has_fused_ba {
+                &w.ssm_ba[l]
+            } else {
+                &w.ssm_alpha[l]
+            };
+            bmm_prefill(
+                &mut scratch.ssm_gate_a[..m * gate_rows],
+                &scratch.xn[..m * dim],
+                gate_weights,
+                mapped,
+                m,
+                0,
+                gate_rows,
+                &mut scratch.mm,
+            )?;
+            if !shape.has_fused_ba {
+                bmm_prefill(
+                    &mut scratch.ssm_gate_b[..m * shape.n_v_heads],
+                    &scratch.xn[..m * dim],
+                    &w.ssm_beta[l],
+                    mapped,
+                    m,
+                    0,
+                    shape.n_v_heads,
+                    &mut scratch.mm,
+                )?;
+            }
+
+            // Preserve causal recurrence exactly: each step observes the state
+            // written by the preceding token. Only the surrounding matrices are
+            // moved out of this loop.
+            for i in 0..m {
+                let gate_b = (!shape.has_fused_ba)
+                    .then(|| &scratch.ssm_gate_b[i * shape.n_v_heads..(i + 1) * shape.n_v_heads]);
+                qwen3next_linear_attention_step_from_projections(
+                    l,
+                    s,
+                    w,
+                    shape,
+                    &scratch.ssm_qkv[i * shape.conv_dim..(i + 1) * shape.conv_dim],
+                    &scratch.ssm_z[i * shape.d_inner..(i + 1) * shape.d_inner],
+                    &scratch.ssm_gate_a[i * gate_rows..(i + 1) * gate_rows],
+                    gate_b,
+                    eps,
+                )?;
+                scratch.ssm_proj[i * shape.d_inner..(i + 1) * shape.d_inner]
+                    .copy_from_slice(&s.ssm_proj[..shape.d_inner]);
+            }
+
+            bmm_prefill(
+                &mut scratch.xb2[..m * dim],
+                &scratch.ssm_proj[..m * shape.d_inner],
+                &w.wv[l],
+                mapped,
+                m,
+                0,
+                dim,
+                &mut scratch.mm,
+            )?;
+            sanitize_finite_inplace(&mut scratch.xb2[..m * dim]);
+            for i in 0..m {
+                accum(
+                    &mut scratch.x[i * dim..(i + 1) * dim],
+                    &scratch.xb2[i * dim..(i + 1) * dim],
+                    dim,
+                );
+            }
+            prof_end(&PROF_SSM_NS, ssm_prof);
         } else {
             // Full-attention layer: batch the projections (QKV here, O-proj
             // below); the per-token core (bias/qk-norm, RoPE, KV write,
@@ -3881,12 +4001,15 @@ fn transformer_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        TURBOQUANT_RESIDUAL_POST_SALT, TURBOQUANT_RESIDUAL_PRE_SALT, TURBOQUANT_ROTATE_POST_SALT,
-        TURBOQUANT_ROTATE_PRE_SALT, TurboquantHeadRead, axpy_turboquant_head_scalar,
-        dot_turboquant_head_scalar, get_q2_at, set_sign_bit, splitmix64, turboquant_fwht_inplace,
+        PrefillInput, PrefillScratch, TURBOQUANT_RESIDUAL_POST_SALT, TURBOQUANT_RESIDUAL_PRE_SALT,
+        TURBOQUANT_ROTATE_POST_SALT, TURBOQUANT_ROTATE_PRE_SALT, TurboquantHeadRead,
+        axpy_turboquant_head_scalar, dot_turboquant_head_scalar, get_q2_at, malloc_run_state,
+        set_sign_bit, splitmix64, transformer_prefill_batch,
+        transformer_with_embedding_without_logits, turboquant_fwht_inplace,
     };
     #[cfg(target_arch = "aarch64")]
     use super::{axpy_turboquant_head_neon, dot_turboquant_head_neon};
+    use crate::engine::types::{Config, ModelCapabilities, QuantizedTensor, TransformerWeights};
 
     #[inline]
     fn turboquant_seed(layer: usize, kv_head: usize, salt: u64) -> u64 {
@@ -3905,6 +4028,203 @@ mod tests {
     fn turboquant_apply_signs(values: &mut [f32], seed: u64) {
         for (idx, value) in values.iter_mut().enumerate() {
             *value *= turboquant_sign(seed, idx);
+        }
+    }
+
+    fn append_f32_matrix(
+        mapped: &mut Vec<u8>,
+        rows: usize,
+        cols: usize,
+        salt: usize,
+    ) -> QuantizedTensor {
+        let data_offset = mapped.len();
+        for row in 0..rows {
+            for col in 0..cols {
+                let index = row * cols + col + salt;
+                let value = ((index as f32 + 0.75) * 0.173).sin() * 0.17;
+                mapped.extend_from_slice(&value.to_ne_bytes());
+            }
+        }
+        QuantizedTensor {
+            data_offset,
+            rows,
+            cols,
+            ..QuantizedTensor::default()
+        }
+    }
+
+    fn qwen3next_dense_test_fixture(fused_gates: bool) -> (Config, TransformerWeights, Vec<u8>) {
+        let dim = 4usize;
+        let hidden_dim = 6usize;
+        let n_v_heads = 2usize;
+        let ssm_head_dim = 2usize;
+        let d_inner = n_v_heads * ssm_head_dim;
+        let n_k_heads = 1usize;
+        let conv_dim = d_inner + 2 * n_k_heads * ssm_head_dim;
+        let conv_kernel = 2usize;
+        let config = Config {
+            dim,
+            input_embedding_dim: dim,
+            n_deepstack_layers: 0,
+            hidden_dim,
+            expert_hidden_dim: 0,
+            shared_expert_hidden_dim: 0,
+            n_layers: 1,
+            n_heads: 1,
+            n_kv_heads: 1,
+            n_experts: 0,
+            n_experts_used: 0,
+            moe_n_group: 0,
+            moe_topk_group: 0,
+            moe_norm_topk_prob: false,
+            moe_routed_scaling_factor: 1.0,
+            vocab_size: 1,
+            seq_len: 8,
+            rope_theta: 10_000.0,
+            head_dim: dim,
+            rope_dim: dim,
+            rope_sections: [0; 4],
+            is_bert_family: false,
+            is_gemma3: false,
+            is_smolvlm: false,
+            is_qwen2: false,
+            is_qwen3: false,
+            is_qwen35: true,
+            is_qwen3vl: false,
+            is_qwen3moe: false,
+            is_qwen3next: true,
+            uses_chatml_template: true,
+            online_attn_fusion: false,
+            qwen_chat_template_contains_think: false,
+            qwen_chat_template_has_builtin_system: false,
+            qwen_chat_template_uses_empty_think: false,
+            capabilities: ModelCapabilities::default(),
+            final_logit_softcapping: 0.0,
+            rms_norm_eps: 1e-6,
+            rope_theta_swa: 0.0,
+            swa_pattern: 0,
+            ssm_conv_kernel: conv_kernel,
+            ssm_inner_size: d_inner,
+            ssm_state_size: ssm_head_dim,
+            ssm_time_step_rank: n_v_heads,
+            ssm_group_count: n_k_heads,
+        };
+
+        let mut mapped = Vec::new();
+        let attn_qkv = append_f32_matrix(&mut mapped, conv_dim, dim, 1);
+        let attn_gate = append_f32_matrix(&mut mapped, d_inner, dim, 101);
+        let (ssm_ba, ssm_alpha, ssm_beta) = if fused_gates {
+            (
+                vec![append_f32_matrix(&mut mapped, 2 * n_v_heads, dim, 201)],
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            (
+                Vec::new(),
+                vec![append_f32_matrix(&mut mapped, n_v_heads, dim, 201)],
+                vec![append_f32_matrix(&mut mapped, n_v_heads, dim, 251)],
+            )
+        };
+        let ssm_out = append_f32_matrix(&mut mapped, dim, d_inner, 301);
+        let ffn_gate = append_f32_matrix(&mut mapped, hidden_dim, dim, 401);
+        let ffn_up = append_f32_matrix(&mut mapped, hidden_dim, dim, 501);
+        let ffn_down = append_f32_matrix(&mut mapped, dim, hidden_dim, 601);
+        let weights = TransformerWeights {
+            token_embedding_table: vec![0.0; dim],
+            rms_att_weight: vec![1.0; dim],
+            rms_ffn_weight: vec![1.0; dim],
+            wq: vec![QuantizedTensor::default()],
+            wk: vec![QuantizedTensor::default()],
+            wv: vec![ssm_out],
+            wo: vec![attn_gate],
+            w1: vec![ffn_gate],
+            w2: vec![ffn_down],
+            w3: vec![ffn_up],
+            attn_qkv: vec![attn_qkv],
+            ssm_ba,
+            ssm_alpha,
+            ssm_beta,
+            ssm_conv1d: vec![
+                (0..conv_dim)
+                    .flat_map(|channel| {
+                        let past = 0.11 + channel as f32 * 0.003;
+                        [past, 0.83 - channel as f32 * 0.005]
+                    })
+                    .collect(),
+            ],
+            ssm_a: vec![-0.5, -0.7],
+            ssm_dt_bias: vec![0.05, -0.03],
+            ssm_norm: vec![0.9, 1.1],
+            moe_gate_inp: Vec::new(),
+            moe_gate_exps: Vec::new(),
+            moe_up_exps: Vec::new(),
+            moe_down_exps: Vec::new(),
+            moe_shared_gate_inp: Vec::new(),
+            rms_final_weight: vec![1.0; dim],
+            wcls: QuantizedTensor::default(),
+            wcls_is_embed: true,
+            attn_q_bias: Vec::new(),
+            attn_k_bias: Vec::new(),
+            attn_v_bias: Vec::new(),
+            attn_q_norm: Vec::new(),
+            attn_k_norm: Vec::new(),
+            attn_qk_norm_present: vec![false],
+            attn_post_norm: Vec::new(),
+            ffn_post_norm: Vec::new(),
+            attn_post_norm_bias: Vec::new(),
+            ffn_post_norm_bias: Vec::new(),
+        };
+        (config, weights, mapped)
+    }
+
+    #[test]
+    fn batched_ssm_projections_preserve_token_order_and_results() {
+        for fused_gates in [true, false] {
+            let (config, weights, mapped) = qwen3next_dense_test_fixture(fused_gates);
+            let embeddings = [
+                vec![0.21, -0.34, 0.55, -0.13],
+                vec![-0.17, 0.29, 0.08, 0.41],
+                vec![0.37, 0.11, -0.23, 0.19],
+            ];
+            let mut sequential_state = malloc_run_state(&config).expect("sequential state");
+            let mut expected_outputs = Vec::new();
+            for (position, embedding) in embeddings.iter().enumerate() {
+                transformer_with_embedding_without_logits(
+                    embedding,
+                    position,
+                    &config,
+                    &mut sequential_state,
+                    &weights,
+                    &mapped,
+                )
+                .expect("sequential SSM step");
+                expected_outputs.extend_from_slice(&sequential_state.x[..config.dim]);
+            }
+
+            let mut batched_state = malloc_run_state(&config).expect("batched state");
+            let mut scratch = PrefillScratch::new();
+            let inputs = embeddings
+                .iter()
+                .map(|embedding| PrefillInput::Embedding(embedding))
+                .collect::<Vec<_>>();
+            transformer_prefill_batch(
+                &inputs,
+                0,
+                &config,
+                &mut batched_state,
+                &weights,
+                &mapped,
+                &mut scratch,
+            )
+            .expect("batched SSM prefill");
+
+            assert_eq!(&scratch.x[..expected_outputs.len()], &expected_outputs);
+            assert_eq!(
+                batched_state.ssm_conv_state,
+                sequential_state.ssm_conv_state
+            );
+            assert_eq!(batched_state.ssm_state, sequential_state.ssm_state);
         }
     }
 

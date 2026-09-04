@@ -44,9 +44,10 @@ See `docs/speaker-recognition.md` for usage, privacy guidance, limitations, and 
 
 Supported tensor data paths include:
 - `F32`, `F16`, `BF16`
-- F16/BF16 multimodal encoder matrices reuse each expanded weight row across a token batch; BF16
-  batches pack activations once and use native `BFDOT` on compatible AArch64 hosts (including
-  Apple M5), with portable NEON widening/F32 FMA as the fallback; x86_64 uses AVX2 widening/FMA
+- F16/BF16 multimodal encoder matrices narrow activations to GGML's matching dot type; F16 reuses
+  each expanded weight row across a token batch, while BF16 packs activations once and uses native
+  2-token x 2-row `BFMMLA` tiles on compatible AArch64 hosts (including Apple M5), with `BFDOT` for
+  odd edges and portable NEON widening/F32 FMA as the fallback; x86_64 uses AVX2 widening/FMA
 - `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`
 - `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`
 - `IQ4_NL`
@@ -59,6 +60,11 @@ Supported tensor data paths include:
 - model-family-specific chat prompt rendering
 - multimodal request/model capability scaffolding for Gemma3, Qwen3-VL, and Qwen3.5:
   - startup capability probe for native image/video/audio support (token + tensor checks)
+  - shared full self-attention for Qwen3-VL/Qwen3.5, Gemma3, Idefics3, and Qwen3-ASR encoders;
+    macOS evaluates bounded query blocks with Accelerate SGEMM and vForce softmax while the portable
+    path retains online softmax, and each image in a microbatch remains an independent sequence
+  - Qwen3-VL/Qwen3.5 vision M-RoPE coefficients are computed once per patch grid, reused across all
+    vision layers and compatible images, and applied to token rows in parallel
   - llama-style local `mmproj*.gguf` sidecar auto-discovery/probe (no extra CLI flag)
   - strict native-only multimodal execution (no metadata fallback path)
   - multimodal tensor-group probe during runtime load:
@@ -77,6 +83,8 @@ Supported tensor data paths include:
   - media prompts prefill in batches: injected embeddings travel through `transformer_prefill_batch`
     as `PrefillInput::Embedding` rather than forcing the per-position loop. Deepstack models, whose
     embeddings carry a per-layer tail, keep the sequential path
+  - Qwen3Next/Qwen3.5 dense prefill batches the QKV, gate, and output projections around SSM layers;
+    the recurrent state transition remains serial and causal across prompt positions
   - media expansion validates spans globally and refuses context overflow instead of truncating through embedding sequences
   - clearer media capability diagnostics when GGUF is missing native multimodal tensor groups
     - includes sidecar search results and effective support status
@@ -217,7 +225,8 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_LAYER_DEBUG_POS`
 - `GGUF_AARCH64_DOTPROD_Q8` (aarch64 only)
 - `GGUF_AARCH64_QK_MR4` (aarch64 only)
-- `GGUF_AARCH64_BF16` (`0` disables native `BFDOT` BF16 batch matmul; aarch64 only)
+- `GGUF_AARCH64_BF16` (`0` disables native `BFMMLA`/`BFDOT` BF16 batch matmul;
+  aarch64 only)
 - `GGUF_X86_AVX2` (x86_64 only)
 - `GGUF_X86_F16C` (x86_64 only)
 - `GGUF_X86_QK_MR4` (x86_64 only)

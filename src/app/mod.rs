@@ -123,7 +123,7 @@ fn print_cpu_features() {
         println!("  FCVTL fp16 loads:             always enabled (base AArch64)");
         println!("  USHLL/SHL bf16 loads:         always enabled (base AArch64)");
         println!(
-            "  BFDOT bf16 batch matmul:       runtime={}",
+            "  BFMMLA/BFDOT bf16 batch:       runtime={}",
             yn(std::arch::is_aarch64_feature_detected!("bf16"))
         );
         println!(
@@ -802,7 +802,7 @@ pub(crate) fn collect_debug_banner_lines(cli: &CliOptions) -> Vec<String> {
     ));
     #[cfg(target_arch = "aarch64")]
     lines.push(format!(
-        "AArch64 kernels: matmul_prefetch_rows={}, bf16_bfdot={}",
+        "AArch64 kernels: matmul_prefetch_rows={}, bf16_matrix={}",
         aarch64_matmul_prefetch_rows(),
         use_aarch64_bf16()
     ));
