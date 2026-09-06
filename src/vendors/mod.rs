@@ -837,9 +837,13 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         qwen_chat_template_has_builtin_system: chat_template.contains("you are qwen"),
         // Detect the pre-filled empty-think pattern used by no-reasoning Qwen3 variants
         // (Bonsai, Qwen3-Instruct without thinking). The template literal in the GGUF
-        // shows up with escaped newlines, so check both renderings.
-        qwen_chat_template_uses_empty_think: chat_template.contains("<think>\\n\\n</think>")
-            || chat_template.contains("<think>\n\n</think>"),
+        // shows up with escaped newlines, so check both renderings. Hybrid templates
+        // (Qwen3.5) contain the same literal inside an `enable_thinking` conditional
+        // branch — those models do reason, so they must not be classified as
+        // empty-think or their reasoning spills into the visible answer.
+        qwen_chat_template_uses_empty_think: (chat_template.contains("<think>\\n\\n</think>")
+            || chat_template.contains("<think>\n\n</think>"))
+            && !chat_template.contains("enable_thinking"),
         capabilities,
         final_logit_softcapping: get_gguf_float_from_map(&gguf.kv, &key_softcap, 0.0),
         rms_norm_eps: get_gguf_float_from_map(&gguf.kv, &key_rms_eps, 1e-6),
