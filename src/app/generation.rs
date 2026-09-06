@@ -14,8 +14,8 @@ use crate::engine::multimodal::{
 use crate::engine::profiling::{PROF_TRANSFORMER_NS, prof_end, prof_start, record_forward_pass};
 use crate::engine::types::{
     AudioEncoderBackend, AudioTranscriptionResult, Config, ContentPart, EncodedPrompt, GGUFFile,
-    GenerationRequest, MediaRef, MultimodalBackend, MultimodalWeights, PlaceholderSpan, ThinkMode,
-    Tokenizer, TransformerWeights, XorShiftRng,
+    GenerationRequest, MediaRef, MultimodalBackend, MultimodalWeights, PlaceholderSpan,
+    RopePositionPlan, ThinkMode, Tokenizer, TransformerWeights, XorShiftRng,
 };
 use crate::engine::vision::{
     ImageNormalization, ImagePreprocessProfile, ImageResizeMode, load_video_chunk_tensors,
@@ -115,7 +115,9 @@ fn repeated_inline_phrase(output: &str) -> Option<String> {
     const LOOKBACK: usize = 1024;
 
     let window = if output.len() > LOOKBACK {
-        &output[output.len() - LOOKBACK..]
+        // `len - LOOKBACK` can land inside a multi-byte character; snap to a
+        // char boundary instead of slicing (which would panic).
+        split_at_char_boundary(output, output.len() - LOOKBACK).1
     } else {
         output
     };
@@ -3266,7 +3268,7 @@ impl ModelRuntime {
 
         let prefill_injected_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
         let output =
-            self.generate_from_prefill(prompt_tokens, prefill_injected_embeddings, false)?;
+            self.generate_from_prefill(prompt_tokens, prefill_injected_embeddings, None, false)?;
         let request = GenerationRequest {
             system_prompt: system_prompt.to_string(),
             parts: vec![ContentPart::Text(
@@ -3804,12 +3806,12 @@ impl ModelRuntime {
                 return Err("generation request has no text content".to_string());
             }
 
-            let image_profile = self.image_preprocess_profile();
             self.ensure_external_multimodal_initialized(images.len(), videos.len(), audios.len())?;
             self.ensure_native_media_support(images.len(), videos.len(), audios.len())
                 .map_err(|e| {
                     format!("native multimodal execution required (fallback disabled): {e}")
                 })?;
+            let image_profile = self.image_preprocess_profile();
             let event_callback = self.settings.runtime_event_callback.as_ref();
             if (!images.is_empty() || !videos.is_empty() || !audios.is_empty())
                 && self.multimodal_weights.is_none()
@@ -4036,6 +4038,7 @@ impl ModelRuntime {
             }
 
             let mut prefill_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
+            let mut rope_position_plan = None;
             let mut prompt_tokens = encoded_prompt.token_ids.clone();
             let mut image_embeddings = Vec::new();
 
@@ -4156,7 +4159,7 @@ impl ModelRuntime {
                                 );
                             }
                         }
-                        Ok(MediaEmbeddingSequence { tokens })
+                        Ok(MediaEmbeddingSequence { tokens, grid: None })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let actual_audio_token_counts = audio_embeddings
@@ -4216,14 +4219,15 @@ impl ModelRuntime {
                     self.config.seq_len,
                     decode_reserve,
                 )?;
-                let (expanded_tokens, injected) = expand_prompt_with_media_embeddings(
+                let expanded = expand_prompt_with_media_embeddings(
                     &encoded_prompt,
                     &image_embeddings,
                     &audio_embeddings,
                     self.config.input_embedding_dim,
                 )?;
-                prompt_tokens = expanded_tokens;
-                prefill_embeddings = injected;
+                prompt_tokens = expanded.token_ids;
+                prefill_embeddings = expanded.embeddings;
+                rope_position_plan = expanded.position_plan;
             }
 
             if self.settings.debug_mode {
@@ -4270,6 +4274,7 @@ impl ModelRuntime {
             let output = self.generate_from_prefill(
                 prompt_tokens,
                 prefill_embeddings,
+                rope_position_plan,
                 effective_stream_stdout,
             )?;
             self.retry_without_think_for_request(
@@ -4292,10 +4297,14 @@ impl ModelRuntime {
         &mut self,
         prompt_tokens: Vec<i32>,
         prefill_injected_embeddings: HashMap<usize, Vec<f32>>,
+        rope_position_plan: Option<RopePositionPlan>,
         stream_stdout: bool,
     ) -> Result<String, String> {
         let event_callback = self.settings.runtime_event_callback.clone();
         let hidden_retry_enabled = self.settings.think_mode == ThinkMode::Hidden;
+        let retry_position_plan = hidden_retry_enabled
+            .then(|| rope_position_plan.clone())
+            .flatten();
         let retry_prompt_tokens = if hidden_retry_enabled {
             Some(prompt_tokens.clone())
         } else {
@@ -4327,6 +4336,7 @@ impl ModelRuntime {
             &self.config,
             self.kv_cache_format_override,
         )?;
+        state.rope_position_plan = rope_position_plan;
         if debug_mode && !self.kv_cache_format_logged {
             emit_debug_line(
                 event_callback.as_ref(),
@@ -4567,9 +4577,9 @@ impl ModelRuntime {
 
         // Batched prefill: process all but the last prompt token in chunks so
         // each weight tensor streams from memory once per chunk instead of
-        // once per token. Bit-identical to the sequential loop below (the
-        // batched matmuls mirror the per-token kernels exactly and the
-        // rope/KV/attention steps are the same shared helpers); the last
+        // once per token. Exact batched matmuls mirror the sequential kernels;
+        // the default fast K-quant kernel can differ in floating-point rounding.
+        // Both modes share the rope/KV/attention helpers. The last
         // prompt token stays on the sequential path so the logits and
         // sampling flow are untouched.
         //
@@ -5403,6 +5413,7 @@ impl ModelRuntime {
                 let retry_result = self.generate_from_prefill(
                     retry_prompt_tokens,
                     retry_prefill_embeddings,
+                    retry_position_plan,
                     stream_stdout,
                 );
                 self.settings.think_mode = original_think_mode;
@@ -5562,8 +5573,12 @@ impl ModelRuntime {
         }
 
         let prefill_injected_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
-        let output =
-            self.generate_from_prefill(prompt_tokens, prefill_injected_embeddings, stream_stdout)?;
+        let output = self.generate_from_prefill(
+            prompt_tokens,
+            prefill_injected_embeddings,
+            None,
+            stream_stdout,
+        )?;
         let request = GenerationRequest {
             system_prompt: system_prompt.to_string(),
             parts: vec![ContentPart::Text(prompt.to_string())],
@@ -5581,7 +5596,7 @@ mod tests {
         extract_first_complete_json_object, finalize_visible_think_tail,
         find_first_complete_json_object_span, flush_visible_text_stop_tail,
         has_meaningful_retry_text, is_agent_json_safe_text, match_agent_response_prefix,
-        promote_think_only_content, sanitize_final_response_text,
+        promote_think_only_content, repeated_inline_phrase, sanitize_final_response_text,
         should_buffer_visible_think_stdout,
     };
     use crate::app::CWD_TEST_LOCK;
@@ -5589,6 +5604,108 @@ mod tests {
     use crate::vendors::VendorDecodePolicy;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn repeated_inline_phrase_lookback_snaps_to_char_boundary() {
+        // 600 two-byte 'ä' + one ascii byte = 1201 bytes; the 1024-byte
+        // lookback start (byte 177) falls inside an 'ä'.
+        let mid_char_cut = "ä".repeat(600) + "x";
+        let _ = repeated_inline_phrase(&mid_char_cut);
+
+        // Detection still works on multi-byte text past the lookback size.
+        let padding = "ä".repeat(600);
+        let repeated = format!("{padding}{}", "Grüße aus Köln! ".repeat(4));
+        assert!(repeated_inline_phrase(&repeated).is_some());
+    }
+
+    #[test]
+    #[ignore = "requires local Qwen3.5-2B-Q4_K_M.gguf, its F16 mmproj, and regression/IMG_0138.jpg; run in release mode"]
+    fn lazy_image_requests_match_warm_and_preencoded_requests() {
+        use crate::app::events::RuntimeEvent;
+        use crate::engine::vision::ImageNormalization;
+        use std::path::Path;
+        use std::sync::{Arc, Mutex};
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut runtime =
+            ModelRuntime::load_from_file(&root.join("Qwen3.5-2B-Q4_K_M.gguf"), false).unwrap();
+        assert!(
+            runtime.vision_encoder.is_none(),
+            "fixture must start with lazy sidecar loading"
+        );
+        runtime.set_context_size(512);
+        runtime.set_think_mode_no();
+        runtime.set_sampling_seed(Some(1));
+        runtime.set_debug_mode(true);
+        runtime.settings.max_tokens = 128;
+        runtime
+            .settings
+            .vendor_multimodal_policy
+            .detail_crop
+            .enabled = false;
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let captured = messages.clone();
+        runtime.set_runtime_event_callback(Some(Arc::new(move |event| {
+            if let RuntimeEvent::Log(log) = event {
+                captured.lock().unwrap().push(log.message);
+            }
+        })));
+        let image_path = root
+            .join("regression/IMG_0138.jpg")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut outputs = Vec::new();
+        for run in 0..3 {
+            if run == 2 {
+                let results = runtime.preencode_image_batch(std::slice::from_ref(&image_path));
+                assert_eq!(results, [Ok(())]);
+                assert_eq!(
+                    runtime.preencoded_image_embeddings[&image_path].grid,
+                    Some([1, 12, 16])
+                );
+            }
+            messages.lock().unwrap().clear();
+            // Use the same request construction as EmbeddedRuntime::generate_with_image,
+            // including image-first ordering and the vendor's prompt suffix.
+            outputs.push(
+                runtime
+                    .generate_text_with_images(
+                        "Answer with one word: does this image show water?",
+                        "Be concise.",
+                        std::slice::from_ref(&image_path),
+                        false,
+                    )
+                    .unwrap(),
+            );
+            let logs = messages.lock().unwrap();
+            assert!(
+                logs.iter()
+                    .any(|line| line.contains("width=512, height=384, elements=589824")),
+                "run {run}: {logs:?}"
+            );
+            assert!(
+                logs.iter()
+                    .any(|line| line.contains("injected_embeddings=192 images=1")),
+                "run {run}: {logs:?}"
+            );
+            assert_eq!(
+                runtime.image_preprocess_profile().normalization,
+                ImageNormalization::MeanStd {
+                    mean: [0.5; 3],
+                    std: [0.5; 3]
+                }
+            );
+        }
+        assert!(
+            !outputs[0].trim().is_empty(),
+            "outputs={outputs:?}; logs={:?}",
+            messages.lock().unwrap()
+        );
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], outputs[2]);
+        eprintln!("lazy/warm/preencoded image responses: {outputs:?}");
+    }
 
     #[test]
     fn finds_first_complete_json_object_after_prefix_junk() {
