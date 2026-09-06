@@ -843,7 +843,7 @@ impl Gemma3VisionEncoder {
             tokens.push(projected.clone());
         }
 
-        Ok(MediaEmbeddingSequence { tokens })
+        Ok(MediaEmbeddingSequence { tokens, grid: None })
     }
 
     pub(crate) fn encode_images(

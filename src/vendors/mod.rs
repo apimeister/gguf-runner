@@ -816,6 +816,7 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         head_dim: 0,
         rope_dim: 0,
         rope_sections: [0; 4],
+        rope_position_layout: Default::default(),
         is_bert_family: identity.family == ModelFamily::BertFamily,
         is_gemma3: identity.family == ModelFamily::Gemma,
         is_smolvlm: identity.family == ModelFamily::SmolVlm,
@@ -901,6 +902,12 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
             sections[idx] = if *value > 0 { *value as usize } else { 0 };
         }
         config.rope_sections = sections;
+    }
+
+    match identity.family {
+        ModelFamily::Qwen35 => qwen35::configure_rope(&mut config)?,
+        ModelFamily::Qwen3Vl => qwen3vl::configure_rope(&mut config)?,
+        _ => {}
     }
 
     if !gguf.vocab_tokens.is_empty() && config.vocab_size != gguf.vocab_tokens.len() {

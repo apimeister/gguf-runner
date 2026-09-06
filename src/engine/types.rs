@@ -441,6 +441,22 @@ impl GGUFFile {
     }
 }
 
+/// Vendor-selected mapping of rotary frequencies to position axes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RopePositionLayout {
+    #[default]
+    Sequential,
+    Interleaved,
+}
+
+/// Logical T/H/W coordinates for a prompt; physical KV rows remain sequential.
+/// Subsequent text (including retry suffixes) continues at `next_text_position`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RopePositionPlan {
+    pub(crate) positions: Vec<[usize; 3]>,
+    pub(crate) next_text_position: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) dim: usize,
@@ -464,6 +480,7 @@ pub(crate) struct Config {
     pub(crate) head_dim: usize,
     pub(crate) rope_dim: usize,
     pub(crate) rope_sections: [usize; 4],
+    pub(crate) rope_position_layout: RopePositionLayout,
     pub(crate) is_bert_family: bool,
     pub(crate) is_gemma3: bool,
     pub(crate) is_smolvlm: bool,
@@ -600,6 +617,7 @@ pub(crate) struct RunState {
     pub(crate) rope_sin: Vec<f32>,
     pub(crate) rope_cache_pos: isize,
     pub(crate) rope_cache_is_swa: isize,
+    pub(crate) rope_position_plan: Option<RopePositionPlan>,
     pub(crate) head_size: usize,
     pub(crate) kv_dim: usize,
     pub(crate) q_dim: usize,

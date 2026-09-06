@@ -1,4 +1,4 @@
-use crate::engine::types::{EncodedPrompt, PlaceholderSpan};
+use crate::engine::types::{EncodedPrompt, PlaceholderSpan, RopePositionPlan};
 use std::collections::HashMap;
 
 pub(crate) type PrefillEmbeddingMap = HashMap<usize, Vec<f32>>;
@@ -6,6 +6,15 @@ pub(crate) type PrefillEmbeddingMap = HashMap<usize, Vec<f32>>;
 #[derive(Clone, Debug)]
 pub(crate) struct MediaEmbeddingSequence {
     pub(crate) tokens: Vec<Vec<f32>>,
+    /// T/H/W dimensions after spatial merging, in embedding token order.
+    pub(crate) grid: Option<[usize; 3]>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpandedMediaPrompt {
+    pub(crate) token_ids: Vec<i32>,
+    pub(crate) embeddings: PrefillEmbeddingMap,
+    pub(crate) position_plan: Option<RopePositionPlan>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,7 +253,7 @@ pub(crate) fn expand_prompt_with_media_embeddings(
     image_embeddings: &[MediaEmbeddingSequence],
     audio_embeddings: &[MediaEmbeddingSequence],
     expected_embedding_dim: usize,
-) -> Result<(Vec<i32>, PrefillEmbeddingMap), String> {
+) -> Result<ExpandedMediaPrompt, String> {
     validate_embedding_dimensions(MediaKind::Image, image_embeddings, expected_embedding_dim)?;
     validate_embedding_dimensions(MediaKind::Audio, audio_embeddings, expected_embedding_dim)?;
     let image_token_counts = image_embeddings
@@ -259,6 +268,11 @@ pub(crate) fn expand_prompt_with_media_embeddings(
     let expanded_len = expanded_len_from_plan(encoded.token_ids.len(), &plans)?;
     let mut out_tokens = Vec::with_capacity(expanded_len);
     let mut injected_embeddings = PrefillEmbeddingMap::new();
+    let mut position_plan = image_embeddings
+        .iter()
+        .chain(audio_embeddings)
+        .any(|sequence| sequence.grid.is_some())
+        .then(RopePositionPlan::default);
     let mut source_cursor = 0usize;
 
     for plan in plans {
@@ -267,6 +281,21 @@ pub(crate) fn expand_prompt_with_media_embeddings(
             MediaKind::Image => &image_embeddings[plan.span.media_index],
             MediaKind::Audio => &audio_embeddings[plan.span.media_index],
         };
+
+        if let Some(positions) = &mut position_plan {
+            positions.append_text(plan.span.token_start - source_cursor)?;
+            if !plan.span.replace_marker {
+                positions.append_text(1)?;
+            }
+            if let Some(grid) = sequence.grid {
+                positions.append_grid(grid, sequence.tokens.len())?;
+            } else {
+                positions.append_text(sequence.tokens.len())?;
+            }
+            if !plan.span.replace_marker {
+                positions.append_text(1)?;
+            }
+        }
 
         if plan.span.replace_marker {
             let placeholder = encoded.token_ids[plan.span.token_start];
@@ -289,8 +318,16 @@ pub(crate) fn expand_prompt_with_media_embeddings(
     }
 
     out_tokens.extend_from_slice(&encoded.token_ids[source_cursor..]);
+    if let Some(positions) = &mut position_plan {
+        positions.append_text(encoded.token_ids.len() - source_cursor)?;
+        debug_assert_eq!(positions.positions.len(), expanded_len);
+    }
     debug_assert_eq!(out_tokens.len(), expanded_len);
-    Ok((out_tokens, injected_embeddings))
+    Ok(ExpandedMediaPrompt {
+        token_ids: out_tokens,
+        embeddings: injected_embeddings,
+        position_plan,
+    })
 }
 
 #[cfg(test)]
@@ -303,6 +340,7 @@ mod tests {
 
     fn sequence(values: &[f32]) -> MediaEmbeddingSequence {
         MediaEmbeddingSequence {
+            grid: None,
             tokens: values.iter().map(|value| vec![*value, -*value]).collect(),
         }
     }
@@ -325,7 +363,7 @@ mod tests {
             audio_spans: vec![span(1, 0)],
         };
 
-        let (tokens, embeddings) = expand_prompt_with_media_embeddings(
+        let expanded = expand_prompt_with_media_embeddings(
             &encoded,
             &[sequence(&[3.0])],
             &[sequence(&[1.0, 2.0])],
@@ -333,10 +371,85 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(tokens, [10, 20, 21, 21, 22, 30, 40, 41, 42, 50]);
-        assert_eq!(embeddings[&2], [1.0, -1.0]);
-        assert_eq!(embeddings[&3], [2.0, -2.0]);
-        assert_eq!(embeddings[&7], [3.0, -3.0]);
+        assert_eq!(expanded.token_ids, [10, 20, 21, 21, 22, 30, 40, 41, 42, 50]);
+        assert_eq!(expanded.embeddings[&2], [1.0, -1.0]);
+        assert_eq!(expanded.embeddings[&3], [2.0, -2.0]);
+        assert_eq!(expanded.embeddings[&7], [3.0, -3.0]);
+        assert!(expanded.position_plan.is_none());
+    }
+
+    #[test]
+    fn image_grids_keep_marker_and_following_text_positions_in_source_order() {
+        let encoded = EncodedPrompt {
+            token_ids: vec![10, 20, 21, 22, 30, 40, 41, 42, 50],
+            image_spans: vec![span(1, 0), span(5, 1)],
+            video_spans: Vec::new(),
+            audio_spans: Vec::new(),
+        };
+        let mut first = sequence(&[1.0; 6]);
+        first.grid = Some([1, 2, 3]);
+        let mut second = sequence(&[2.0; 2]);
+        second.grid = Some([1, 2, 1]);
+        let expanded =
+            expand_prompt_with_media_embeddings(&encoded, &[first, second], &[], 2).unwrap();
+        assert_eq!(
+            expanded.token_ids,
+            [10, 20, 21, 21, 21, 21, 21, 21, 22, 30, 40, 41, 41, 42, 50]
+        );
+        let positions = expanded.position_plan.unwrap();
+        assert_eq!(
+            positions.positions,
+            [
+                [0; 3],
+                [1; 3],
+                [2, 2, 2],
+                [2, 2, 3],
+                [2, 2, 4],
+                [2, 3, 2],
+                [2, 3, 3],
+                [2, 3, 4],
+                [5; 3],
+                [6; 3],
+                [7; 3],
+                [8, 8, 8],
+                [8, 9, 8],
+                [10; 3],
+                [11; 3],
+            ]
+        );
+        assert_eq!(positions.at(15), [12; 3]);
+        assert_eq!(expanded.embeddings.len(), 8);
+        assert!(expanded.embeddings.contains_key(&12));
+        assert!(!expanded.embeddings.contains_key(&13));
+    }
+
+    #[test]
+    fn grid_expansion_handles_replaced_markers_and_rejects_wrong_token_counts() {
+        let encoded = EncodedPrompt {
+            token_ids: vec![10, 99, 20],
+            image_spans: vec![PlaceholderSpan {
+                token_start: 1,
+                token_len: 1,
+                media_index: 0,
+                replace_marker: true,
+            }],
+            video_spans: Vec::new(),
+            audio_spans: Vec::new(),
+        };
+        let mut image = sequence(&[1.0; 2]);
+        image.grid = Some([1, 2, 1]);
+        let expanded =
+            expand_prompt_with_media_embeddings(&encoded, &[image.clone()], &[], 2).unwrap();
+        assert_eq!(
+            expanded.position_plan.unwrap().positions,
+            [[0; 3], [1; 3], [1, 2, 1], [3; 3]]
+        );
+        image.grid = Some([1, 2, 3]);
+        assert!(
+            expand_prompt_with_media_embeddings(&encoded, &[image], &[], 2)
+                .unwrap_err()
+                .contains("6 positions for 2 embeddings")
+        );
     }
 
     #[test]
@@ -353,12 +466,12 @@ mod tests {
             audio_spans: Vec::new(),
         };
 
-        let (tokens, embeddings) =
+        let expanded =
             expand_prompt_with_media_embeddings(&encoded, &[sequence(&[1.0, 2.0])], &[], 2)
                 .unwrap();
 
-        assert_eq!(tokens, [10, 99, 99, 20]);
-        assert_eq!(embeddings.len(), 2);
+        assert_eq!(expanded.token_ids, [10, 99, 99, 20]);
+        assert_eq!(expanded.embeddings.len(), 2);
     }
 
     #[test]
@@ -415,6 +528,7 @@ mod tests {
             audio_spans: vec![span(1, 0)],
         };
         let audio = [MediaEmbeddingSequence {
+            grid: None,
             tokens: vec![vec![1.0]],
         }];
 

@@ -712,6 +712,7 @@ impl Idefics3VisionEncoder {
             .collect();
 
         Ok(MediaEmbeddingSequence {
+            grid: None,
             tokens: result_tokens,
         })
     }

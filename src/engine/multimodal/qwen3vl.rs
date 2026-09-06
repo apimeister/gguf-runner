@@ -39,7 +39,9 @@ fn vision_rope_coefficients(head_dim: usize, positions: &[(usize, usize)]) -> Ve
             } else {
                 ic - quarter_head
             };
-            1.0 / 10_000.0f32.powf((2 * local_ic) as f32 / head_dim as f32)
+            // Each spatial axis uses half the head dimension (Qwen vision
+            // rotary embedding), before the two axes are concatenated.
+            1.0 / 10_000.0f32.powf((2 * local_ic) as f32 / half_head as f32)
         })
         .collect::<Vec<_>>();
 
@@ -1060,7 +1062,10 @@ impl Qwen3VlVisionEncoder {
                 }
                 tokens.push(token);
             }
-            sequences.push(MediaEmbeddingSequence { tokens });
+            sequences.push(MediaEmbeddingSequence {
+                tokens,
+                grid: Some([1, ph / self.spatial_merge, pw / self.spatial_merge]),
+            });
         }
 
         Ok(sequences)
@@ -1134,6 +1139,32 @@ mod tests {
     }
 
     #[test]
+    fn vision_rope_matches_pinned_qwen_reference_values() {
+        // Transformers v5.2.0 modeling_qwen3_vl.py constructs
+        // Qwen3VLVisionRotaryEmbedding(head_dim // 2). At head_dim=64,
+        // each axis has frequencies 1, ..., 0.01 (index 8), ... .
+        // These literal cos/sin values exercise both axes independently.
+        let coefficients = vision_rope_coefficients(64, &[(2, 3)]);
+        for (index, expected) in [
+            (0, (-0.416_146_84, 0.909_297_4)),
+            (8, (0.999_8, 0.019_998_666)),
+            (16, (-0.989_992_5, 0.141_12)),
+            (24, (0.999_550_04, 0.029_995_501)),
+        ] {
+            assert!((coefficients[index].0 - expected.0).abs() < 1e-7);
+            assert!((coefficients[index].1 - expected.1).abs() < 1e-7);
+        }
+        // rotate_half pairs [8,40] and [24,56], independently in Q and K.
+        let mut q = vec![0.0; 64];
+        let mut k = vec![0.0; 64];
+        q[8] = 1.0;
+        k[24] = 1.0;
+        apply_vision_rope_cached(&mut q, &mut k, 64, 1, 64, 1, &coefficients);
+        assert!((q[40] - 0.019_998_666).abs() < 1e-7);
+        assert!((k[56] - 0.029_995_501).abs() < 1e-7);
+    }
+
+    #[test]
     fn cached_parallel_vision_rope_matches_per_layer_scalar_reference() {
         let head_dim = 8usize;
         let head_count = 2usize;
@@ -1164,7 +1195,7 @@ mod tests {
                             (px as f32, ic - quarter_head)
                         };
                         let frequency =
-                            1.0 / 10_000.0f32.powf((2 * local_ic) as f32 / head_dim as f32);
+                            1.0 / 10_000.0f32.powf((2 * local_ic) as f32 / half_head as f32);
                         let theta = position * frequency;
                         let (cos, sin) = (theta.cos(), theta.sin());
                         let a = head_offset + ic;

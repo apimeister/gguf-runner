@@ -5,9 +5,40 @@
 
 use super::{ChatMessage, ChatRole, MmprojFilenameScoreHint, VendorRuntimeDebugPolicy};
 use crate::engine::types::{
-    ContentPart, EncodedPrompt, GenerationRequest, MediaRef, MultimodalBackend, PlaceholderSpan,
-    ThinkMode, Tokenizer,
+    Config, ContentPart, EncodedPrompt, GenerationRequest, MediaRef, MultimodalBackend,
+    PlaceholderSpan, RopePositionLayout, ThinkMode, Tokenizer,
 };
+
+pub(super) fn configure_interleaved_rope(
+    config: &mut Config,
+    default_sections: [usize; 4],
+) -> Result<(), String> {
+    let sections = if config.rope_sections == [0; 4] {
+        default_sections
+    } else {
+        config.rope_sections
+    };
+    let half = config.rope_dim / 2;
+    let sum = sections
+        .iter()
+        .try_fold(0usize, |sum, &n| sum.checked_add(n));
+    // Qwen3-VL and Qwen3.5 interleave H/W into every third frequency;
+    // frequencies left over belong to T. Reject metadata that would silently
+    // truncate an axis or use the unsupported fourth section.
+    let mut counts = [0usize; 4];
+    for i in 0..half {
+        counts[RopePositionLayout::Interleaved.axis(i, sections)] += 1;
+    }
+    if half == 0 || sections[3] != 0 || sum != Some(half) || counts != sections {
+        return Err(format!(
+            "invalid interleaved RoPE sections {sections:?} for rotary dimension {}",
+            config.rope_dim
+        ));
+    }
+    config.rope_sections = sections;
+    config.rope_position_layout = RopePositionLayout::Interleaved;
+    Ok(())
+}
 
 pub(crate) const QWEN_STOP_TOKEN_LITERALS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|im_start|>"];

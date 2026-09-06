@@ -66,6 +66,10 @@ pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
     qwen_common::runtime_debug_policy()
 }
 
+pub(super) fn configure_rope(config: &mut Config) -> Result<(), String> {
+    qwen_common::configure_interleaved_rope(config, [11, 11, 10, 0])
+}
+
 pub(super) fn encode_chat_prompt(
     tokenizer: &mut Tokenizer,
     prompt: &str,
@@ -121,6 +125,7 @@ mod tests {
             head_dim: 0,
             rope_dim: 0,
             rope_sections: [0; 4],
+            rope_position_layout: Default::default(),
             is_bert_family: false,
             is_gemma3: false,
             is_qwen2: false,
@@ -146,6 +151,31 @@ mod tests {
             ssm_time_step_rank: 0,
             ssm_group_count: 0,
         }
+    }
+
+    #[test]
+    fn interleaved_rope_validates_vendor_defaults_and_explicit_sections() {
+        use crate::engine::types::RopePositionLayout;
+        let mut config = base_qwen35_config();
+        config.head_dim = 256;
+        config.rope_dim = 64;
+        super::configure_rope(&mut config).unwrap();
+        assert_eq!(config.rope_sections, [11, 11, 10, 0]);
+        assert_eq!(config.rope_position_layout, RopePositionLayout::Interleaved);
+        super::configure_rope(&mut config).unwrap();
+        for sections in [
+            [10, 11, 10, 0],
+            [1, 1, 30, 0],
+            [10, 11, 10, 1],
+            [usize::MAX; 4],
+        ] {
+            config.rope_sections = sections;
+            assert!(super::configure_rope(&mut config).is_err());
+        }
+        config.rope_dim = 128;
+        config.rope_sections = [0; 4];
+        crate::vendors::qwen3vl::configure_rope(&mut config).unwrap();
+        assert_eq!(config.rope_sections, [24, 20, 20, 0]);
     }
 
     #[test]

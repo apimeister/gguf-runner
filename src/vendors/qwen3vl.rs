@@ -47,6 +47,10 @@ pub(super) fn runtime_debug_policy() -> VendorRuntimeDebugPolicy {
     qwen_common::runtime_debug_policy()
 }
 
+pub(super) fn configure_rope(config: &mut Config) -> Result<(), String> {
+    qwen_common::configure_interleaved_rope(config, [24, 20, 20, 0])
+}
+
 pub(super) fn encode_chat_prompt(
     tokenizer: &mut Tokenizer,
     prompt: &str,

@@ -199,9 +199,8 @@ fn align_within_limit(value: usize, align_to: usize, limit: usize) -> usize {
 
     let mut aligned = round_down_to_multiple(value, align_to);
     if aligned == 0 {
-        aligned = round_down_to_multiple(limit.max(align_to), align_to);
-    }
-    if aligned == 0 {
+        // A thin image may scale below one patch-merge unit. Use the
+        // smallest representable dimension, not the full target edge.
         aligned = align_to.min(limit.max(1));
     }
     aligned.min(limit.max(1)).max(1)
@@ -431,6 +430,31 @@ mod tests {
         assert_eq!(out.height(), 1024);
         assert_eq!(out.width() % 32, 0);
         assert_eq!(out.height() % 32, 0);
+    }
+
+    #[test]
+    fn fit_within_extreme_aspect_ratios_use_minimum_patch_alignment() {
+        let profile = ImagePreprocessProfile::new_with_mode(
+            512,
+            512,
+            ImageNormalization::UnitRange,
+            ImageResizeMode::FitWithin,
+            32,
+        );
+        for (source, expected) in [
+            ((4096, 64), (512, 32)),
+            ((64, 4096), (32, 512)),
+            ((512, 31), (512, 32)),
+            ((512, 32), (512, 32)),
+            ((512, 63), (512, 32)),
+            ((512, 64), (512, 64)),
+        ] {
+            let image = RgbImage::new(source.0, source.1);
+            assert_eq!(
+                resize_for_profile(&image, profile).unwrap().dimensions(),
+                expected
+            );
+        }
     }
 
     #[test]

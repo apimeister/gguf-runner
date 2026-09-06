@@ -37,6 +37,7 @@ src/
   engine/
     mod.rs
     types.rs
+    positions.rs
     audio/
       mod.rs
       decode.rs
@@ -225,7 +226,7 @@ src/
   - llama-style local `mmproj*.gguf` sidecar discovery/probe for multimodal models (no extra CLI switch)
   - sidecar probe enforces checkpoint variant token matching (for example `2b`, `35b`, `a3b`) to prevent silent cross-size pairing
   - metadata-first Qwen3-ASR audio-only sidecar recognition records the validated `qwen3_asr` backend independently from vision capability
-  - eager and lazy loading construct `VisionEncoder` for image/video requests and image batches when the selected sidecar exposes both vision encoder and projector tensors
+  - eager and lazy loading construct `VisionEncoder` for image/video requests and image batches when the selected sidecar exposes both vision encoder and projector tensors; request preprocessing profiles are selected after lazy initialization so the first image uses the sidecar resolution, alignment, and normalization
   - eager and lazy audio requests construct a dedicated Qwen3-ASR `AudioEncoder`; diagnostics
     report loaded weights and effective execution readiness
   - embedded mmproj loading supports either the existing vision encoders or the Qwen3-ASR audio weight contract
@@ -274,6 +275,7 @@ src/
     caller settings on success or failure, applies the vendor-required Q8 KV-cache override, and
     returns a typed parsed result
   - shared decode core `generate_from_prefill(...)` for text + multimodal routes (supports per-position embedding overrides during prefill)
+    - carries optional logical T/H/W image positions through sequential/batched prefill, subsequent text decode, and hidden-thinking retries; physical KV-cache rows and causal token order remain sequential
     - prompts of more than eight tokens prefill in chunks through `transformer_prefill_batch(...)`,
       including media prompts: injected embeddings are passed as `PrefillInput::Embedding`. The
       batch gate falls back to the sequential loop only when the model is unsupported or when
@@ -398,7 +400,7 @@ src/
 ### `src/engine/mod.rs`
 
 - Aggregates engine submodules:
-  - `audio`, `io`, `kernels`, `multimodal`, `profiling`, `runtime`, `speaker`, `switches`, `tokenizer`,
+  - `audio`, `io`, `kernels`, `multimodal`, `positions`, `profiling`, `runtime`, `speaker`, `switches`, `tokenizer`,
     `types`, `vision`, `weights`.
 
 ### `src/engine/types.rs`
@@ -429,11 +431,19 @@ src/
     - `ModelCapabilities`
   - Extended model identity flags:
     - `Config::is_qwen35`
-    - `Config::rope_sections` for Qwen3.5 M-RoPE section metadata
+    - `Config::rope_sections` and vendor-selected `rope_position_layout` for rotary axis mapping
     - `Config::online_attn_fusion` for vendor-selected dense-attention fast paths
   - Unix mmap wrapper (`MappedFile`) including Linux memory advice hints for model mappings
   - `ensure_model_range(...)` helper used by quantized matmul paths (currently a no-op in local-file mode).
   - GGUF metadata value variants include integer arrays (`I64Array`) for keys such as `*.rope.dimension_sections`.
+
+### `src/engine/positions.rs`
+
+- Builds checked logical T/H/W position plans from text spans and merged media grids.
+- Text after each grid starts at the maximum grid coordinate plus one; later decoding and retry
+  suffixes continue from the same logical text position without changing physical KV-cache indices.
+- Applies the vendor-selected frequency layout: sequential positions or interleaved spatial axes.
+  Qwen3-VL and Qwen3.5 vendors select and validate their respective M-RoPE sections.
 
 ### `src/engine/io/*`
 
@@ -516,9 +526,9 @@ src/
 
 - Native multimodal embedding and prompt-injection subsystem.
 - `multimodal/injection.rs`:
-  - defines a modality-neutral language-space `MediaEmbeddingSequence`
+  - defines a modality-neutral language-space `MediaEmbeddingSequence` with optional merged T/H/W grid dimensions
   - merges image/audio placeholder spans in source-token order and validates per-modality order, global overlap, bounds, marker shape, media-index uniqueness, embedding dimensions, and checked expanded length
-  - preserves begin/end markers, replaces each placeholder with variable-length embedding slots, and builds the token-aligned prefill injection map
+  - preserves begin/end markers, replaces each placeholder with variable-length embedding slots, and builds the token-aligned prefill injection map plus a logical position plan when grids are present; grid products must match embedding counts
   - preflights expanded context plus decode reserve and rejects overflow rather than truncating through media embeddings
 - `multimodal/qwen3vl.rs`:
   - Qwen3-VL CLIP/mmproj image encoder path (`qwen3vl_merger`)
@@ -526,12 +536,13 @@ src/
   - reads `clip.vision.image_mean/std` normalization metadata from mmproj GGUF when available
   - loads and applies optional `v.deepstack.*` layer branches, fused into projected media embeddings
   - uses the shared blocked encoder-attention path and caches vision M-RoPE coefficients once per
-    patch grid, applying them across token rows in parallel and reusing them for every vision layer
+    patch grid, applying them across token rows in parallel and reusing them for every vision layer;
+    each spatial axis uses half the attention head dimension for its rotary frequencies
   - batches F16/BF16 QKV, output, FFN, deepstack FC1/FC2, and projector matrices across image tokens
     so each expanded weight row is reused instead of decoded independently for every token
   - jointly encodes up to four same-shape images per call, keeps attention and RoPE image-local,
     restores input ordering, and caps each microbatch at 4096 patch tokens
-  - emits language-space image token embeddings for prompt injection
+  - emits language-space image token embeddings and merged grid dimensions for prompt injection
 - `multimodal/gemma3.rs`:
   - Gemma3 CLIP/mmproj image encoder path (`clip.projector_type='gemma3'`)
   - runs ViT layers with separate q/k/v projections, patch-grid average pooling, RMS normalization, and `mm.input_projection` into text embedding space

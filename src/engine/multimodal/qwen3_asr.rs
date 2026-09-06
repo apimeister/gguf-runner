@@ -897,6 +897,7 @@ fn project_to_language_embeddings(
     }
 
     Ok(MediaEmbeddingSequence {
+        grid: None,
         tokens: projected
             .chunks_exact(output_dim)
             .map(<[f32]>::to_vec)

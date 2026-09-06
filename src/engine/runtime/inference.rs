@@ -1481,11 +1481,6 @@ unsafe fn axpy_q8_row_blocks_ptr(
     }
 }
 
-#[inline]
-fn qwen35_uses_mrope(p: &Config) -> bool {
-    p.is_qwen35 && p.rope_sections[0] > 0 && p.rope_sections[1] > 0
-}
-
 fn rebuild_rope_cache(p: &Config, s: &mut RunState, pos: usize, is_swa_layer: bool) {
     let current_is_swa = if is_swa_layer { 1 } else { 0 };
     if s.rope_cache_pos == pos as isize && s.rope_cache_is_swa == current_is_swa {
@@ -1499,48 +1494,22 @@ fn rebuild_rope_cache(p: &Config, s: &mut RunState, pos: usize, is_swa_layer: bo
     };
     let rope_half = s.rope_cos.len();
 
-    if qwen35_uses_mrope(p) {
-        // llama.cpp M-RoPE text path expands scalar position into [t,h,w,e] = [pos,pos,pos,0].
-        let pos_streams = [pos as f32, pos as f32, pos as f32, 0.0f32];
-        let section_total = p.rope_sections.iter().sum::<usize>();
-        let section_h = p.rope_sections[0];
-        let section_w = section_h + p.rope_sections[1];
-        let section_e = section_w + p.rope_sections[2];
-
-        for (i, ((cos, sin), &freq)) in s
-            .rope_cos
-            .iter_mut()
-            .zip(s.rope_sin.iter_mut())
-            .zip(rope_freqs.iter())
-            .take(rope_half)
-            .enumerate()
-        {
-            let sector = i % section_total;
-            let pos_value = if sector < section_h {
-                pos_streams[0]
-            } else if sector < section_w {
-                pos_streams[1]
-            } else if sector < section_e {
-                pos_streams[2]
-            } else {
-                pos_streams[3]
-            };
-            let val = pos_value * freq;
-            *cos = val.cos();
-            *sin = val.sin();
-        }
-    } else {
-        for ((cos, sin), &freq) in s
-            .rope_cos
-            .iter_mut()
-            .zip(s.rope_sin.iter_mut())
-            .zip(rope_freqs.iter())
-            .take(rope_half)
-        {
-            let val = pos as f32 * freq;
-            *cos = val.cos();
-            *sin = val.sin();
-        }
+    let coordinates = s
+        .rope_position_plan
+        .as_ref()
+        .map_or([pos; 3], |plan| plan.at(pos));
+    for (i, ((cos, sin), &freq)) in s
+        .rope_cos
+        .iter_mut()
+        .zip(s.rope_sin.iter_mut())
+        .zip(rope_freqs.iter())
+        .take(rope_half)
+        .enumerate()
+    {
+        let axis = p.rope_position_layout.axis(i, p.rope_sections);
+        let val = coordinates[axis] as f32 * freq;
+        *cos = val.cos();
+        *sin = val.sin();
     }
 
     s.rope_cache_pos = pos as isize;
@@ -1747,6 +1716,7 @@ pub(crate) fn malloc_run_state_with_kv_cache_format(
         rope_sin: vec![0.0; rope_size],
         rope_cache_pos: -1,
         rope_cache_is_swa: -1,
+        rope_position_plan: None,
         head_size,
         kv_dim,
         q_dim,
@@ -4009,7 +3979,163 @@ mod tests {
     };
     #[cfg(target_arch = "aarch64")]
     use super::{axpy_turboquant_head_neon, dot_turboquant_head_neon};
-    use crate::engine::types::{Config, ModelCapabilities, QuantizedTensor, TransformerWeights};
+    use crate::engine::types::{
+        Config, KvCacheFormat, ModelCapabilities, QuantizedTensor, RopePositionLayout,
+        RopePositionPlan, TransformerWeights,
+    };
+
+    #[test]
+    fn image_rope_rotates_reference_axes_and_preserves_partial_rope_tail() {
+        for (head_dim, rope_dim, sections) in
+            [(128, 128, [24, 20, 20, 0]), (256, 64, [11, 11, 10, 0])]
+        {
+            let (mut config, _, _) = qwen3next_dense_test_fixture(true);
+            config.head_dim = head_dim;
+            config.rope_dim = rope_dim;
+            config.rope_sections = sections;
+            config.rope_position_layout = RopePositionLayout::Interleaved;
+            let mut state = malloc_run_state(&config).unwrap();
+            let mut plan = RopePositionPlan::default();
+            plan.append_text(2).unwrap();
+            plan.append_grid([1, 2, 3], 6).unwrap();
+            state.rope_position_plan = Some(plan);
+            // Unit frequencies isolate axis selection from frequency generation.
+            state.rope_freqs.fill(1.0);
+            let half = rope_dim / 2;
+            state.q.fill(0.0);
+            state.q[..half].fill(1.0);
+            state.q[rope_dim..].fill(0.75);
+            state.k.copy_from_slice(&state.q);
+            super::apply_rope_qk(&config, &mut state, 0, 7);
+            // Physical token 7 has logical T/H/W=(2,3,4).
+            for (i, cos, sin) in [
+                (0, -0.416_146_84, 0.909_297_4),
+                (1, -0.989_992_5, 0.141_12),
+                (2, -0.653_643_6, -0.756_802_5),
+            ] {
+                assert!((state.q[i] - cos).abs() < 1e-7);
+                assert!((state.q[i + half] - sin).abs() < 1e-7);
+            }
+            assert_eq!(state.q, state.k);
+            assert!(state.q[rope_dim..].iter().all(|&value| value == 0.75));
+            // The first decoded text token follows max(grid)+1, not KV row 8.
+            super::rebuild_rope_cache(&config, &mut state, 8, false);
+            assert!(
+                state
+                    .rope_cos
+                    .iter()
+                    .all(|&cos| (cos - 0.283_662_2).abs() < 1e-7)
+            );
+            assert!(
+                state
+                    .rope_sin
+                    .iter()
+                    .all(|&sin| (sin + 0.958_924_3).abs() < 1e-7)
+            );
+        }
+    }
+
+    #[test]
+    fn image_positions_preserve_chunked_prefill_kv_rows_and_decode_results() {
+        let (mut config, mut weights, mut mapped) = qwen3next_dense_test_fixture(true);
+        config.is_qwen3next = false;
+        config.is_qwen35 = false;
+        config.is_qwen3vl = true;
+        config.head_dim = 8;
+        config.rope_dim = 6;
+        config.rope_sections = [1, 1, 1, 0];
+        config.rope_position_layout = RopePositionLayout::Interleaved;
+        config.seq_len = 16;
+        weights.wq = vec![append_f32_matrix(&mut mapped, 8, config.dim, 701)];
+        weights.wk = vec![append_f32_matrix(&mut mapped, 8, config.dim, 801)];
+        weights.wv = vec![append_f32_matrix(&mut mapped, 8, config.dim, 901)];
+        weights.wo = vec![append_f32_matrix(&mut mapped, config.dim, 8, 1001)];
+        weights.attn_qkv.clear();
+        weights.token_embedding_table = vec![0.13, -0.27, 0.42, 0.51];
+        let embeddings: Vec<Vec<f32>> = (0..11)
+            .map(|i| {
+                (0..config.dim)
+                    .map(|j| ((i * config.dim + j) as f32 * 0.37).sin())
+                    .collect()
+            })
+            .collect();
+        // Both regular text (None) and two image grids cross chunk boundaries.
+        let mut plan = RopePositionPlan::default();
+        plan.append_text(2).unwrap();
+        plan.append_grid([1, 2, 3], 6).unwrap();
+        plan.append_grid([1, 2, 1], 2).unwrap();
+        for positions in [None, Some(plan)] {
+            let mut sequential =
+                super::malloc_run_state_with_kv_cache_format(&config, Some(KvCacheFormat::Q8))
+                    .unwrap();
+            let mut batched =
+                super::malloc_run_state_with_kv_cache_format(&config, Some(KvCacheFormat::Q8))
+                    .unwrap();
+            sequential.rope_position_plan = positions.clone();
+            batched.rope_position_plan = positions;
+            let inputs: Vec<_> = embeddings[..10]
+                .iter()
+                .map(|v| PrefillInput::Embedding(v))
+                .collect();
+            let mut scratch = PrefillScratch::new();
+            let mut expected = Vec::new();
+            for (pos, embedding) in embeddings[..10].iter().enumerate() {
+                transformer_with_embedding_without_logits(
+                    embedding,
+                    pos,
+                    &config,
+                    &mut sequential,
+                    &weights,
+                    &mapped,
+                )
+                .unwrap();
+                expected.extend_from_slice(&sequential.x);
+            }
+            for (chunk, start) in [(&inputs[..4], 0), (&inputs[4..], 4)] {
+                transformer_prefill_batch(
+                    chunk,
+                    start,
+                    &config,
+                    &mut batched,
+                    &weights,
+                    &mapped,
+                    &mut scratch,
+                )
+                .unwrap();
+                for (&got, &want) in scratch.x[..chunk.len() * config.dim]
+                    .iter()
+                    .zip(&expected[start * config.dim..])
+                {
+                    assert!((got - want).abs() < 1e-6, "hidden output: {got} != {want}");
+                }
+            }
+            assert_eq!(sequential.key_cache_q8, batched.key_cache_q8);
+            assert_eq!(sequential.value_cache_q8, batched.value_cache_q8);
+            // All ten physical rows must be populated, even though logical
+            // text position is only seven after these two grids.
+            assert!(
+                batched.key_cache_q8[..10 * 8]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .all(|row| row.iter().any(|&x| x != 0))
+            );
+            for state in [&mut sequential, &mut batched] {
+                super::transformer_with_embedding(
+                    &embeddings[10],
+                    10,
+                    &config,
+                    state,
+                    &weights,
+                    &mapped,
+                )
+                .unwrap();
+            }
+            for (&got, &want) in batched.logits.iter().zip(&sequential.logits) {
+                assert!((got - want).abs() < 1e-6, "decode logit: {got} != {want}");
+            }
+        }
+    }
 
     #[inline]
     fn turboquant_seed(layer: usize, kv_head: usize, salt: u64) -> u64 {
@@ -4084,6 +4210,7 @@ mod tests {
             head_dim: dim,
             rope_dim: dim,
             rope_sections: [0; 4],
+            rope_position_layout: Default::default(),
             is_bert_family: false,
             is_gemma3: false,
             is_smolvlm: false,
