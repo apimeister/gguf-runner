@@ -1,7 +1,6 @@
 // Items in this module are used by the binary crate. When the library crate is linted
 // in isolation (cargo clippy without --bin) they appear unused because the lib only
 // exports EmbeddedRuntime and does not re-export binary-only code.
-#![allow(dead_code)]
 
 /// Document embedding encoder — the RAG sidecar.
 ///
@@ -713,17 +712,8 @@ impl EmbeddingEncoder {
         self.config.dim
     }
 
-    /// Tokenize `text` into token ids (requires `&mut self` for lazy hashmap init).
-    pub(crate) fn tokenize(&mut self, text: &str, out: &mut Vec<i32>) {
-        self.tokenizer.bpe_encode(text, out);
-    }
-
     pub(crate) fn prepare_tokenizer(&mut self) {
         self.tokenizer.prepare_for_encode();
-    }
-
-    pub(crate) fn tokenize_prepared(&self, text: &str, out: &mut Vec<i32>) {
-        self.tokenizer.encode_prepared(text, out);
     }
 
     pub(crate) fn prepared_tokenizer(&self) -> &Tokenizer {
@@ -819,22 +809,9 @@ impl DocumentEncoder {
         }
     }
 
-    /// Tokenize `text` (sequential; requires `&mut self`).
-    pub(crate) fn tokenize(&mut self, text: &str, out: &mut Vec<i32>) {
-        match self {
-            Self::Embedding(e) => e.tokenize(text, out),
-        }
-    }
-
     pub(crate) fn prepare_tokenizer(&mut self) {
         match self {
             Self::Embedding(e) => e.prepare_tokenizer(),
-        }
-    }
-
-    pub(crate) fn tokenize_prepared(&self, text: &str, out: &mut Vec<i32>) {
-        match self {
-            Self::Embedding(e) => e.tokenize_prepared(text, out),
         }
     }
 

@@ -2,7 +2,6 @@
 // in isolation (cargo clippy without --bin) they appear unused because the lib only
 // exports EmbeddedRuntime/SpeakerRuntime/SpeakerIndexRuntime and does not re-export
 // binary-only code.
-#![allow(dead_code)]
 
 mod agent;
 mod audio_batch;
@@ -11,6 +10,8 @@ pub mod embed;
 mod events;
 mod generation;
 mod image_batch;
+mod image_request;
+mod image_views;
 pub(crate) mod prefill_cache;
 mod repl;
 pub mod speaker;
@@ -227,7 +228,7 @@ fn print_cpu_features() {
     println!("No architecture-specific features detected for this target.");
 }
 
-pub(crate) fn run() -> Result<(), String> {
+pub fn run() -> Result<(), String> {
     let cli = CliOptions::parse()?;
 
     if cli.show_features {

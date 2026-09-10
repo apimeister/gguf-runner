@@ -1,3 +1,4 @@
+use crate::engine::types::ImageStretchFilter;
 use image::imageops::FilterType;
 use image::{ImageReader, RgbImage};
 use std::fs;
@@ -22,6 +23,7 @@ pub(crate) struct ImagePreprocessProfile {
     pub(crate) normalization: ImageNormalization,
     pub(crate) resize_mode: ImageResizeMode,
     pub(crate) align_to: usize,
+    pub(crate) stretch_filter: ImageStretchFilter,
 }
 
 impl ImagePreprocessProfile {
@@ -36,6 +38,7 @@ impl ImagePreprocessProfile {
             normalization,
             resize_mode: ImageResizeMode::CenterCrop,
             align_to: 1,
+            stretch_filter: ImageStretchFilter::default(),
         }
     }
 
@@ -52,7 +55,13 @@ impl ImagePreprocessProfile {
             normalization,
             resize_mode,
             align_to: align_to.max(1),
+            stretch_filter: ImageStretchFilter::default(),
         }
+    }
+
+    pub(crate) fn with_stretch_filter(mut self, filter: ImageStretchFilter) -> Self {
+        self.stretch_filter = filter;
+        self
     }
 }
 
@@ -106,7 +115,7 @@ fn normalize_channel(
     }
 }
 
-fn rgb_u8_to_chw_f32(
+pub(super) fn rgb_u8_to_chw_f32(
     rgb: &[u8],
     width: usize,
     height: usize,
@@ -127,7 +136,10 @@ fn rgb_u8_to_chw_f32(
         ));
     }
 
-    let mut out = vec![0.0f32; expected_len];
+    let mut out = Vec::new();
+    out.try_reserve_exact(expected_len)
+        .map_err(|_| "unable to allocate normalized image tensor".to_string())?;
+    out.resize(expected_len, 0.0f32);
     for y in 0..height {
         for x in 0..width {
             let pix = y * width + x;
@@ -257,8 +269,7 @@ fn resize_stretch_exact(
     if src_w == target_width && src_h == target_height {
         return Ok(rgb.clone());
     }
-    // Match llama.cpp clip preprocess behavior for Gemma3 projector path:
-    // direct bilinear resize to the model's fixed image size.
+    // Legacy floating-point triangle filter; its rounding differs from Pillow.
     Ok(image::imageops::resize(
         rgb,
         target_width as u32,
@@ -278,9 +289,14 @@ fn resize_for_profile(rgb: &RgbImage, profile: ImagePreprocessProfile) -> Result
             profile.target_height,
             profile.align_to,
         ),
-        ImageResizeMode::Stretch => {
-            resize_stretch_exact(rgb, profile.target_width, profile.target_height)
-        }
+        ImageResizeMode::Stretch => match profile.stretch_filter {
+            ImageStretchFilter::Triangle => {
+                resize_stretch_exact(rgb, profile.target_width, profile.target_height)
+            }
+            ImageStretchFilter::PillowBilinear => {
+                super::bilinear::resize_rgb8(rgb, profile.target_width, profile.target_height)
+            }
+        },
     }
 }
 

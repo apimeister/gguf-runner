@@ -1,7 +1,6 @@
 // Items in this module are used by the binary crate. When the library crate is linted
 // in isolation (cargo clippy without --bin) they appear unused because the lib only
 // exports EmbeddedRuntime and does not re-export binary-only code.
-#![allow(dead_code)]
 
 mod gemma;
 mod llama;
@@ -23,8 +22,8 @@ use crate::engine::io::{
 use crate::engine::speaker::SpeakerModelPolicy;
 use crate::engine::types::{
     AudioEncoderBackend, AudioTranscriptionResult, Config, ContentPart, EncodedPrompt, GGUFFile,
-    GenerationRequest, KvCacheFormat, ModelCapabilities, MultimodalBackend, ThinkMode, Tokenizer,
-    VendorTokenizerPolicy,
+    GenerationRequest, ImageStretchFilter, ImageViewPolicy, KvCacheFormat, ModelCapabilities,
+    MultimodalBackend, ThinkMode, Tokenizer, VendorTokenizerPolicy,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,9 +139,23 @@ pub(crate) struct VendorDetailCropPolicy {
     pub(crate) temp_file_prefix: &'static str,
 }
 
+pub(crate) type ImageViewPromptEncoder = fn(
+    &mut Tokenizer,
+    &GenerationRequest,
+    &[crate::engine::types::ImagePromptSource],
+    usize,
+) -> Result<EncodedPrompt, String>;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct VendorMultimodalPolicy {
     pub(crate) image_prompt_suffix: &'static str,
+    pub(crate) image_stretch_filter: ImageStretchFilter,
+    /// Explicit grouped-view contract; absent for unsupported vendors. The byte
+    /// bound applies to compact prompt text, before embedding-row expansion.
+    pub(crate) image_view_prompt: Option<ImageViewPromptEncoder>,
+    /// Crop policy applied to each image source when the vendor supports grouped
+    /// views. `OverviewOnly` reproduces the previous single-view behaviour.
+    pub(crate) image_view_policy: ImageViewPolicy,
     pub(crate) detail_crop: VendorDetailCropPolicy,
     pub(crate) mmproj_filename_score_hints: &'static [MmprojFilenameScoreHint],
     pub(crate) missing_sidecar_hint: &'static str,
@@ -817,6 +830,8 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         rope_dim: 0,
         rope_sections: [0; 4],
         rope_position_layout: Default::default(),
+        rope_scaling: Default::default(),
+        attention_policy: Default::default(),
         is_bert_family: identity.family == ModelFamily::BertFamily,
         is_gemma3: identity.family == ModelFamily::Gemma,
         is_smolvlm: identity.family == ModelFamily::SmolVlm,
@@ -855,6 +870,11 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         ssm_time_step_rank: get_gguf_int_from_map(&gguf.kv, &key_ssm_time_step_rank, 0) as usize,
         ssm_group_count: get_gguf_int_from_map(&gguf.kv, &key_ssm_group_count, 0) as usize,
     };
+
+    if key_prefix == "gemma3" {
+        config.attention_policy = gemma::attention_policy(&gguf.kv, config.n_layers)?;
+        config.rope_scaling = gemma::rope_scaling_policy(&gguf.kv)?;
+    }
 
     let deepstack_multiplier = config
         .n_deepstack_layers
@@ -1042,24 +1062,32 @@ pub(crate) fn encode_generation_request(
     config: &Config,
     request: &GenerationRequest,
     think_mode: ThinkMode,
-) -> EncodedPrompt {
+) -> Result<EncodedPrompt, String> {
     if config.is_gemma3 {
         return gemma::encode_generation_request(tokenizer, request);
     }
     if config.is_smolvlm {
-        return smolvlm::encode_generation_request(tokenizer, request);
+        return Ok(smolvlm::encode_generation_request(tokenizer, request));
     }
     if config.is_qwen35 {
-        return qwen35::encode_generation_request(tokenizer, request, think_mode);
+        return Ok(qwen35::encode_generation_request(
+            tokenizer, request, think_mode,
+        ));
     }
     if config.is_qwen3vl {
-        return qwen3vl::encode_generation_request(tokenizer, request, think_mode);
+        return Ok(qwen3vl::encode_generation_request(
+            tokenizer, request, think_mode,
+        ));
     }
     if config.is_qwen3next {
-        return qwen3next::encode_generation_request(tokenizer, config, request, think_mode);
+        return Ok(qwen3next::encode_generation_request(
+            tokenizer, config, request, think_mode,
+        ));
     }
     if config.is_qwen3moe || config.is_qwen3 {
-        return qwen3::encode_generation_request(tokenizer, request, think_mode);
+        return Ok(qwen3::encode_generation_request(
+            tokenizer, request, think_mode,
+        ));
     }
 
     let prompt = join_request_text(&request.parts);
@@ -1068,7 +1096,7 @@ pub(crate) fn encode_generation_request(
     } else {
         llama::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
     };
-    EncodedPrompt::from_token_ids(token_ids)
+    Ok(EncodedPrompt::from_token_ids(token_ids))
 }
 
 pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {

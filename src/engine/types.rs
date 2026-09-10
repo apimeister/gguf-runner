@@ -98,6 +98,112 @@ pub(crate) struct MediaRef {
     pub(crate) path: String,
 }
 
+// Geometry contracts are developed independently of request integration; see
+// docs/image-scaling.md. No runtime mode enables crops yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum ImageViewPolicy {
+    /// One view covering the whole image; the Gemma3 default (pan and scan off).
+    #[default]
+    OverviewOnly,
+    /// All parameters must be resolved by the caller's vendor policy.
+    LongAxisCrops {
+        min_crop_size: u32,
+        max_crops: u32,
+        min_aspect_ratio: f64,
+    },
+}
+
+/// Arithmetic used for fixed-size RGB8 stretching; selected by vendor policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ImageStretchFilter {
+    #[default]
+    Triangle,
+    PillowBilinear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageOrientationPolicy {
+    /// Decode the stored pixels as-is. Matches the single-view path, which
+    /// applies no EXIF transform.
+    EncodedPixels,
+    /// Apply the EXIF orientation before planning views. Implemented and
+    /// exercised by the loader, but no vendor selects it yet.
+    #[allow(dead_code)]
+    ApplyExif,
+}
+
+/// Fixed per-view encoder contract, resolved before any vision execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageViewEncoding {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) tokens: usize,
+    pub(crate) dimension: usize,
+    pub(crate) grid: Option<[usize; 3]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageSourceLimits {
+    pub(crate) max_file_bytes: usize,
+    pub(crate) max_source_pixels: usize,
+    /// Passed to the codec as a best-effort limit; decoded output is also checked explicitly.
+    pub(crate) max_decoder_bytes: usize,
+    /// Conservative bound on owned decode/conversion/resize/tensor buffer payloads.
+    /// Excludes allocator overhead, codec scratch, and encoder working memory.
+    pub(crate) max_prepare_bytes: usize,
+    /// Retained projected F32 payload, excluding vector/allocator overhead.
+    pub(crate) max_embedding_bytes: usize,
+    pub(crate) max_views: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageViewLimits {
+    pub(crate) max_source_pixels: usize,
+    /// Includes the overview. Exceeding this limit fails instead of dropping crops.
+    pub(crate) max_views: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageRect {
+    pub(crate) left: u32,
+    pub(crate) top: u32,
+    /// Exclusive source-space bounds, before any resize or normalization.
+    pub(crate) right: u32,
+    pub(crate) bottom: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageViewKind {
+    Overview,
+    Crop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageViewSpec {
+    pub(crate) source_index: usize,
+    pub(crate) view_index: usize,
+    pub(crate) kind: ImageViewKind,
+    pub(crate) rect: ImageRect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImageSourcePlan {
+    /// Identifies a logical request occurrence, independently of its file path.
+    pub(crate) source_index: usize,
+    pub(crate) source_width: u32,
+    pub(crate) source_height: u32,
+    /// Overview first, followed by crops along the long axis in source order.
+    pub(crate) views: Vec<ImageViewSpec>,
+}
+
+/// Prompt-facing description of one logical source occurrence. Paths are not
+/// identities: two occurrences of the same file occupy separate prompt space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImagePromptSource {
+    pub(crate) source_index: usize,
+    pub(crate) view_count: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ContentPart {
     Text(String),
@@ -449,12 +555,59 @@ pub(crate) enum RopePositionLayout {
     Interleaved,
 }
 
+/// Vendor-resolved frequency multipliers for global and local attention.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RopeScalingPolicy {
+    pub(crate) global: f32,
+    pub(crate) local: f32,
+}
+
+impl Default for RopeScalingPolicy {
+    fn default() -> Self {
+        Self {
+            global: 1.0,
+            local: 1.0,
+        }
+    }
+}
+
 /// Logical T/H/W coordinates for a prompt; physical KV rows remain sequential.
 /// Subsequent text (including retry suffixes) continues at `next_text_position`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RopePositionPlan {
     pub(crate) positions: Vec<[usize; 3]>,
     pub(crate) next_text_position: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ImageAttentionMode {
+    #[default]
+    Causal,
+    Bidirectional,
+}
+
+/// Vendor-resolved per-layer visibility. An empty layer list retains unbounded
+/// causal attention; a local window counts the current token and excludes keys
+/// whose distance equals the window size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LanguageAttentionPolicy {
+    pub(crate) layer_windows: Vec<Option<usize>>,
+    pub(crate) image_mode: ImageAttentionMode,
+}
+
+/// One view's physical embedding rows, excluding its surrounding marker tokens.
+/// This metadata is independent of rotary positions and vocabulary token IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MediaAttentionBlock {
+    pub(crate) token_start: usize,
+    pub(crate) token_len: usize,
+    pub(crate) media_index: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MediaAttentionPlan {
+    pub(crate) prompt_tokens: usize,
+    pub(crate) blocks: Vec<MediaAttentionBlock>,
 }
 
 #[derive(Clone)]
@@ -481,6 +634,8 @@ pub(crate) struct Config {
     pub(crate) rope_dim: usize,
     pub(crate) rope_sections: [usize; 4],
     pub(crate) rope_position_layout: RopePositionLayout,
+    pub(crate) rope_scaling: RopeScalingPolicy,
+    pub(crate) attention_policy: LanguageAttentionPolicy,
     pub(crate) is_bert_family: bool,
     pub(crate) is_gemma3: bool,
     pub(crate) is_smolvlm: bool,
@@ -618,6 +773,7 @@ pub(crate) struct RunState {
     pub(crate) rope_cache_pos: isize,
     pub(crate) rope_cache_is_swa: isize,
     pub(crate) rope_position_plan: Option<RopePositionPlan>,
+    pub(crate) media_attention_plan: MediaAttentionPlan,
     pub(crate) head_size: usize,
     pub(crate) kv_dim: usize,
     pub(crate) q_dim: usize,
@@ -642,11 +798,13 @@ pub(crate) struct Tokenizer {
     /// True when GGUF metadata explicitly disables automatic BOS insertion.
     pub(crate) skip_bos_token: bool,
     pub(crate) eos_token: i32,
-    pub(crate) start_header_token: i32,
-    pub(crate) end_header_token: i32,
     pub(crate) eot_token: i32,
     pub(crate) pre_tokenizer: TokenizerPreType,
     pub(crate) use_sentencepiece: bool,
+    /// Honor the GGUF normalizer's explicit no-prefix contract (e.g. Gemma3).
+    /// False preserves the existing default when metadata is absent.
+    pub(crate) sentencepiece_no_space_prefix: bool,
+    pub(crate) sentencepiece_user_defined: Vec<i32>,
     pub(crate) token_to_id: HashMap<String, i32>,
     pub(crate) merges: Vec<String>,
     pub(crate) merge_ranks: HashMap<String, usize>,

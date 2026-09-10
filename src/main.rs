@@ -1,12 +1,5 @@
-mod app;
-mod cli;
-mod engine;
-mod rag;
-mod tools;
-mod vendors;
-
 fn main() {
-    if let Err(e) = app::run() {
+    if let Err(e) = gguf_runner::run() {
         eprintln!("{e}");
         std::process::exit(1);
     }

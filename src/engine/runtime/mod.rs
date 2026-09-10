@@ -1,4 +1,6 @@
+pub(crate) mod attention;
 mod inference;
+mod media_prefill;
 mod parallel;
 
 use crate::engine::types::Config;
@@ -9,6 +11,7 @@ pub(crate) use inference::{
     transformer_with_embedding, transformer_with_embedding_without_logits,
     transformer_without_logits,
 };
+pub(crate) use media_prefill::transformer_prefill_image_block;
 pub(crate) use parallel::configure_rayon_threads;
 
 pub(crate) fn apply_context_size_overrides(

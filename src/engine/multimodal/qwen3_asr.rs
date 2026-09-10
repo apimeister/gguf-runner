@@ -40,7 +40,6 @@ pub(crate) struct Qwen3AsrAudioConfig {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct TensorWeight {
     name: String,
     data_offset: usize,
@@ -49,7 +48,6 @@ struct TensorWeight {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct AudioTransformerLayerWeights {
     ln1_weight: TensorWeight,
     ln1_bias: Option<TensorWeight>,
@@ -67,22 +65,6 @@ struct AudioTransformerLayerWeights {
     feed_forward_up_bias: Option<TensorWeight>,
     feed_forward_down_weight: TensorWeight,
     feed_forward_down_bias: Option<TensorWeight>,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct Qwen3AsrWeights {
-    position_embeddings: TensorWeight,
-    conv2d_weights: [TensorWeight; CONV_LAYER_COUNT],
-    conv2d_biases: [TensorWeight; CONV_LAYER_COUNT],
-    conv_output_weight: TensorWeight,
-    layers: Vec<AudioTransformerLayerWeights>,
-    post_layer_norm_weight: TensorWeight,
-    post_layer_norm_bias: TensorWeight,
-    projector_up_weight: TensorWeight,
-    projector_up_bias: TensorWeight,
-    projector_down_weight: TensorWeight,
-    projector_down_bias: TensorWeight,
 }
 
 #[derive(Clone, Debug)]
@@ -154,8 +136,6 @@ pub(crate) struct Qwen3AsrAudioEncoder {
     // Keep the mapped sidecar alive for quantized runtime weights and descriptor diagnostics.
     gguf: GGUFFile,
     config: Qwen3AsrAudioConfig,
-    #[allow(dead_code)]
-    weights: Qwen3AsrWeights,
     conv_frontend: ConvFrontendWeights,
     transformer: AudioTransformerWeights,
     post_layer_norm: AudioPostLayerNormWeights,
@@ -1380,19 +1360,6 @@ impl Qwen3AsrAudioEncoder {
         Ok(Self {
             gguf,
             config,
-            weights: Qwen3AsrWeights {
-                position_embeddings,
-                conv2d_weights,
-                conv2d_biases,
-                conv_output_weight,
-                layers,
-                post_layer_norm_weight,
-                post_layer_norm_bias,
-                projector_up_weight,
-                projector_up_bias,
-                projector_down_weight,
-                projector_down_bias,
-            },
             conv_frontend,
             transformer,
             post_layer_norm,
@@ -1400,6 +1367,7 @@ impl Qwen3AsrAudioEncoder {
         })
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_conv_frontend(
         &self,
@@ -1422,6 +1390,7 @@ impl Qwen3AsrAudioEncoder {
         )
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_transformer_frontend(
         &self,
@@ -1453,6 +1422,7 @@ impl Qwen3AsrAudioEncoder {
         Ok(output)
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_from_conv_output(
         &self,
@@ -1489,6 +1459,7 @@ impl Qwen3AsrAudioEncoder {
         Ok((transformer, projected))
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_from_conv_output_with_layers(
         &self,
@@ -1550,7 +1521,6 @@ impl Qwen3AsrAudioEncoder {
         Ok((layer_outputs, transformer, projected))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn encode_feature_window(
         &self,
         window: &PreparedAudioFeatureWindow,

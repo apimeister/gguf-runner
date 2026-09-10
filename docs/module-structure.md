@@ -20,6 +20,8 @@ src/
     batch.rs
     audio_batch.rs
     image_batch.rs
+    image_request.rs
+    image_views.rs
     embed.rs
     events.rs
     generation.rs
@@ -54,10 +56,15 @@ src/
       qwen3_asr.rs
       qwen3vl.rs
     vision/
+      bilinear.rs
+      groups.rs
+      groups_tests.rs
       mod.rs
       preprocess.rs
+      views.rs
     tokenizer/
       mod.rs
+      sentencepiece.rs
     weights.rs
     kernels/
       mod.rs
@@ -65,8 +72,10 @@ src/
       quant.rs
       sampling.rs
     runtime/
+      attention.rs
       mod.rs
       inference.rs
+      media_prefill.rs
       parallel.rs
     switches.rs
     profiling.rs
@@ -74,6 +83,7 @@ src/
     mod.rs
     llama.rs
     gemma.rs
+    gemma_image_views.rs
     qwen2.rs
     qwen3.rs
     qwen35.rs
@@ -152,6 +162,32 @@ src/
   model, `mmproj` sidecar, and the matching pre-encoded embedding.
 - Batches at most four records; encoder-specific shape and token limits may split a chunk further.
 
+### `src/app/image_request.rs`
+
+- Plans the complete typed request through `VendorMultimodalPolicy::image_view_prompt`;
+  app/engine code contains no Gemma prompt literals or family checks.
+- Probes and snapshots every source occurrence before any pixel decode/encoder call.
+  Bounds logical sources, total views, compressed snapshots, preparation payload,
+  retained projected payload, compact text bytes, and exact expanded context plus decode reserve.
+- The preparation bound conservatively adds all snapshots to the largest source bound;
+  it excludes allocator/codec scratch, encoder working memory, and projected embeddings.
+- Consumes a private plan once, serially encodes groups through `image_views`, and moves
+  their rows into an injection-ready prompt while retaining source/view identities and group plans.
+  Failure drops all request rows; it does not mutate shared state or caches.
+- Internal foundation only: metadata/settings resolution and generation, CLI, embedded,
+  REPL, retry, and batch/cache integration remain open.
+
+### `src/app/image_views.rs`
+
+- Executes one planned image source through the existing `VisionEncoder` interface,
+  with one prepared view per call and stable source/view identities.
+- Requires exactly one embedding sequence per view and checks its token count,
+  row dimension, spatial grid, and finiteness against the planned contract.
+- Returns `EncodedImageViews` only after every view succeeds. Decode, preparation,
+  or encoder errors drop all completed embeddings for that source; no cache is modified.
+- The internal `image_request` executor calls this stage after complete-request preflight.
+  Generation/image-batch routing and cache/model identity checks remain open.
+
 ### `src/app/speaker.rs`
 
 - Owns the public `SpeakerRuntime` library facade and CLI orchestration for stateless embedding,
@@ -227,6 +263,7 @@ src/
   - sidecar probe enforces checkpoint variant token matching (for example `2b`, `35b`, `a3b`) to prevent silent cross-size pairing
   - metadata-first Qwen3-ASR audio-only sidecar recognition records the validated `qwen3_asr` backend independently from vision capability
   - eager and lazy loading construct `VisionEncoder` for image/video requests and image batches when the selected sidecar exposes both vision encoder and projector tensors; request preprocessing profiles are selected after lazy initialization so the first image uses the sidecar resolution, alignment, and normalization
+    - image profiles apply the vendor-selected stretch filter to both loaded-encoder and fallback geometry; Gemma selects the pinned Pillow RGB8 rounding contract
   - eager and lazy audio requests construct a dedicated Qwen3-ASR `AudioEncoder`; diagnostics
     report loaded weights and effective execution readiness
   - embedded mmproj loading supports either the existing vision encoders or the Qwen3-ASR audio weight contract
@@ -275,12 +312,16 @@ src/
     caller settings on success or failure, applies the vendor-required Q8 KV-cache override, and
     returns a typed parsed result
   - shared decode core `generate_from_prefill(...)` for text + multimodal routes (supports per-position embedding overrides during prefill)
-    - carries optional logical T/H/W image positions through sequential/batched prefill, subsequent text decode, and hidden-thinking retries; physical KV-cache rows and causal token order remain sequential
+    - carries logical T/H/W positions and separate physical image attention blocks through prefill
+      and hidden-thinking retries; each request allocates fresh state
+    - vendor-selected bidirectional image blocks use `transformer_prefill_image_block(...)`,
+      independently of the batch-prefill switch or ordinary chunk size; a block ending the prompt
+      computes its final logits directly, then normal incremental text decoding continues
     - prompts of more than eight tokens prefill in chunks through `transformer_prefill_batch(...)`,
       including media prompts: injected embeddings are passed as `PrefillInput::Embedding`. The
-      batch gate falls back to the sequential loop only when the model is unsupported or when
-      injected embeddings are wider than `dim` (deepstack). The final prompt token always stays on
-      the sequential path so the logits and sampling flow are untouched
+      batch gate excludes bidirectional blocks and falls back to the sequential loop for unsupported
+      causal models or embeddings wider than `dim` (deepstack). On the causal batch path, the final
+      prompt token stays sequential
     - `generated_tokens` counts only positions past the prompt. Both bookkeeping checks after the
       `pos`/`token` advance test `pos >= prompt_tokens.len()`, not `len() - 1`; the off-by-one
       counted the last prompt token as generated, which shifted every periodic loop-guard check
@@ -418,8 +459,20 @@ src/
         processor contracts without adding family checks to app code
     - `ContentPart`
     - `MediaRef`
+    - `ImageViewPolicy`, `ImageViewLimits`, `ImageRect`, `ImageViewKind`,
+      `ImageViewSpec`, and `ImageSourcePlan`: source-space crop geometry and explicit
+      source/view identity consumed by internal grouped preparation and request planning
+    - `ImagePromptSource`: ordered occurrence/view counts supplied to vendor prompt policy
+    - `ImageStretchFilter`: vendor-selected fixed-size RGB8 resampling arithmetic,
+      separate from image geometry and normalization
+    - `ImageOrientationPolicy`, `ImageViewEncoding`, and `ImageSourceLimits`: explicit
+      source orientation, fixed per-view encoder shape/grid, and source/buffer/view budgets
     - `EncodedPrompt`
     - `PlaceholderSpan`
+    - `LanguageAttentionPolicy` and `ImageAttentionMode`: vendor-resolved local/global visibility
+      and image-block behavior, independent of rotary coordinates
+    - `MediaAttentionBlock` and `MediaAttentionPlan`: ordered physical embedding ranges, excluding
+      markers; source indices label views without inferring attention membership from token IDs
     - `AudioTranscriptionResult` (raw model output, detected/forced language, transcript)
     - `KvCacheFormat`, also accepted as a generic run-state allocation override so app/vendor policy
       can select a quality-safe cache without engine family branches
@@ -432,6 +485,8 @@ src/
   - Extended model identity flags:
     - `Config::is_qwen35`
     - `Config::rope_sections` and vendor-selected `rope_position_layout` for rotary axis mapping
+    - `Config::rope_scaling` (`RopeScalingPolicy`) for positive global/local frequency multipliers;
+      identity by default, resolved in vendors and validated before runtime allocation
     - `Config::online_attn_fusion` for vendor-selected dense-attention fast paths
   - Unix mmap wrapper (`MappedFile`) including Linux memory advice hints for model mappings
   - `ensure_model_range(...)` helper used by quantized matmul paths (currently a no-op in local-file mode).
@@ -450,6 +505,7 @@ src/
 - GGUF parsing and low-level read helpers.
 - `io/gguf.rs`:
   - Parses GGUF metadata/tensors.
+  - Preserves boolean metadata arrays as integer 0/1 arrays, including per-layer attention patterns.
   - Maps model file.
   - Provides IEEE F16/BF16 conversion helpers with round-to-nearest, ties-to-even semantics.
   - Provides metadata access helpers:
@@ -458,14 +514,41 @@ src/
 ### `src/engine/vision/*`
 
 - Image/video preprocessing utilities.
+- `vision/views.rs` provides a model-free, checked long-axis crop planner. Callers
+  supply geometry parameters and source-pixel/view limits; the engine contains no
+  model-family defaults. Plans retain source occurrence identity, overview-first
+  order, and exclusive source-space rectangles. Invalid dimensions, unaddressable
+  RGB storage, empty crops, and exceeded limits fail before plan allocation.
+  This module is not yet connected to inference. Its tests cover the overview policy,
+  limits, and invalid inputs; grouped preparation adds decode/encoder contracts below;
+  `app/image_request.rs` owns complete-request preflight.
+- `vision/groups.rs` owns an immutable, size-bounded file snapshot and a validated
+  `ImageViewGroupPlan` before pixel decode or encoder execution. It probes dimensions,
+  checks source pixels/decoded bytes, plans crops in the chosen orientation, and
+  rejects preparation/embedding budgets without reducing the crop count.
+  - `DecodedImageSource` decodes once per source occurrence, optionally applies EXIF,
+    and converts supported 8-bit channels to RGB by discarding alpha.
+  - `prepare_view` extracts each crop from decoded source pixels and produces one
+    Pillow-compatible fixed-size CHW tensor with the original source path and typed view identity.
+  - Plans retain the profile, encoding contract, orientation, and calculated payload bounds.
+    The preparation bound excludes allocator overhead, codec scratch, and vision working memory;
+    decoder allocation limits are best-effort, with explicit strict dimension/output checks.
+  - `groups_tests.rs` checks invalid/nonfinite encoding and normalization contracts, which are
+    rejected before any file is inspected.
 - `vision/preprocess.rs` currently provides deterministic preprocessing:
   - images:
     - decode (`png`/`jpeg`/`webp` via `image` crate)
     - resize to profile target using mode (`CenterCrop` / `FitWithin` / `Stretch`)
+    - stretch filtering selected explicitly by the profile (`Triangle` / `PillowBilinear`)
     - CHW float tensor conversion
     - configurable normalization profile (`UnitRange` / `MeanStd`)
   - videos:
     - currently unavailable in no-external-dependency mode (native decode path removed)
+- `vision/bilinear.rs` implements Pillow-compatible RGB8 stretch resampling with
+  pixel-center coordinates, widened downsampling support, normalized fixed-point
+  coefficients, and byte rounding after each axis. Size checks and fallible
+  allocations cover resize storage; a conservative storage bound feeds grouped preparation.
+  `app/image_request.rs` combines source bounds into a conservative request preparation budget.
 
 ### `src/engine/audio/*`
 
@@ -529,7 +612,11 @@ src/
   - defines a modality-neutral language-space `MediaEmbeddingSequence` with optional merged T/H/W grid dimensions
   - merges image/audio placeholder spans in source-token order and validates per-modality order, global overlap, bounds, marker shape, media-index uniqueness, embedding dimensions, and checked expanded length
   - preserves begin/end markers, replaces each placeholder with variable-length embedding slots, and builds the token-aligned prefill injection map plus a logical position plan when grids are present; grid products must match embedding counts
+  - records each image's physical attention block separately from rotary grids; audio embeddings
+    and surrounding marker tokens are excluded from image-block membership
   - preflights expanded context plus decode reserve and rejects overflow rather than truncating through media embeddings
+  - offers borrowed/copying and owned/moving expansion APIs; the grouped request executor
+    transfers projected row ownership without duplicating its retained F32 payload
 - `multimodal/qwen3vl.rs`:
   - Qwen3-VL CLIP/mmproj image encoder path (`qwen3vl_merger`)
   - loads mmproj tensors, runs patch embedding + vision transformer + projector in Rust
@@ -547,8 +634,31 @@ src/
   - Gemma3 CLIP/mmproj image encoder path (`clip.projector_type='gemma3'`)
   - runs ViT layers with separate q/k/v projections, patch-grid average pooling, RMS normalization, and `mm.input_projection` into text embedding space
   - full-resolution ViT path is default; optional pre-attention fast-pooling shortcut is opt-in via `GGUF_GEMMA3_ENABLE_FAST_POOL=1`
-  - batches F16/BF16 ViT projection and FFN matrices across image tokens
+  - preserves the GGML CPU operand boundaries for patch convolution and the transposed
+    projector, including F16 activation narrowing; BF16 patch weights use the GGML F32 exception
+  - `gemma3_math.rs` owns CPU-compatible affine LayerNorm, RMS normalization,
+    half-table GELU, runtime-gated ARM half dots with a widened portable fallback,
+    and BF16 matrix tiles with F64 accumulation. macOS uses bounded Accelerate DGEMM
+    tiles; other platforms use a parallel widened reduction. This Gemma path bypasses
+    the shared BFMMLA/F32 reduction because its rounding changes propagate through
+    subsequent BF16 boundaries. Other encoders retain their existing dispatch
+  - `gemma3_attention.rs` owns noncausal image attention with the pinned CPU dot,
+    softmax, and reduction ordering. It retains only transposed values and per-worker
+    score rows, with no full quadratic score matrix. Its ARM arithmetic matches the
+    local GGML CPU build (which disables llamafile GEMM for `MATMUL_INT8` targets);
+    the portable path uses widened dots and scalar exponentials
   - emits language-space image token embeddings for prompt injection
+  - optional diagnostic stage observer exposes patch embeddings, each ViT layer,
+    post-LayerNorm, pooled, normalized, and projected tensors, plus operations in
+    requested layers, without retaining intermediate stages in normal inference;
+    `examples/gemma3_encoder_dump.rs` writes one-view F32 stage files for the pinned
+    checkpoint comparison harness. Its optional positional `f32` control bypasses
+    ViT matrix activation narrowing through the existing dequantized batch kernel;
+    patch, norm, GELU, attention, and final projection retain the current CPU contract.
+    Dumps declare `arithmetic=ggml_cpu_v1`; ordinary inference exposes no precision flag
+  - the local llama.cpp stage comparator checks complete encoders and can trace
+    operations in layers 0/1/26. Generated stage dumps and investigation reports
+    stay outside the project
 - `multimodal/idefics3.rs`:
   - Idefics3/SigLIP vision transformer, pixel shuffle, and language-space projection path
   - batches F16/BF16 ViT projection, FFN, and final projector matrices across image tokens
@@ -594,7 +704,13 @@ src/
 
 - Tokenizer initialization and encode/decode logic.
 - Handles sentencepiece/tiktoken-ish paths and special token resolution.
+- GPT-2 whitespace splitting preserves the reference lookahead boundary before non-whitespace.
 - Applies vendor-provided tokenizer policy for BOS fallback and end-of-turn token lookup.
+- Honors GGUF's explicit `tokenizer.ggml.add_space_prefix=false` and retains
+  user-defined token IDs from `tokenizer.ggml.token_type` for SentencePiece processing.
+- `tokenizer/sentencepiece.rs` handles the explicit no-prefix contract: raw user-defined
+  pieces, UTF-8 symbol/score merging, and byte fallback after merging. Decoding returns
+  actual bytes for `<0xNN>` pieces. The previous default-prefix path is retained.
 - Exposes `init_tokenizer_from_gguf(...)`.
 
 ### `src/engine/weights.rs`
@@ -616,7 +732,16 @@ src/
 ### `src/engine/runtime/*`
 
 - Runtime-specific execution and threading config.
+- `runtime/attention.rs`: validates physical image blocks, keeps chunk boundaries outside blocks,
+  and resolves each query's visible KV interval. A bidirectional image block overrides the local
+  window within itself; other keys obey causal local/global visibility.
+- `runtime/media_prefill.rs`: evaluates one complete dense image block at a time. Each layer
+  stages every K/V row and retains queries before attention runs, then reuses the normal residual,
+  feed-forward, and final-logit helpers. Rejects partial blocks and unsupported layouts without a
+  causal fallback. Holds one block's residual/query arrays; existing KV cache storage is reused.
 - `runtime/inference.rs`:
+  - Applies the vendor's global/local RoPE frequency scale when rebuilding cached angles;
+    switching layer kinds at the same position invalidates the cached coefficients.
   - `malloc_run_state(...)`
   - `malloc_run_state_with_kv_cache_format(...)` for a generic request-scoped Q8/Turbo override;
     Qwen3-ASR selects Q8 in vendor policy because Turbo fails the audio quality gate
@@ -628,13 +753,16 @@ src/
     full-attention projections and the dense FFN; Qwen3Next/Qwen3.5 SSM layers batch their input,
     gate, and output projections around the still-token-ordered recurrent transition.
     `batch_prefill_supported(...)` gates the path (post-norm BERT, Gemma3 ordering, and per-token MoE
-    routing fall back to the sequential loop)
+    routing are excluded); bidirectional image blocks use the separate complete-block evaluator
   - `PrefillInput::{Token, Embedding}` lets that chunk mix vocabulary tokens with encoder-produced
     embeddings, so audio and image prompts prefill in batches instead of one position at a time.
     Embeddings must be `dim` wide; deepstack prompts, whose embeddings carry a per-layer tail that
     only the sequential path replays, stay on the per-token loop
   - accepts multimodal prefill vectors at either `dim` or `input_embedding_dim`
   - applies per-layer deepstack residual injection for Qwen3-VL-style expanded embeddings
+  - shares input normalization, attention preparation, residual/FFN completion, and final logits
+    between ordinary token steps and complete image blocks; sequential/batch calls reject an image
+    block that requires the staged evaluator
   - reuses kernel activation scratch across high-frequency sequential projection calls in decode,
     including prepared-activation reuse across compatible dense, BERT fused, Qwen3Next
     full-attention, and FFN gate/up projection groups
@@ -694,14 +822,30 @@ src/
   - Dispatches vendor policies used by app/tokenizer decode paths:
     - `decode_policy(...)` returning `VendorDecodePolicy` (`parse_think_tags`, `stop_token_literals`, `deterministic_loop_guard`, hidden/visible think budgets, multimodal think preference, think-retry toggles)
     - `tokenizer_policy(...)` returning `VendorTokenizerPolicy`
-    - `multimodal_policy(...)` returning `VendorMultimodalPolicy` (image prompt suffix, detail-crop behavior, mmproj candidate scoring hints, sidecar diagnostics hint)
+    - `multimodal_policy(...)` returning `VendorMultimodalPolicy` (image prompt suffix, stretch filter, detail-crop behavior, mmproj candidate scoring hints, sidecar diagnostics hint)
     - `audio_preprocess_config(...)` returning the backend-specific decode, resource-limit, log-Mel, and feature-window profile without placing Qwen3-ASR constants in app/engine branches
     - `audio_transcription_policy(...)` returning backend-owned request construction, decode/stopping,
       forced-language validation, typed output parsing behavior, and required KV-cache format
     - `runtime_debug_policy(...)` returning `VendorRuntimeDebugPolicy` (family-specific native-context debug label)
   - Routes both simple chat prompt encoding and structured `GenerationRequest` encoding to family-specific implementation.
+    Structured encoding returns `Result` so missing image-token contracts and ambiguous
+    reserved controls fail before media preprocessing/encoding.
 - `vendors/llama.rs`, `vendors/gemma.rs`, `vendors/qwen*.rs`:
   - Family-specific defaults, validations, prompt rendering, and family-owned policy constructors.
+  - `gemma.rs` resolves Gemma3 bidirectional image attention and GGUF sliding-window metadata.
+    Scalar periods and per-layer boolean patterns select both local masks and local RoPE;
+    absent/zero window size selects global layers. Other families retain their existing policies.
+    It also resolves linear RoPE scaling (modern factor key before legacy `rope.scale_linear`):
+    global frequencies use the reciprocal factor while local frequencies remain unscaled.
+    Missing/zero factors and explicit `none` select identity; invalid factors and unsupported
+    scaling types fail configuration loading. The supplied 4B checkpoint selects `0.125`/`1`.
+    Its multimodal policy selects Pillow-compatible RGB8 bilinear stretching;
+    other vendors retain their existing filters.
+  - `gemma_image_views.rs` renders the separate grouped-image prompt policy with
+    pinned processor crop wording, per-view blank lines, required image tokens,
+    compact byte limits, and explicit spans. It preserves text-fragment merging
+    and assistant prefill, rejects ambiguous reserved controls, and has no path/cache logic.
+    Normal Gemma3 one-view image requests also use this builder; crop execution remains internal.
   - Qwen family is split by variant:
     - `qwen2.rs`: Qwen2 chat template + baseline decode/tokenizer policies.
     - `qwen3.rs`: Qwen3-MoE defaults/validation helpers and Qwen3 prompt wrappers.

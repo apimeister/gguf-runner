@@ -20,7 +20,8 @@ use crate::engine::switches::{
     par_attn_min_heads,
 };
 use crate::engine::types::{
-    Config, GGML_TYPE_BF16, KvCacheFormat, QuantizedTensor, RunState, TransformerWeights,
+    Config, GGML_TYPE_BF16, ImageAttentionMode, KvCacheFormat, QuantizedTensor, RunState,
+    TransformerWeights,
 };
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
@@ -1498,6 +1499,11 @@ fn rebuild_rope_cache(p: &Config, s: &mut RunState, pos: usize, is_swa_layer: bo
         .rope_position_plan
         .as_ref()
         .map_or([pos; 3], |plan| plan.at(pos));
+    let frequency_scale = if is_swa_layer {
+        p.rope_scaling.local
+    } else {
+        p.rope_scaling.global
+    };
     for (i, ((cos, sin), &freq)) in s
         .rope_cos
         .iter_mut()
@@ -1507,7 +1513,7 @@ fn rebuild_rope_cache(p: &Config, s: &mut RunState, pos: usize, is_swa_layer: bo
         .enumerate()
     {
         let axis = p.rope_position_layout.axis(i, p.rope_sections);
-        let val = coordinates[axis] as f32 * freq;
+        let val = (coordinates[axis] as f32 * freq) * frequency_scale;
         *cos = val.cos();
         *sin = val.sin();
     }
@@ -1524,6 +1530,20 @@ pub(crate) fn malloc_run_state_with_kv_cache_format(
     p: &Config,
     format_override: Option<KvCacheFormat>,
 ) -> Result<RunState, String> {
+    if [p.rope_scaling.global, p.rope_scaling.local]
+        .iter()
+        .any(|scale| !scale.is_finite() || *scale <= 0.0)
+    {
+        return Err("RoPE frequency scales must be finite and positive".into());
+    }
+    if !p.attention_policy.layer_windows.is_empty()
+        && (p.attention_policy.layer_windows.len() != p.n_layers
+            || p.attention_policy.layer_windows.contains(&Some(0)))
+    {
+        return Err(
+            "attention policy requires one positive window or global entry per layer".to_string(),
+        );
+    }
     let head_size = if p.head_dim > 0 {
         p.head_dim
     } else {
@@ -1717,6 +1737,7 @@ pub(crate) fn malloc_run_state_with_kv_cache_format(
         rope_cache_pos: -1,
         rope_cache_is_swa: -1,
         rope_position_plan: None,
+        media_attention_plan: Default::default(),
         head_size,
         kv_dim,
         q_dim,
@@ -1797,7 +1818,11 @@ pub(crate) fn apply_rope_qk(p: &Config, s: &mut RunState, l: usize, pos: usize) 
     let head_size = s.head_size;
     let kv_dim = s.kv_dim;
     let q_dim = s.q_dim;
-    let is_swa_layer = p.swa_pattern > 0 && (l % p.swa_pattern < p.swa_pattern - 1);
+    let is_swa_layer = if p.attention_policy.layer_windows.is_empty() {
+        p.swa_pattern > 0 && (l % p.swa_pattern < p.swa_pattern - 1)
+    } else {
+        p.attention_policy.layer_windows[l].is_some()
+    };
     let rope_half = s.rope_cos.len();
     rebuild_rope_cache(p, s, pos, is_swa_layer);
 
@@ -1939,8 +1964,13 @@ pub(crate) fn kv_write_token(p: &Config, s: &mut RunState, l: usize, pos: usize)
     }
 }
 
-/// Attention for one token: reads `s.q`, attends over KV-cache rows `0..=pos` of layer `l`, writes the per-head outputs into `s.xb`. Includes the fused online-softmax and parallel/serial branches. Extracted verbatim from `transformer_inner` so the batched prefill path shares it.
+/// Attend over the vendor-selected physical KV range for this query. Image
+/// queries require their complete block's K/V rows to have been written first.
+/// All cache formats and serial/parallel branches use the same visibility range.
 pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize) {
+    let visible = p
+        .attention_policy
+        .visible_keys(&s.media_attention_plan, l, pos);
     let head_size = s.head_size;
     let kv_dim = s.kv_dim;
     let q_dim = s.q_dim;
@@ -1989,7 +2019,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                     let kv_head = h / kv_mul;
                     let kv_head_offset = kv_head * head_size;
 
-                    let att_head = &mut att_head_full[..=pos];
+                    let att_head = &mut att_head_full[visible.clone()];
                     // Scale slice for this KV head: blocks_per_head blocks starting at
                     // the head's block offset within the row.
                     let head_block_off = kv_head * blocks_per_head;
@@ -2022,7 +2052,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                         }
                         let mut max_score = f32::NEG_INFINITY;
                         let mut score_sum = 0.0f32;
-                        for t in 0..=pos {
+                        for t in visible.clone() {
                             let t_row = layer_row_base + t;
                             let row_offset = t_row * kv_dim + kv_head_offset;
                             let mut score = match kv_format {
@@ -2144,6 +2174,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                         }
                     } else {
                         for (t, slot) in att_head.iter_mut().enumerate() {
+                            let t = visible.start + t;
                             let t_row = layer_row_base + t;
                             let row_offset = t_row * kv_dim + kv_head_offset;
                             let mut score = match kv_format {
@@ -2190,13 +2221,14 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                             *slot = score;
                         }
 
-                        softmax(att_head, pos + 1);
+                        softmax(att_head, visible.len());
 
                         xb_head.fill(0.0);
                         if kv_format == KvCacheFormat::Turbo {
                             turboquant_reset_residual_accum(turbo_residual_accum, head_size);
                         }
                         for (t, &a) in att_head.iter().enumerate() {
+                            let t = visible.start + t;
                             let t_row = layer_row_base + t;
                             let row_offset = t_row * kv_dim + kv_head_offset;
                             match kv_format {
@@ -2264,7 +2296,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
             let key_head_scales_ptr = unsafe { key_scales.as_ptr().add(head_block_off) };
             let value_head_scales_ptr = unsafe { value_scales.as_ptr().add(head_block_off) };
             let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
-            let att_head = &mut att_head_full[..=pos];
+            let att_head = &mut att_head_full[visible.clone()];
             let xb_head = &mut xb_all[hs..hs + head_size];
             let turbo_signs = if kv_format == KvCacheFormat::Turbo {
                 let s = TurboSignRef::from_table(
@@ -2292,7 +2324,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                 }
                 let mut max_score = f32::NEG_INFINITY;
                 let mut score_sum = 0.0f32;
-                for t in 0..=pos {
+                for t in visible.clone() {
                     let t_row = layer_row_base + t;
                     let row_offset = t_row * kv_dim + kv_head_offset;
                     let mut score = match kv_format {
@@ -2397,6 +2429,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                 }
             } else {
                 for (t, slot) in att_head.iter_mut().enumerate() {
+                    let t = visible.start + t;
                     let t_row = layer_row_base + t;
                     let row_offset = t_row * kv_dim + kv_head_offset;
                     let mut score = match kv_format {
@@ -2437,13 +2470,14 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                     *slot = score;
                 }
 
-                softmax(att_head, pos + 1);
+                softmax(att_head, visible.len());
 
                 xb_head.fill(0.0);
                 if kv_format == KvCacheFormat::Turbo {
                     turboquant_reset_residual_accum(turbo_residual_accum, head_size);
                 }
                 for (t, &a) in att_head.iter().enumerate() {
+                    let t = visible.start + t;
                     let t_row = layer_row_base + t;
                     let row_offset = t_row * kv_dim + kv_head_offset;
                     match kv_format {
@@ -2708,6 +2742,18 @@ pub(crate) fn transformer_prefill_batch(
     let m = inputs.len();
     if m == 0 {
         return Ok(());
+    }
+    let end = base_pos
+        .checked_add(m)
+        .filter(|&end| end <= p.seq_len)
+        .ok_or_else(|| "batched prefill range exceeds context".to_string())?;
+    if p.attention_policy.image_mode == ImageAttentionMode::Bidirectional
+        && s.media_attention_plan
+            .blocks
+            .iter()
+            .any(|block| block.token_start < end && base_pos < block.token_start + block.token_len)
+    {
+        return Err("image embedding tokens require complete-block prefill".to_string());
     }
     let dim = p.dim;
     let hidden_dim = p.hidden_dim;
@@ -3064,6 +3110,20 @@ pub(crate) fn layer_attention_token(
     matmul_scratch: &mut MatmulActivationScratch,
     l: usize,
     pos: usize,
+) -> Result<(), String> {
+    layer_attention_token_staged(p, s, w, mapped, matmul_scratch, l, pos, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn layer_attention_token_staged(
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    matmul_scratch: &mut MatmulActivationScratch,
+    l: usize,
+    pos: usize,
+    prepare_only: bool,
 ) -> Result<(), String> {
     let dim = p.dim;
     let head_size = s.head_size;
@@ -3440,6 +3500,10 @@ pub(crate) fn layer_attention_token(
 
         apply_rope_qk(p, s, l, pos);
         kv_write_token(p, s, l, pos);
+        if prepare_only {
+            prof_end(&PROF_ATTN_NS, attn_prof);
+            return Ok(());
+        }
         attention_token(p, s, l, pos);
 
         if qwen3next_packed_q_gate {
@@ -3466,6 +3530,480 @@ pub(crate) fn layer_attention_token(
     Ok(())
 }
 
+pub(super) fn layer_input_norm(p: &Config, s: &mut RunState, w: &TransformerWeights, l: usize) {
+    let dim = p.dim;
+    let eps = if p.rms_norm_eps > 0.0 {
+        p.rms_norm_eps
+    } else {
+        1e-5
+    };
+    if p.is_bert_family {
+        // Post-norm architecture: no pre-attention norm — feed x directly into attention.
+        s.xb[..dim].copy_from_slice(&s.x[..dim]);
+    } else if p.is_gemma3 {
+        rmsnorm_gemma(
+            &mut s.xb[..dim],
+            &s.x[..dim],
+            &w.rms_att_weight[l * dim..(l + 1) * dim],
+            dim,
+            eps,
+        );
+    } else {
+        rmsnorm(
+            &mut s.xb[..dim],
+            &s.x[..dim],
+            &w.rms_att_weight[l * dim..(l + 1) * dim],
+            dim,
+            eps,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn layer_after_attention(
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    matmul_scratch: &mut MatmulActivationScratch,
+    l: usize,
+    pos: usize,
+    do_layer_debug: bool,
+) -> Result<(), String> {
+    let dim = p.dim;
+    let hidden_dim = p.hidden_dim;
+    let eps = if p.rms_norm_eps > 0.0 {
+        p.rms_norm_eps
+    } else {
+        1e-5
+    };
+
+    if do_layer_debug {
+        eprintln!(
+            "[LAYERDBG pos={pos} l={l}] post_attn_norm={:.4} x_norm={:.4}",
+            l2_norm(&s.xb2[..dim]),
+            l2_norm(&s.x[..dim]),
+        );
+    }
+
+    if p.is_bert_family {
+        // Post-norm: residual first, then LayerNorm in-place on x.
+        accum(&mut s.x[..dim], &s.xb2[..dim], dim);
+        layernorm_inplace(
+            &mut s.x[..dim],
+            &w.attn_post_norm[l * dim..(l + 1) * dim],
+            &w.attn_post_norm_bias[l * dim..(l + 1) * dim],
+            dim,
+            eps,
+        );
+    } else {
+        if p.is_gemma3 && !w.attn_post_norm.is_empty() {
+            rmsnorm_inplace(
+                &mut s.xb2[..dim],
+                &w.attn_post_norm[l * dim..(l + 1) * dim],
+                dim,
+                eps,
+            );
+        }
+        accum(&mut s.x[..dim], &s.xb2[..dim], dim);
+    }
+
+    if p.is_bert_family {
+        // Post-norm architecture: no pre-FFN norm — feed x directly into FFN.
+        s.xb[..dim].copy_from_slice(&s.x[..dim]);
+    } else if p.is_gemma3 {
+        rmsnorm_gemma(
+            &mut s.xb[..dim],
+            &s.x[..dim],
+            &w.rms_ffn_weight[l * dim..(l + 1) * dim],
+            dim,
+            eps,
+        );
+    } else {
+        rmsnorm(
+            &mut s.xb[..dim],
+            &s.x[..dim],
+            &w.rms_ffn_weight[l * dim..(l + 1) * dim],
+            dim,
+            eps,
+        );
+    }
+
+    if p.is_qwen3moe || (p.is_qwen3next && p.n_experts > 0) {
+        let moe_prof = prof_start();
+        let expert_hidden = p.expert_hidden_dim;
+        let disable_routed = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_ROUTED_EXPERTS");
+        let disable_shared = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_SHARED_EXPERT");
+        let force_serial_routed =
+            p.is_qwen3next && env_flag("GGUF_QWEN3NEXT_SERIAL_ROUTED_EXPERTS");
+        s.xb2[..dim].copy_from_slice(&s.xb[..dim]);
+        matmul_quantized_with_scratch(
+            &mut s.moe_logits[..p.n_experts],
+            &s.xb2[..dim],
+            &w.moe_gate_inp[l],
+            mapped,
+            matmul_scratch,
+        )?;
+        let n_selected = select_topk_softmax(
+            &s.moe_logits[..p.n_experts],
+            p.n_experts_used,
+            p.moe_n_group,
+            p.moe_topk_group,
+            p.moe_norm_topk_prob,
+            p.moe_routed_scaling_factor,
+            &mut s.moe_scores,
+            &mut s.moe_selected_group,
+            &mut s.moe_group_scores,
+            &mut s.moe_group_rank,
+            &mut s.moe_topk_indices,
+            &mut s.moe_topk_weights,
+        );
+        s.xb[..dim].fill(0.0);
+
+        if !disable_routed {
+            let mut routed_selected = Vec::with_capacity(n_selected);
+            for j in 0..n_selected {
+                let route_weight = s.moe_topk_weights[j];
+                if route_weight != 0.0 {
+                    routed_selected.push((s.moe_topk_indices[j], route_weight));
+                }
+            }
+
+            if routed_selected.len() >= 2 && !force_serial_routed {
+                let xb2 = &s.xb2[..dim];
+                let gate_exps = &w.moe_gate_exps[l];
+                let up_exps = &w.moe_up_exps[l];
+                let down_exps = &w.moe_down_exps[l];
+                let contribs_len = routed_selected.len() * dim;
+                let contribs = &mut s.moe_contribs[..contribs_len];
+
+                let per_expert = contribs
+                    .par_chunks_mut(dim)
+                    .zip(routed_selected.par_iter())
+                    .map_init(
+                        || {
+                            (
+                                vec![0.0f32; expert_hidden],
+                                vec![0.0f32; expert_hidden],
+                                MatmulActivationScratch::new(),
+                            )
+                        },
+                        |(hb_local, hb2_local, local_matmul_scratch),
+                         (contrib, &(expert_idx, route_weight))|
+                         -> Result<(), String> {
+                            let row_start_ffn = expert_idx * expert_hidden;
+                            matmul_quantized_rows_with_scratch(
+                                &mut hb_local[..expert_hidden],
+                                xb2,
+                                gate_exps,
+                                row_start_ffn,
+                                expert_hidden,
+                                mapped,
+                                local_matmul_scratch,
+                            )?;
+                            matmul_quantized_rows_with_scratch(
+                                &mut hb2_local[..expert_hidden],
+                                xb2,
+                                up_exps,
+                                row_start_ffn,
+                                expert_hidden,
+                                mapped,
+                                local_matmul_scratch,
+                            )?;
+                            silu_and_mul_inplace(
+                                &mut hb_local[..expert_hidden],
+                                &hb2_local[..expert_hidden],
+                            );
+
+                            let row_start_down = expert_idx * dim;
+                            matmul_quantized_rows_with_scratch(
+                                contrib,
+                                &hb_local[..expert_hidden],
+                                down_exps,
+                                row_start_down,
+                                dim,
+                                mapped,
+                                local_matmul_scratch,
+                            )?;
+                            for v in contrib {
+                                *v *= route_weight;
+                            }
+                            Ok(())
+                        },
+                    )
+                    .collect::<Vec<_>>();
+
+                for item in per_expert {
+                    item?;
+                }
+
+                s.xb[..dim].fill(0.0);
+                for contrib in contribs.chunks(dim) {
+                    crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], 1.0, contrib);
+                }
+            } else {
+                for &(expert_idx, route_weight) in &routed_selected {
+                    let row_start_ffn = expert_idx * expert_hidden;
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.hb[..expert_hidden],
+                        &s.xb2[..dim],
+                        &w.moe_gate_exps[l],
+                        row_start_ffn,
+                        expert_hidden,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.hb2[..expert_hidden],
+                        &s.xb2[..dim],
+                        &w.moe_up_exps[l],
+                        row_start_ffn,
+                        expert_hidden,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+
+                    silu_and_mul_inplace(&mut s.hb[..expert_hidden], &s.hb2[..expert_hidden]);
+
+                    let row_start_down = expert_idx * dim;
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.moe_tmp[..dim],
+                        &s.hb[..expert_hidden],
+                        &w.moe_down_exps[l],
+                        row_start_down,
+                        dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                    crate::engine::kernels::axpy_inplace(
+                        &mut s.xb[..dim],
+                        route_weight,
+                        &s.moe_tmp[..dim],
+                    );
+                }
+            }
+        }
+
+        if p.is_qwen3next && !disable_shared && !w.moe_shared_gate_inp.is_empty() {
+            let shared_hidden = if p.shared_expert_hidden_dim > 0 {
+                p.shared_expert_hidden_dim
+            } else {
+                p.expert_hidden_dim
+            };
+            let shared_gate = &w.moe_shared_gate_inp[l * dim..(l + 1) * dim];
+            let gate_logit = dot_f32_simd(&s.xb2[..dim], shared_gate);
+            let gate = 1.0 / (1.0 + (-gate_logit).exp());
+
+            if all_prepared_activation_supported(&[&w.w1[l], &w.w3[l]]) {
+                if let Some(prepared) =
+                    prepare_matmul_activation(&s.xb2[..dim], &w.w1[l], matmul_scratch)
+                {
+                    matmul_quantized_with_prepared_activation(
+                        &mut s.hb[..shared_hidden],
+                        &prepared,
+                        &w.w1[l],
+                        mapped,
+                    )?;
+                    matmul_quantized_with_prepared_activation(
+                        &mut s.hb2[..shared_hidden],
+                        &prepared,
+                        &w.w3[l],
+                        mapped,
+                    )?;
+                } else {
+                    matmul_quantized_with_scratch(
+                        &mut s.hb[..shared_hidden],
+                        &s.xb2[..dim],
+                        &w.w1[l],
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                    matmul_quantized_with_scratch(
+                        &mut s.hb2[..shared_hidden],
+                        &s.xb2[..dim],
+                        &w.w3[l],
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                }
+            } else {
+                matmul_quantized_with_scratch(
+                    &mut s.hb[..shared_hidden],
+                    &s.xb2[..dim],
+                    &w.w1[l],
+                    mapped,
+                    matmul_scratch,
+                )?;
+                matmul_quantized_with_scratch(
+                    &mut s.hb2[..shared_hidden],
+                    &s.xb2[..dim],
+                    &w.w3[l],
+                    mapped,
+                    matmul_scratch,
+                )?;
+            }
+            silu_and_mul_inplace(&mut s.hb[..shared_hidden], &s.hb2[..shared_hidden]);
+            matmul_quantized_with_scratch(
+                &mut s.moe_tmp[..dim],
+                &s.hb[..shared_hidden],
+                &w.w2[l],
+                mapped,
+                matmul_scratch,
+            )?;
+            crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], gate, &s.moe_tmp[..dim]);
+        }
+        prof_end(&PROF_MOE_NS, moe_prof);
+    } else {
+        let ffn_prof = prof_start();
+        if all_prepared_activation_supported(&[&w.w1[l], &w.w3[l]]) {
+            if let Some(prepared) =
+                prepare_matmul_activation(&s.xb[..dim], &w.w1[l], matmul_scratch)
+            {
+                matmul_quantized_with_prepared_activation(
+                    &mut s.hb[..hidden_dim],
+                    &prepared,
+                    &w.w1[l],
+                    mapped,
+                )?;
+                matmul_quantized_with_prepared_activation(
+                    &mut s.hb2[..hidden_dim],
+                    &prepared,
+                    &w.w3[l],
+                    mapped,
+                )?;
+            } else {
+                matmul_quantized_with_scratch(
+                    &mut s.hb[..hidden_dim],
+                    &s.xb[..dim],
+                    &w.w1[l],
+                    mapped,
+                    matmul_scratch,
+                )?;
+                matmul_quantized_with_scratch(
+                    &mut s.hb2[..hidden_dim],
+                    &s.xb[..dim],
+                    &w.w3[l],
+                    mapped,
+                    matmul_scratch,
+                )?;
+            }
+        } else {
+            matmul_quantized_with_scratch(
+                &mut s.hb[..hidden_dim],
+                &s.xb[..dim],
+                &w.w1[l],
+                mapped,
+                matmul_scratch,
+            )?;
+            matmul_quantized_with_scratch(
+                &mut s.hb2[..hidden_dim],
+                &s.xb[..dim],
+                &w.w3[l],
+                mapped,
+                matmul_scratch,
+            )?;
+        }
+
+        if p.is_gemma3 {
+            for i in 0..hidden_dim {
+                let x = s.hb[i];
+                let gelu = 0.5 * x * (1.0 + (0.797_884_6 * x * (1.0 + 0.044_715 * x * x)).tanh());
+                s.hb[i] = gelu * s.hb2[i];
+            }
+        } else {
+            silu_and_mul_inplace(&mut s.hb[..hidden_dim], &s.hb2[..hidden_dim]);
+        }
+
+        matmul_quantized_with_scratch(
+            &mut s.xb[..dim],
+            &s.hb[..hidden_dim],
+            &w.w2[l],
+            mapped,
+            matmul_scratch,
+        )?;
+        prof_end(&PROF_FFN_NS, ffn_prof);
+    }
+
+    if p.is_bert_family {
+        // Post-norm: residual first, then LayerNorm in-place on x.
+        accum(&mut s.x[..dim], &s.xb[..dim], dim);
+        layernorm_inplace(
+            &mut s.x[..dim],
+            &w.ffn_post_norm[l * dim..(l + 1) * dim],
+            &w.ffn_post_norm_bias[l * dim..(l + 1) * dim],
+            dim,
+            eps,
+        );
+    } else {
+        if p.is_gemma3 && !w.ffn_post_norm.is_empty() {
+            rmsnorm_inplace(
+                &mut s.xb[..dim],
+                &w.ffn_post_norm[l * dim..(l + 1) * dim],
+                dim,
+                eps,
+            );
+        }
+        accum(&mut s.x[..dim], &s.xb[..dim], dim);
+    }
+
+    if do_layer_debug {
+        eprintln!(
+            "[LAYERDBG pos={pos} l={l}] post_ffn_norm={:.4} x_norm={:.4}",
+            l2_norm(&s.xb[..dim]),
+            l2_norm(&s.x[..dim]),
+        );
+    }
+
+    Ok(())
+}
+
+pub(super) fn finish_logits(
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+    matmul_scratch: &mut MatmulActivationScratch,
+) -> Result<(), String> {
+    let dim = p.dim;
+    let eps = if p.rms_norm_eps > 0.0 {
+        p.rms_norm_eps
+    } else {
+        1e-5
+    };
+    if !p.is_bert_family {
+        rmsnorm_inplace(&mut s.x[..dim], &w.rms_final_weight[..dim], dim, eps);
+    }
+    sanitize_finite_inplace(&mut s.x[..dim]);
+
+    if w.wcls_is_embed {
+        matmul_f32_embeddings(
+            &mut s.logits[..p.vocab_size],
+            &s.x[..dim],
+            &w.token_embedding_table,
+            p.vocab_size,
+            dim,
+        );
+    } else {
+        matmul_quantized_with_scratch(
+            &mut s.logits[..p.vocab_size],
+            &s.x[..dim],
+            &w.wcls,
+            mapped,
+            matmul_scratch,
+        )?;
+    }
+    sanitize_finite_inplace(&mut s.logits[..p.vocab_size]);
+
+    if p.is_gemma3 && p.final_logit_softcapping > 0.0 {
+        let cap = p.final_logit_softcapping;
+        for i in 0..p.vocab_size {
+            s.logits[i] = cap * (s.logits[i] / cap).tanh();
+        }
+    }
+
+    Ok(())
+}
+
 fn transformer_inner(
     input: TransformerInput<'_>,
     pos: usize,
@@ -3475,13 +4013,12 @@ fn transformer_inner(
     w: &TransformerWeights,
     mapped: &[u8],
 ) -> Result<(), String> {
+    if p.attention_policy.image_mode == ImageAttentionMode::Bidirectional
+        && s.media_attention_plan.block_at(pos).is_some()
+    {
+        return Err("image embedding tokens require complete-block prefill".to_string());
+    }
     let dim = p.dim;
-    let hidden_dim = p.hidden_dim;
-    let eps = if p.rms_norm_eps > 0.0 {
-        p.rms_norm_eps
-    } else {
-        1e-5
-    };
     let do_layer_debug =
         layer_debug_enabled() && layer_debug_pos().map_or(pos == 0, |p0| pos == p0);
     let mut deepstack_embedding: Option<&[f32]> = None;
@@ -3514,405 +4051,10 @@ fn transformer_inner(
     }
 
     for l in 0..p.n_layers {
-        if p.is_bert_family {
-            // Post-norm architecture: no pre-attention norm — feed x directly into attention.
-            s.xb[..dim].copy_from_slice(&s.x[..dim]);
-        } else if p.is_gemma3 {
-            rmsnorm_gemma(
-                &mut s.xb[..dim],
-                &s.x[..dim],
-                &w.rms_att_weight[l * dim..(l + 1) * dim],
-                dim,
-                eps,
-            );
-        } else {
-            rmsnorm(
-                &mut s.xb[..dim],
-                &s.x[..dim],
-                &w.rms_att_weight[l * dim..(l + 1) * dim],
-                dim,
-                eps,
-            );
-        }
+        layer_input_norm(p, s, w, l);
 
         layer_attention_token(p, s, w, mapped, &mut matmul_scratch, l, pos)?;
-
-        if do_layer_debug {
-            eprintln!(
-                "[LAYERDBG pos={pos} l={l}] post_attn_norm={:.4} x_norm={:.4}",
-                l2_norm(&s.xb2[..dim]),
-                l2_norm(&s.x[..dim]),
-            );
-        }
-
-        if p.is_bert_family {
-            // Post-norm: residual first, then LayerNorm in-place on x.
-            accum(&mut s.x[..dim], &s.xb2[..dim], dim);
-            layernorm_inplace(
-                &mut s.x[..dim],
-                &w.attn_post_norm[l * dim..(l + 1) * dim],
-                &w.attn_post_norm_bias[l * dim..(l + 1) * dim],
-                dim,
-                eps,
-            );
-        } else {
-            if p.is_gemma3 && !w.attn_post_norm.is_empty() {
-                rmsnorm_inplace(
-                    &mut s.xb2[..dim],
-                    &w.attn_post_norm[l * dim..(l + 1) * dim],
-                    dim,
-                    eps,
-                );
-            }
-            accum(&mut s.x[..dim], &s.xb2[..dim], dim);
-        }
-
-        if p.is_bert_family {
-            // Post-norm architecture: no pre-FFN norm — feed x directly into FFN.
-            s.xb[..dim].copy_from_slice(&s.x[..dim]);
-        } else if p.is_gemma3 {
-            rmsnorm_gemma(
-                &mut s.xb[..dim],
-                &s.x[..dim],
-                &w.rms_ffn_weight[l * dim..(l + 1) * dim],
-                dim,
-                eps,
-            );
-        } else {
-            rmsnorm(
-                &mut s.xb[..dim],
-                &s.x[..dim],
-                &w.rms_ffn_weight[l * dim..(l + 1) * dim],
-                dim,
-                eps,
-            );
-        }
-
-        if p.is_qwen3moe || (p.is_qwen3next && p.n_experts > 0) {
-            let moe_prof = prof_start();
-            let expert_hidden = p.expert_hidden_dim;
-            let disable_routed = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_ROUTED_EXPERTS");
-            let disable_shared = p.is_qwen35 && env_flag("GGUF_QWEN35_DISABLE_SHARED_EXPERT");
-            let force_serial_routed =
-                p.is_qwen3next && env_flag("GGUF_QWEN3NEXT_SERIAL_ROUTED_EXPERTS");
-            s.xb2[..dim].copy_from_slice(&s.xb[..dim]);
-            matmul_quantized_with_scratch(
-                &mut s.moe_logits[..p.n_experts],
-                &s.xb2[..dim],
-                &w.moe_gate_inp[l],
-                mapped,
-                &mut matmul_scratch,
-            )?;
-            let n_selected = select_topk_softmax(
-                &s.moe_logits[..p.n_experts],
-                p.n_experts_used,
-                p.moe_n_group,
-                p.moe_topk_group,
-                p.moe_norm_topk_prob,
-                p.moe_routed_scaling_factor,
-                &mut s.moe_scores,
-                &mut s.moe_selected_group,
-                &mut s.moe_group_scores,
-                &mut s.moe_group_rank,
-                &mut s.moe_topk_indices,
-                &mut s.moe_topk_weights,
-            );
-            s.xb[..dim].fill(0.0);
-
-            if !disable_routed {
-                let mut routed_selected = Vec::with_capacity(n_selected);
-                for j in 0..n_selected {
-                    let route_weight = s.moe_topk_weights[j];
-                    if route_weight != 0.0 {
-                        routed_selected.push((s.moe_topk_indices[j], route_weight));
-                    }
-                }
-
-                if routed_selected.len() >= 2 && !force_serial_routed {
-                    let xb2 = &s.xb2[..dim];
-                    let gate_exps = &w.moe_gate_exps[l];
-                    let up_exps = &w.moe_up_exps[l];
-                    let down_exps = &w.moe_down_exps[l];
-                    let contribs_len = routed_selected.len() * dim;
-                    let contribs = &mut s.moe_contribs[..contribs_len];
-
-                    let per_expert = contribs
-                        .par_chunks_mut(dim)
-                        .zip(routed_selected.par_iter())
-                        .map_init(
-                            || {
-                                (
-                                    vec![0.0f32; expert_hidden],
-                                    vec![0.0f32; expert_hidden],
-                                    MatmulActivationScratch::new(),
-                                )
-                            },
-                            |(hb_local, hb2_local, local_matmul_scratch),
-                             (contrib, &(expert_idx, route_weight))|
-                             -> Result<(), String> {
-                                let row_start_ffn = expert_idx * expert_hidden;
-                                matmul_quantized_rows_with_scratch(
-                                    &mut hb_local[..expert_hidden],
-                                    xb2,
-                                    gate_exps,
-                                    row_start_ffn,
-                                    expert_hidden,
-                                    mapped,
-                                    local_matmul_scratch,
-                                )?;
-                                matmul_quantized_rows_with_scratch(
-                                    &mut hb2_local[..expert_hidden],
-                                    xb2,
-                                    up_exps,
-                                    row_start_ffn,
-                                    expert_hidden,
-                                    mapped,
-                                    local_matmul_scratch,
-                                )?;
-                                silu_and_mul_inplace(
-                                    &mut hb_local[..expert_hidden],
-                                    &hb2_local[..expert_hidden],
-                                );
-
-                                let row_start_down = expert_idx * dim;
-                                matmul_quantized_rows_with_scratch(
-                                    contrib,
-                                    &hb_local[..expert_hidden],
-                                    down_exps,
-                                    row_start_down,
-                                    dim,
-                                    mapped,
-                                    local_matmul_scratch,
-                                )?;
-                                for v in contrib {
-                                    *v *= route_weight;
-                                }
-                                Ok(())
-                            },
-                        )
-                        .collect::<Vec<_>>();
-
-                    for item in per_expert {
-                        item?;
-                    }
-
-                    s.xb[..dim].fill(0.0);
-                    for contrib in contribs.chunks(dim) {
-                        crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], 1.0, contrib);
-                    }
-                } else {
-                    for &(expert_idx, route_weight) in &routed_selected {
-                        let row_start_ffn = expert_idx * expert_hidden;
-                        matmul_quantized_rows_with_scratch(
-                            &mut s.hb[..expert_hidden],
-                            &s.xb2[..dim],
-                            &w.moe_gate_exps[l],
-                            row_start_ffn,
-                            expert_hidden,
-                            mapped,
-                            &mut matmul_scratch,
-                        )?;
-                        matmul_quantized_rows_with_scratch(
-                            &mut s.hb2[..expert_hidden],
-                            &s.xb2[..dim],
-                            &w.moe_up_exps[l],
-                            row_start_ffn,
-                            expert_hidden,
-                            mapped,
-                            &mut matmul_scratch,
-                        )?;
-
-                        silu_and_mul_inplace(&mut s.hb[..expert_hidden], &s.hb2[..expert_hidden]);
-
-                        let row_start_down = expert_idx * dim;
-                        matmul_quantized_rows_with_scratch(
-                            &mut s.moe_tmp[..dim],
-                            &s.hb[..expert_hidden],
-                            &w.moe_down_exps[l],
-                            row_start_down,
-                            dim,
-                            mapped,
-                            &mut matmul_scratch,
-                        )?;
-                        crate::engine::kernels::axpy_inplace(
-                            &mut s.xb[..dim],
-                            route_weight,
-                            &s.moe_tmp[..dim],
-                        );
-                    }
-                }
-            }
-
-            if p.is_qwen3next && !disable_shared && !w.moe_shared_gate_inp.is_empty() {
-                let shared_hidden = if p.shared_expert_hidden_dim > 0 {
-                    p.shared_expert_hidden_dim
-                } else {
-                    p.expert_hidden_dim
-                };
-                let shared_gate = &w.moe_shared_gate_inp[l * dim..(l + 1) * dim];
-                let gate_logit = dot_f32_simd(&s.xb2[..dim], shared_gate);
-                let gate = 1.0 / (1.0 + (-gate_logit).exp());
-
-                if all_prepared_activation_supported(&[&w.w1[l], &w.w3[l]]) {
-                    if let Some(prepared) =
-                        prepare_matmul_activation(&s.xb2[..dim], &w.w1[l], &mut matmul_scratch)
-                    {
-                        matmul_quantized_with_prepared_activation(
-                            &mut s.hb[..shared_hidden],
-                            &prepared,
-                            &w.w1[l],
-                            mapped,
-                        )?;
-                        matmul_quantized_with_prepared_activation(
-                            &mut s.hb2[..shared_hidden],
-                            &prepared,
-                            &w.w3[l],
-                            mapped,
-                        )?;
-                    } else {
-                        matmul_quantized_with_scratch(
-                            &mut s.hb[..shared_hidden],
-                            &s.xb2[..dim],
-                            &w.w1[l],
-                            mapped,
-                            &mut matmul_scratch,
-                        )?;
-                        matmul_quantized_with_scratch(
-                            &mut s.hb2[..shared_hidden],
-                            &s.xb2[..dim],
-                            &w.w3[l],
-                            mapped,
-                            &mut matmul_scratch,
-                        )?;
-                    }
-                } else {
-                    matmul_quantized_with_scratch(
-                        &mut s.hb[..shared_hidden],
-                        &s.xb2[..dim],
-                        &w.w1[l],
-                        mapped,
-                        &mut matmul_scratch,
-                    )?;
-                    matmul_quantized_with_scratch(
-                        &mut s.hb2[..shared_hidden],
-                        &s.xb2[..dim],
-                        &w.w3[l],
-                        mapped,
-                        &mut matmul_scratch,
-                    )?;
-                }
-                silu_and_mul_inplace(&mut s.hb[..shared_hidden], &s.hb2[..shared_hidden]);
-                matmul_quantized_with_scratch(
-                    &mut s.moe_tmp[..dim],
-                    &s.hb[..shared_hidden],
-                    &w.w2[l],
-                    mapped,
-                    &mut matmul_scratch,
-                )?;
-                crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], gate, &s.moe_tmp[..dim]);
-            }
-            prof_end(&PROF_MOE_NS, moe_prof);
-        } else {
-            let ffn_prof = prof_start();
-            if all_prepared_activation_supported(&[&w.w1[l], &w.w3[l]]) {
-                if let Some(prepared) =
-                    prepare_matmul_activation(&s.xb[..dim], &w.w1[l], &mut matmul_scratch)
-                {
-                    matmul_quantized_with_prepared_activation(
-                        &mut s.hb[..hidden_dim],
-                        &prepared,
-                        &w.w1[l],
-                        mapped,
-                    )?;
-                    matmul_quantized_with_prepared_activation(
-                        &mut s.hb2[..hidden_dim],
-                        &prepared,
-                        &w.w3[l],
-                        mapped,
-                    )?;
-                } else {
-                    matmul_quantized_with_scratch(
-                        &mut s.hb[..hidden_dim],
-                        &s.xb[..dim],
-                        &w.w1[l],
-                        mapped,
-                        &mut matmul_scratch,
-                    )?;
-                    matmul_quantized_with_scratch(
-                        &mut s.hb2[..hidden_dim],
-                        &s.xb[..dim],
-                        &w.w3[l],
-                        mapped,
-                        &mut matmul_scratch,
-                    )?;
-                }
-            } else {
-                matmul_quantized_with_scratch(
-                    &mut s.hb[..hidden_dim],
-                    &s.xb[..dim],
-                    &w.w1[l],
-                    mapped,
-                    &mut matmul_scratch,
-                )?;
-                matmul_quantized_with_scratch(
-                    &mut s.hb2[..hidden_dim],
-                    &s.xb[..dim],
-                    &w.w3[l],
-                    mapped,
-                    &mut matmul_scratch,
-                )?;
-            }
-
-            if p.is_gemma3 {
-                for i in 0..hidden_dim {
-                    let x = s.hb[i];
-                    let gelu =
-                        0.5 * x * (1.0 + (0.797_884_6 * x * (1.0 + 0.044_715 * x * x)).tanh());
-                    s.hb[i] = gelu * s.hb2[i];
-                }
-            } else {
-                silu_and_mul_inplace(&mut s.hb[..hidden_dim], &s.hb2[..hidden_dim]);
-            }
-
-            matmul_quantized_with_scratch(
-                &mut s.xb[..dim],
-                &s.hb[..hidden_dim],
-                &w.w2[l],
-                mapped,
-                &mut matmul_scratch,
-            )?;
-            prof_end(&PROF_FFN_NS, ffn_prof);
-        }
-
-        if p.is_bert_family {
-            // Post-norm: residual first, then LayerNorm in-place on x.
-            accum(&mut s.x[..dim], &s.xb[..dim], dim);
-            layernorm_inplace(
-                &mut s.x[..dim],
-                &w.ffn_post_norm[l * dim..(l + 1) * dim],
-                &w.ffn_post_norm_bias[l * dim..(l + 1) * dim],
-                dim,
-                eps,
-            );
-        } else {
-            if p.is_gemma3 && !w.ffn_post_norm.is_empty() {
-                rmsnorm_inplace(
-                    &mut s.xb[..dim],
-                    &w.ffn_post_norm[l * dim..(l + 1) * dim],
-                    dim,
-                    eps,
-                );
-            }
-            accum(&mut s.x[..dim], &s.xb[..dim], dim);
-        }
-
-        if do_layer_debug {
-            eprintln!(
-                "[LAYERDBG pos={pos} l={l}] post_ffn_norm={:.4} x_norm={:.4}",
-                l2_norm(&s.xb[..dim]),
-                l2_norm(&s.x[..dim]),
-            );
-        }
+        layer_after_attention(p, s, w, mapped, &mut matmul_scratch, l, pos, do_layer_debug)?;
 
         if let Some(ds) = deepstack_embedding
             && l < p.n_deepstack_layers
@@ -3934,38 +4076,7 @@ fn transformer_inner(
         return Ok(());
     }
 
-    if !p.is_bert_family {
-        rmsnorm_inplace(&mut s.x[..dim], &w.rms_final_weight[..dim], dim, eps);
-    }
-    sanitize_finite_inplace(&mut s.x[..dim]);
-
-    if w.wcls_is_embed {
-        matmul_f32_embeddings(
-            &mut s.logits[..p.vocab_size],
-            &s.x[..dim],
-            &w.token_embedding_table,
-            p.vocab_size,
-            dim,
-        );
-    } else {
-        matmul_quantized_with_scratch(
-            &mut s.logits[..p.vocab_size],
-            &s.x[..dim],
-            &w.wcls,
-            mapped,
-            &mut matmul_scratch,
-        )?;
-    }
-    sanitize_finite_inplace(&mut s.logits[..p.vocab_size]);
-
-    if p.is_gemma3 && p.final_logit_softcapping > 0.0 {
-        let cap = p.final_logit_softcapping;
-        for i in 0..p.vocab_size {
-            s.logits[i] = cap * (s.logits[i] / cap).tanh();
-        }
-    }
-
-    Ok(())
+    finish_logits(p, s, w, mapped, &mut matmul_scratch)
 }
 
 #[cfg(test)]
@@ -3983,6 +4094,41 @@ mod tests {
         Config, KvCacheFormat, ModelCapabilities, QuantizedTensor, RopePositionLayout,
         RopePositionPlan, TransformerWeights,
     };
+
+    #[test]
+    fn rope_scaling_switches_local_and_global_layers_at_the_same_position() {
+        let (mut config, _, _) = qwen3next_dense_test_fixture(true);
+        config.is_qwen3next = false;
+        config.is_qwen35 = false;
+        config.n_layers = 2;
+        config.attention_policy.layer_windows = vec![Some(1024), None];
+        config.rope_scaling.global = 0.125;
+        let mut state = malloc_run_state(&config).unwrap();
+        for (layer, angle) in [(0, 8.0f32), (1, 1.0), (0, 8.0)] {
+            state.q.fill(0.0);
+            state.k.fill(0.0);
+            state.q[0] = 1.0;
+            state.k[0] = 1.0;
+            super::apply_rope_qk(&config, &mut state, layer, 8);
+            for values in [&state.q, &state.k] {
+                assert!((values[0] - angle.cos()).abs() < 1e-7);
+                assert!((values[1] - angle.sin()).abs() < 1e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn rope_scaling_rejects_invalid_runtime_policies() {
+        let (mut config, _, _) = qwen3next_dense_test_fixture(true);
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            config.rope_scaling.global = scale;
+            config.rope_scaling.local = 1.0;
+            assert!(malloc_run_state(&config).is_err());
+            config.rope_scaling.global = 1.0;
+            config.rope_scaling.local = scale;
+            assert!(malloc_run_state(&config).is_err());
+        }
+    }
 
     #[test]
     fn image_rope_rotates_reference_axes_and_preserves_partial_rope_tail() {
@@ -4211,6 +4357,8 @@ mod tests {
             rope_dim: dim,
             rope_sections: [0; 4],
             rope_position_layout: Default::default(),
+            rope_scaling: Default::default(),
+            attention_policy: Default::default(),
             is_bert_family: false,
             is_gemma3: false,
             is_smolvlm: false,

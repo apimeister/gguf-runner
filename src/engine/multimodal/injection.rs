@@ -1,4 +1,4 @@
-use crate::engine::types::{EncodedPrompt, PlaceholderSpan, RopePositionPlan};
+use crate::engine::types::{EncodedPrompt, MediaAttentionBlock, PlaceholderSpan, RopePositionPlan};
 use std::collections::HashMap;
 
 pub(crate) type PrefillEmbeddingMap = HashMap<usize, Vec<f32>>;
@@ -15,6 +15,7 @@ pub(crate) struct ExpandedMediaPrompt {
     pub(crate) token_ids: Vec<i32>,
     pub(crate) embeddings: PrefillEmbeddingMap,
     pub(crate) position_plan: Option<RopePositionPlan>,
+    pub(crate) image_blocks: Vec<MediaAttentionBlock>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,8 +255,24 @@ pub(crate) fn expand_prompt_with_media_embeddings(
     audio_embeddings: &[MediaEmbeddingSequence],
     expected_embedding_dim: usize,
 ) -> Result<ExpandedMediaPrompt, String> {
-    validate_embedding_dimensions(MediaKind::Image, image_embeddings, expected_embedding_dim)?;
-    validate_embedding_dimensions(MediaKind::Audio, audio_embeddings, expected_embedding_dim)?;
+    expand_prompt_with_owned_media_embeddings(
+        encoded,
+        image_embeddings.to_vec(),
+        audio_embeddings.to_vec(),
+        expected_embedding_dim,
+    )
+}
+
+/// Transfer rows into the injection map without duplicating retained projected
+/// payload. Borrowed callers keep the existing copying API above.
+pub(crate) fn expand_prompt_with_owned_media_embeddings(
+    encoded: &EncodedPrompt,
+    image_embeddings: Vec<MediaEmbeddingSequence>,
+    audio_embeddings: Vec<MediaEmbeddingSequence>,
+    expected_embedding_dim: usize,
+) -> Result<ExpandedMediaPrompt, String> {
+    validate_embedding_dimensions(MediaKind::Image, &image_embeddings, expected_embedding_dim)?;
+    validate_embedding_dimensions(MediaKind::Audio, &audio_embeddings, expected_embedding_dim)?;
     let image_token_counts = image_embeddings
         .iter()
         .map(|sequence| sequence.tokens.len())
@@ -270,17 +287,22 @@ pub(crate) fn expand_prompt_with_media_embeddings(
     let mut injected_embeddings = PrefillEmbeddingMap::new();
     let mut position_plan = image_embeddings
         .iter()
-        .chain(audio_embeddings)
+        .chain(&audio_embeddings)
         .any(|sequence| sequence.grid.is_some())
         .then(RopePositionPlan::default);
     let mut source_cursor = 0usize;
+    let mut image_blocks = Vec::with_capacity(image_embeddings.len());
+    let mut image_embeddings = image_embeddings.into_iter().map(Some).collect::<Vec<_>>();
+    let mut audio_embeddings = audio_embeddings.into_iter().map(Some).collect::<Vec<_>>();
 
     for plan in plans {
         out_tokens.extend_from_slice(&encoded.token_ids[source_cursor..plan.span.token_start]);
         let sequence = match plan.kind {
-            MediaKind::Image => &image_embeddings[plan.span.media_index],
-            MediaKind::Audio => &audio_embeddings[plan.span.media_index],
-        };
+            MediaKind::Image => &mut image_embeddings[plan.span.media_index],
+            MediaKind::Audio => &mut audio_embeddings[plan.span.media_index],
+        }
+        .take()
+        .expect("ordered media plan validates unique sequence ownership");
 
         if let Some(positions) = &mut position_plan {
             positions.append_text(plan.span.token_start - source_cursor)?;
@@ -297,20 +319,27 @@ pub(crate) fn expand_prompt_with_media_embeddings(
             }
         }
 
+        if plan.kind == MediaKind::Image {
+            image_blocks.push(MediaAttentionBlock {
+                token_start: out_tokens.len() + usize::from(!plan.span.replace_marker),
+                token_len: sequence.tokens.len(),
+                media_index: plan.span.media_index,
+            });
+        }
         if plan.span.replace_marker {
             let placeholder = encoded.token_ids[plan.span.token_start];
-            for embedding in &sequence.tokens {
+            for embedding in sequence.tokens {
                 let destination = out_tokens.len();
                 out_tokens.push(placeholder);
-                injected_embeddings.insert(destination, embedding.clone());
+                injected_embeddings.insert(destination, embedding);
             }
         } else {
             let (begin, placeholder, end) = marker_tokens(encoded, plan.span);
             out_tokens.push(begin);
-            for embedding in &sequence.tokens {
+            for embedding in sequence.tokens {
                 let destination = out_tokens.len();
                 out_tokens.push(placeholder);
-                injected_embeddings.insert(destination, embedding.clone());
+                injected_embeddings.insert(destination, embedding);
             }
             out_tokens.push(end);
         }
@@ -327,6 +356,7 @@ pub(crate) fn expand_prompt_with_media_embeddings(
         token_ids: out_tokens,
         embeddings: injected_embeddings,
         position_plan,
+        image_blocks,
     })
 }
 
@@ -376,6 +406,15 @@ mod tests {
         assert_eq!(expanded.embeddings[&3], [2.0, -2.0]);
         assert_eq!(expanded.embeddings[&7], [3.0, -3.0]);
         assert!(expanded.position_plan.is_none());
+        assert_eq!(expanded.image_blocks.len(), 1);
+        assert_eq!(
+            (
+                expanded.image_blocks[0].token_start,
+                expanded.image_blocks[0].token_len
+            ),
+            (7, 1)
+        );
+        assert_eq!(expanded.image_blocks[0].media_index, 0);
     }
 
     #[test]
@@ -395,6 +434,14 @@ mod tests {
         assert_eq!(
             expanded.token_ids,
             [10, 20, 21, 21, 21, 21, 21, 21, 22, 30, 40, 41, 41, 42, 50]
+        );
+        assert_eq!(
+            expanded
+                .image_blocks
+                .iter()
+                .map(|block| (block.token_start, block.token_len, block.media_index))
+                .collect::<Vec<_>>(),
+            [(2, 6, 0), (11, 2, 1)]
         );
         let positions = expanded.position_plan.unwrap();
         assert_eq!(

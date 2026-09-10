@@ -1,13 +1,14 @@
 // Items in this module are used by the binary crate. When the library crate is linted
 // in isolation (cargo clippy without --bin) they appear unused because the lib only
 // exports EmbeddedRuntime and does not re-export binary-only code.
-#![allow(dead_code)]
 
 use super::{
     ChatMessage, VendorDecodePolicy, VendorDetailCropPolicy, VendorMultimodalPolicy,
     VendorRuntimeDebugPolicy, VendorTokenizerPolicy, qwen_common,
 };
-use crate::engine::types::{Config, EncodedPrompt, GenerationRequest, ThinkMode, Tokenizer};
+use crate::engine::types::{
+    Config, EncodedPrompt, GenerationRequest, ImageViewPolicy, ThinkMode, Tokenizer,
+};
 
 fn qwen35_detail_crop_enabled() -> bool {
     matches!(
@@ -50,6 +51,9 @@ pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
 
 pub(super) fn multimodal_policy() -> VendorMultimodalPolicy {
     VendorMultimodalPolicy {
+        image_view_prompt: None,
+        image_view_policy: ImageViewPolicy::OverviewOnly,
+        image_stretch_filter: Default::default(),
         image_prompt_suffix: "\nPlease avoid guessing uncertain details. If text is unclear, explicitly say it is unreadable.",
         detail_crop: VendorDetailCropPolicy {
             enabled: qwen35_detail_crop_enabled(),
@@ -126,6 +130,8 @@ mod tests {
             rope_dim: 0,
             rope_sections: [0; 4],
             rope_position_layout: Default::default(),
+            rope_scaling: Default::default(),
+            attention_policy: Default::default(),
             is_bert_family: false,
             is_gemma3: false,
             is_qwen2: false,

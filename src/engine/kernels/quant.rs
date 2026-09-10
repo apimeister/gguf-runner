@@ -8715,7 +8715,6 @@ pub(crate) fn matmul_quantized_batch_with_scratch(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn matmul_quantized_batch(
     out: &mut [f32],      // [m × n_rows]
     inp: &[f32],          // [m × n_cols]
@@ -10054,7 +10053,9 @@ fn matmul_quantized_batch_bf16_bfmmla(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn matmul_quantized_batch_dequantized(
+/// Dequantized weights with F32 activations. The encoder's diagnostic control
+/// calls this directly; production float batching narrows activations first.
+pub(crate) fn matmul_quantized_batch_dequantized(
     out: &mut [f32],
     inp: &[f32],
     qw: &QuantizedTensor,

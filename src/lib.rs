@@ -5,6 +5,9 @@ mod rag;
 mod tools;
 mod vendors;
 
+/// CLI entry point, used by the `gguf-runner` binary.
+pub use app::run;
+
 pub use app::embed::{
     AudioTranscriptionResult, EmbeddedRuntime, GenerationStats, Tool,
     build_tool_system_prompt_from_specs,

@@ -1,12 +1,14 @@
 use crate::engine::io::{get_gguf_bool_from_map, get_gguf_int_from_map, get_gguf_string_from_map};
 use crate::engine::types::{
-    Config, GGUFFile, GgufValue, LLAMA3_BOS_TOKEN, LLAMA3_END_HEADER, LLAMA3_EOS_TOKEN, LLAMA3_EOT,
-    LLAMA3_START_HEADER, Tokenizer, TokenizerPreType, VendorTokenizerPolicy,
+    Config, GGUFFile, GgufValue, LLAMA3_BOS_TOKEN, LLAMA3_EOS_TOKEN, LLAMA3_EOT, Tokenizer,
+    TokenizerPreType, VendorTokenizerPolicy,
 };
 use fancy_regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::OnceLock;
+
+mod sentencepiece;
 
 fn tiktoken_decode_map() -> [i16; 512] {
     let mut map = [-1i16; 512];
@@ -107,6 +109,28 @@ fn text_to_sentencepiece(text: &str) -> String {
     out
 }
 
+/// GPT-2's `\s+(?!\S)|\s+`: before non-whitespace, a run of two or
+/// more whitespace characters leaves its last character for the next piece.
+/// A single ASCII space may instead prefix a word/number/punctuation piece.
+fn gpt2_whitespace_end(text: &str, start: usize) -> Option<usize> {
+    let mut chars = text[start..].char_indices();
+    let (_, first) = chars.next()?;
+    if !first.is_whitespace() {
+        return None;
+    }
+    let mut last = start;
+    for (offset, ch) in chars {
+        if !ch.is_whitespace() {
+            if last > start {
+                return Some(last);
+            }
+            return (first != ' ').then_some(start + offset);
+        }
+        last = start + offset;
+    }
+    Some(text.len())
+}
+
 #[cfg(test)]
 fn split_gpt2_pieces(text: &str) -> Vec<String> {
     fn contraction_len(s: &str, idx: usize) -> usize {
@@ -150,48 +174,18 @@ fn split_gpt2_pieces(text: &str) -> Vec<String> {
             None => break,
         };
 
-        if c0.is_whitespace() && c0 != ' ' {
+        if let Some(end) = gpt2_whitespace_end(text, i) {
             let start = i;
-            i += c0_len;
-            while i < len {
-                if let Some((c, clen)) = next_char(text, i) {
-                    if c.is_whitespace() && c != ' ' {
-                        i += clen;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
+            i = end;
             out.push(text[start..i].to_string());
             continue;
         }
 
         if c0 == ' ' {
-            let mut j = i + c0_len;
+            let j = i + c0_len;
             if j >= len {
                 out.push(" ".to_string());
                 break;
-            }
-            if let Some((c1, _)) = next_char(text, j)
-                && c1.is_whitespace()
-            {
-                let start = i;
-                while j < len {
-                    if let Some((c, clen)) = next_char(text, j) {
-                        if c.is_whitespace() {
-                            j += clen;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                out.push(text[start..j].to_string());
-                i = j;
-                continue;
             }
 
             let start = i;
@@ -305,48 +299,18 @@ where
             None => break,
         };
 
-        if c0.is_whitespace() && c0 != ' ' {
+        if let Some(end) = gpt2_whitespace_end(text, i) {
             let start = i;
-            i += c0_len;
-            while i < len {
-                if let Some((c, clen)) = next_char(text, i) {
-                    if c.is_whitespace() && c != ' ' {
-                        i += clen;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
+            i = end;
             f(&text[start..i]);
             continue;
         }
 
         if c0 == ' ' {
-            let mut j = i + c0_len;
+            let j = i + c0_len;
             if j >= len {
                 f(" ");
                 break;
-            }
-            if let Some((c1, _)) = next_char(text, j)
-                && c1.is_whitespace()
-            {
-                let start = i;
-                while j < len {
-                    if let Some((c, clen)) = next_char(text, j) {
-                        if c.is_whitespace() {
-                            j += clen;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                f(&text[start..j]);
-                i = j;
-                continue;
             }
 
             let start = i;
@@ -891,6 +855,10 @@ impl Tokenizer {
         }
 
         if self.use_sentencepiece {
+            if self.sentencepiece_no_space_prefix {
+                sentencepiece::encode_without_prefix(self, text, tokens);
+                return;
+            }
             let encoded_text = text_to_sentencepiece(text);
 
             let mut work: Vec<i32> = Vec::with_capacity(encoded_text.len());
@@ -955,6 +923,9 @@ impl Tokenizer {
         }
         let raw = &self.vocab[token_id as usize];
         if self.use_sentencepiece {
+            if let Some(byte) = sentencepiece::byte_token(raw) {
+                return Some(vec![byte]);
+            }
             Some(decode_sentencepiece(raw).into_bytes())
         } else {
             Some(decode_tiktoken_bytes(raw))
@@ -972,41 +943,59 @@ pub(crate) fn init_tokenizer_from_gguf(
         return Err("no vocabulary found in GGUF file".to_string());
     }
 
-    let mut tokenizer = Tokenizer::default();
-    tokenizer.pre_tokenizer = match get_gguf_string_from_map(&gguf.kv, "tokenizer.ggml.pre") {
-        Some("qwen2") | Some("megrez") => TokenizerPreType::Qwen2,
-        Some("qwen35") => TokenizerPreType::Qwen35,
-        _ => TokenizerPreType::Gpt2,
-    };
-    tokenizer.bos_token = match gguf.kv.get("tokenizer.ggml.bos_token_id") {
-        Some(GgufValue::UInt(v)) => *v as i32,
-        Some(GgufValue::Int(v)) => *v as i32,
-        _ => -1,
-    };
-    tokenizer.skip_bos_token =
-        !get_gguf_bool_from_map(&gguf.kv, "tokenizer.ggml.add_bos_token", true);
-    tokenizer.eos_token = get_gguf_int_from_map(
-        &gguf.kv,
-        "tokenizer.ggml.eos_token_id",
-        LLAMA3_EOS_TOKEN as i64,
-    ) as i32;
-    tokenizer.start_header_token = LLAMA3_START_HEADER;
-    tokenizer.end_header_token = LLAMA3_END_HEADER;
-    // Resolve end-of-turn token via vendor policy first, then fallback to Llama-style `<|eot_id|>`.
-    tokenizer.eot_token = policy
-        .end_turn_token_literals
-        .iter()
-        .find_map(|token| gguf.vocab_tokens.iter().position(|s| s == *token))
-        .map(|i| i as i32)
-        .or_else(|| {
-            gguf.vocab_tokens
-                .iter()
-                .position(|s| s == "<|eot_id|>")
-                .map(|i| i as i32)
-        })
-        .unwrap_or(LLAMA3_EOT);
+    let mut tokenizer = Tokenizer {
+        pre_tokenizer: match get_gguf_string_from_map(&gguf.kv, "tokenizer.ggml.pre") {
+            Some("qwen2") | Some("megrez") => TokenizerPreType::Qwen2,
+            Some("qwen35") => TokenizerPreType::Qwen35,
+            _ => TokenizerPreType::Gpt2,
+        },
+        bos_token: match gguf.kv.get("tokenizer.ggml.bos_token_id") {
+            Some(GgufValue::UInt(v)) => *v as i32,
+            Some(GgufValue::Int(v)) => *v as i32,
+            _ => -1,
+        },
+        skip_bos_token: !get_gguf_bool_from_map(&gguf.kv, "tokenizer.ggml.add_bos_token", true),
+        sentencepiece_no_space_prefix: !get_gguf_bool_from_map(
+            &gguf.kv,
+            "tokenizer.ggml.add_space_prefix",
+            true,
+        ),
+        eos_token: get_gguf_int_from_map(
+            &gguf.kv,
+            "tokenizer.ggml.eos_token_id",
+            LLAMA3_EOS_TOKEN as i64,
+        ) as i32,
+        // Resolve end-of-turn token via vendor policy first, then fallback to Llama-style `<|eot_id|>`.
+        eot_token: policy
+            .end_turn_token_literals
+            .iter()
+            .find_map(|token| gguf.vocab_tokens.iter().position(|s| s == *token))
+            .map(|i| i as i32)
+            .or_else(|| {
+                gguf.vocab_tokens
+                    .iter()
+                    .position(|s| s == "<|eot_id|>")
+                    .map(|i| i as i32)
+            })
+            .unwrap_or(LLAMA3_EOT),
 
-    tokenizer.vocab = gguf.vocab_tokens.clone();
+        vocab: gguf.vocab_tokens.clone(),
+        ..Tokenizer::default()
+    };
+    if let Some(GgufValue::I64Array(types)) = gguf.kv.get("tokenizer.ggml.token_type") {
+        if types.len() != tokenizer.vocab.len() {
+            return Err("tokenizer token-type count differs from vocabulary size".to_string());
+        }
+        tokenizer.sentencepiece_user_defined = types
+            .iter()
+            .enumerate()
+            .filter(|(_, token_type)| **token_type == 4)
+            .map(|(index, _)| index as i32)
+            .collect();
+        tokenizer
+            .sentencepiece_user_defined
+            .sort_by_key(|&id| std::cmp::Reverse(tokenizer.vocab[id as usize].len()));
+    }
     tokenizer.vocab_size = tokenizer.vocab.len();
     tokenizer.max_token_length = tokenizer
         .vocab
@@ -1380,11 +1369,11 @@ mod tests {
             bos_token: -1,
             skip_bos_token: false,
             eos_token: -1,
-            start_header_token: -1,
-            end_header_token: -1,
             eot_token: -1,
             pre_tokenizer: TokenizerPreType::Gpt2,
             use_sentencepiece: false,
+            sentencepiece_no_space_prefix: false,
+            sentencepiece_user_defined: Vec::new(),
             token_to_id: HashMap::new(),
             merges: merges
                 .iter()
@@ -1428,11 +1417,11 @@ mod tests {
             bos_token: -1,
             skip_bos_token: false,
             eos_token: -1,
-            start_header_token: -1,
-            end_header_token: -1,
             eot_token: -1,
             pre_tokenizer: TokenizerPreType::Gpt2,
             use_sentencepiece: true,
+            sentencepiece_no_space_prefix: false,
+            sentencepiece_user_defined: Vec::new(),
             token_to_id: HashMap::new(),
             merges: Vec::new(),
             merge_ranks: HashMap::new(),

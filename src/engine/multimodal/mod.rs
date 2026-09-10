@@ -16,7 +16,8 @@ use crate::engine::types::{
 };
 use crate::engine::vision::PreparedImageTensor;
 pub(crate) use injection::{
-    MediaEmbeddingSequence, expand_prompt_with_media_embeddings, preflight_media_context,
+    ExpandedMediaPrompt, MediaEmbeddingSequence, expand_prompt_with_media_embeddings,
+    expand_prompt_with_owned_media_embeddings, preflight_media_context,
 };
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 #[cfg(target_os = "macos")]
@@ -390,7 +391,6 @@ fn encoder_self_attention_accelerate(
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct AudioEncoderFrontendOutput {
     pub(crate) token_count: usize,
     pub(crate) embedding_dim: usize,
@@ -419,6 +419,7 @@ impl AudioEncoder {
         }
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_conv_frontend(
         &self,
@@ -429,6 +430,7 @@ impl AudioEncoder {
         }
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_transformer_frontend(
         &self,
@@ -439,7 +441,6 @@ impl AudioEncoder {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn encode_feature_window(
         &self,
         window: &PreparedAudioFeatureWindow,
@@ -449,6 +450,7 @@ impl AudioEncoder {
         }
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_from_conv_output(
         &self,
@@ -459,6 +461,7 @@ impl AudioEncoder {
         }
     }
 
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
     #[allow(dead_code)]
     pub(crate) fn encode_from_conv_output_with_layers(
         &self,
@@ -516,6 +519,18 @@ impl VisionEncoder {
             VisionEncoder::Gemma3(enc) => enc.recommended_image_normalization(),
             VisionEncoder::Qwen3Vl(enc) => enc.recommended_image_normalization(),
             VisionEncoder::Idefics3(enc) => enc.recommended_image_normalization(),
+        }
+    }
+
+    /// Tokens one prepared view projects to, needed to preflight a grouped
+    /// request before decoding pixels. Only backends with a grouped-view prompt
+    /// contract support this.
+    pub(crate) fn planned_view_tokens(&self, width: usize, height: usize) -> Result<usize, String> {
+        match self {
+            VisionEncoder::Gemma3(enc) => enc.planned_view_tokens(width, height),
+            VisionEncoder::Qwen3Vl(_) | VisionEncoder::Idefics3(_) => {
+                Err("vision backend does not support grouped image views".to_string())
+            }
         }
     }
 

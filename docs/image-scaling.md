@@ -60,12 +60,26 @@ The image is first scaled so the shorter edge equals the target, then center-cro
 ## Gemma3 — fixed SigLIP resolution
 
 Gemma3 multimodal models use the mmproj encoder `base_size` (typically 896 px) with a
-**Stretch** resize mode, matching llama.cpp Gemma3 preprocessing: direct bilinear resize to
-`base_size × base_size` without aspect-preserving fit or center-crop.
+**Stretch** resize mode: direct bilinear resize to `base_size × base_size` without
+aspect-preserving fit or center-crop. Vendor policy selects Pillow-compatible RGB8
+rounding, matching the pinned Transformers v5.2.0 processor. This corrects
+one-byte differences from the previous triangle filter and can change model outputs.
+It does not imply pixel identity with llama.cpp's separate resize implementation.
 
-The [Gemma3 pan-and-scan implementation plan](gemma3-pan-and-scan-plan.md) describes
-proposed cropped-view support, prerequisite correctness work, reference material,
-and validation gates for later execution.
+The crop planner, grouped preparation/encoding contracts, and internal request
+prompt/context/resource preflight are implemented, along with the image-block
+attention and RGB preprocessing prerequisites. None of it is connected to
+inference: cropped-view inference is not exposed yet, and the current image path
+still produces one view.
+
+Gemma3 language attention now also honors GGUF linear RoPE scaling in global layers
+while leaving local layers unscaled. This separate positional correction can change
+text and image outputs; it does not change image dimensions or crop selection.
+
+The Gemma3 encoder now preserves the local llama.cpp CPU arithmetic boundaries
+from patch convolution through projected embeddings. The supplied 4B QAT/BF16
+projector was compared stage by stage with `examples/gemma3_encoder_dump.rs`.
+This is single-view encoder validation; pan and scan remains unavailable.
 
 ## Detail crop (Qwen3.5 small models only)
 

@@ -1,4 +1,7 @@
+mod bilinear;
+pub(crate) mod groups;
 mod preprocess;
+pub(crate) mod views;
 
 pub(crate) use preprocess::{
     ImageNormalization, ImagePreprocessProfile, ImageResizeMode, PreparedImageTensor,

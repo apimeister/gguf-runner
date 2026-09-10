@@ -17,6 +17,7 @@ Supported families:
 
 Currently unsupported:
 - DeepSeek architectures (`deepseek*` GGUF metadata)
+- Gemma4 (`gemma4` and its `gemma4v`/`gemma4a` projectors)
 
 ## Speaker Recognition
 
@@ -48,6 +49,11 @@ Supported tensor data paths include:
   each expanded weight row across a token batch, while BF16 packs activations once and uses native
   2-token x 2-row `BFMMLA` tiles on compatible AArch64 hosts (including Apple M5), with `BFDOT` for
   odd edges and portable NEON widening/F32 FMA as the fallback; x86_64 uses AVX2 widening/FMA
+- Gemma3's BF16 vision matrices use widened F64 accumulation to preserve the pinned
+  llama.cpp CPU rounding contract through successive layers. Its patch/projector
+  half operands, normalization, GELU, and attention follow that same CPU reference.
+  This correctness path supersedes the shared BF16 fast kernel for Gemma3 only;
+  its performance has not been benchmarked.
 - `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`
 - `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`
 - `IQ4_NL`
@@ -57,12 +63,16 @@ Supported tensor data paths include:
 - GGUF parsing from local files
 - Linux mmap memory-advice hints for mapped model pages (best-effort)
 - tokenizer initialization from GGUF vocab/metadata
+- explicit no-space-prefix SentencePiece metadata, user-defined whitespace pieces,
+  UTF-8 merging, and byte fallback, checked against the supplied Gemma3 tokenizer
 - model-family-specific chat prompt rendering
 - multimodal request/model capability scaffolding for Gemma3, Qwen3-VL, and Qwen3.5:
   - startup capability probe for native image/video/audio support (token + tensor checks)
-  - shared full self-attention for Qwen3-VL/Qwen3.5, Gemma3, Idefics3, and Qwen3-ASR encoders;
+  - shared full self-attention for Qwen3-VL/Qwen3.5, Idefics3, and Qwen3-ASR encoders;
     macOS evaluates bounded query blocks with Accelerate SGEMM and vForce softmax while the portable
     path retains online softmax, and each image in a microbatch remains an independent sequence
+  - Gemma3 uses separate noncausal vision attention with the pinned llama.cpp CPU
+    reduction and softmax arithmetic
   - Qwen3-VL/Qwen3.5 vision M-RoPE coefficients are computed once per patch grid, reused across all
     vision layers and compatible images, and applied to token rows in parallel
   - llama-style local `mmproj*.gguf` sidecar auto-discovery/probe (no extra CLI flag)
@@ -83,6 +93,17 @@ Supported tensor data paths include:
   - media prompts prefill in batches: injected embeddings travel through `transformer_prefill_batch`
     as `PrefillInput::Embedding` rather than forcing the per-position loop. Deepstack models, whose
     embeddings carry a per-layer tail, keep the sequential path
+  - Gemma3 image blocks use a separate complete-block prefill path with bidirectional
+    attention within each image and vendor-selected local/global layer windows.
+    Matched-checkpoint validation and pan-and-scan crop integration remain open
+  - Gemma3 GGUF linear RoPE scaling applies to global attention only; the supplied
+    factor-8 checkpoint uses frequency multipliers `0.125` globally and `1` locally.
+    This corrects previously ignored metadata and can change both text and image outputs
+  - Gemma3 fixed-size RGB8 resizing follows the pinned processor's Pillow rounding
+    for both overview and crop views, with CHW normalization applied per profile
+  - Gemma3 one-view image prompts use the processor's blank lines and image-token slots;
+    grouped crop prompts and complete-request resource/context preflight are implemented
+    internally, with public crop settings and grouped batch/cache routing still pending
   - Qwen3Next/Qwen3.5 dense prefill batches the QKV, gate, and output projections around SSM layers;
     the recurrent state transition remains serial and causal across prompt positions
   - media expansion validates spans globally and refuses context overflow instead of truncating through embedding sequences

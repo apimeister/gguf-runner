@@ -1,3 +1,4 @@
+use super::image_request::{ImageRequestLimits, ImageRequestSettings, PlannedImageRequest};
 use crate::app::events::{
     RuntimeEvent, RuntimeEventCallback, RuntimePhase, RuntimeProgress, emit_runtime_event,
 };
@@ -14,8 +15,10 @@ use crate::engine::multimodal::{
 use crate::engine::profiling::{PROF_TRANSFORMER_NS, prof_end, prof_start, record_forward_pass};
 use crate::engine::types::{
     AudioEncoderBackend, AudioTranscriptionResult, Config, ContentPart, EncodedPrompt, GGUFFile,
-    GenerationRequest, MediaRef, MultimodalBackend, MultimodalWeights, PlaceholderSpan,
-    RopePositionPlan, ThinkMode, Tokenizer, TransformerWeights, XorShiftRng,
+    GenerationRequest, ImageAttentionMode, ImageOrientationPolicy, ImageSourceLimits,
+    ImageViewEncoding, ImageViewPolicy, MediaAttentionBlock, MediaAttentionPlan, MediaRef,
+    MultimodalBackend, MultimodalWeights, PlaceholderSpan, RopePositionPlan, ThinkMode, Tokenizer,
+    TransformerWeights, XorShiftRng,
 };
 use crate::engine::vision::{
     ImageNormalization, ImagePreprocessProfile, ImageResizeMode, load_video_chunk_tensors,
@@ -33,14 +36,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sampling parameters embedded in the GGUF file under `general.sampling.*`.
 /// These are model-provided defaults; explicit CLI flags take precedence.
-#[allow(dead_code)]
 struct GgufSamplingHints {
     temperature: Option<f32>,
     top_k: Option<usize>,
     top_p: Option<f32>,
 }
 
-#[allow(dead_code)]
 fn read_gguf_sampling_hints(gguf: &GGUFFile) -> GgufSamplingHints {
     use crate::engine::types::GgufValue;
     let get_f32 = |key: &str| -> Option<f32> {
@@ -1430,7 +1431,6 @@ pub(crate) struct GenerationSettings {
     pub(crate) repeat_last_n: usize,
     pub(crate) max_tokens: usize,
     pub(crate) profiling_mode: bool,
-    pub(crate) show_timings: bool,
     pub(crate) show_tokens: bool,
     pub(crate) debug_mode: bool,
     pub(crate) think_mode: ThinkMode,
@@ -2281,6 +2281,69 @@ impl ModelRuntime {
     }
 
     fn image_preprocess_profile(&self) -> ImagePreprocessProfile {
+        self.image_preprocess_profile_from_encoder()
+            .with_stretch_filter(self.settings.vendor_multimodal_policy.image_stretch_filter)
+    }
+
+    /// Grouped-view request budget. Mirrors the single-view caps so enabling
+    /// crops cannot admit a request the existing path would have rejected.
+    const GROUPED_IMAGE_MAX_SOURCES: usize = 10;
+    const GROUPED_IMAGE_MAX_VIEWS: usize = 40;
+    const GROUPED_IMAGE_MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
+    const GROUPED_IMAGE_MAX_PIXELS: usize = 64 * 1024 * 1024;
+    const GROUPED_IMAGE_MAX_PREPARE_BYTES: usize = 512 * 1024 * 1024;
+    const GROUPED_IMAGE_MAX_EMBEDDING_BYTES: usize = 512 * 1024 * 1024;
+    const GROUPED_IMAGE_MAX_PROMPT_BYTES: usize = 64 * 1024;
+
+    fn grouped_image_request_settings(
+        &self,
+        encoder: &VisionEncoder,
+    ) -> Result<ImageRequestSettings, String> {
+        let profile = self.image_preprocess_profile();
+        let tokens = encoder.planned_view_tokens(profile.target_width, profile.target_height)?;
+        Ok(ImageRequestSettings {
+            view_policy: self.settings.vendor_multimodal_policy.image_view_policy,
+            profile,
+            encoding: ImageViewEncoding {
+                width: profile.target_width as u32,
+                height: profile.target_height as u32,
+                tokens,
+                dimension: self.config.input_embedding_dim,
+                grid: None,
+            },
+            // The single-view path applies no EXIF transform; keep crops identical.
+            orientation: ImageOrientationPolicy::EncodedPixels,
+            source_limits: ImageSourceLimits {
+                max_file_bytes: Self::GROUPED_IMAGE_MAX_FILE_BYTES,
+                max_source_pixels: Self::GROUPED_IMAGE_MAX_PIXELS,
+                max_decoder_bytes: Self::GROUPED_IMAGE_MAX_PREPARE_BYTES,
+                max_prepare_bytes: Self::GROUPED_IMAGE_MAX_PREPARE_BYTES,
+                max_embedding_bytes: Self::GROUPED_IMAGE_MAX_EMBEDDING_BYTES,
+                max_views: Self::GROUPED_IMAGE_MAX_VIEWS,
+            },
+            limits: ImageRequestLimits {
+                max_sources: Self::GROUPED_IMAGE_MAX_SOURCES,
+                max_views: Self::GROUPED_IMAGE_MAX_VIEWS,
+                max_snapshot_bytes: Self::GROUPED_IMAGE_MAX_FILE_BYTES
+                    * Self::GROUPED_IMAGE_MAX_SOURCES,
+                max_prepare_bytes: Self::GROUPED_IMAGE_MAX_PREPARE_BYTES,
+                max_embedding_bytes: Self::GROUPED_IMAGE_MAX_EMBEDDING_BYTES,
+                max_prompt_bytes: Self::GROUPED_IMAGE_MAX_PROMPT_BYTES,
+                context_tokens: self.config.seq_len,
+                decode_reserve: self.media_decode_reserve(),
+            },
+        })
+    }
+
+    /// True when the vendor supplies a grouped-view prompt contract and its crop
+    /// policy asks for more than the single overview view.
+    fn grouped_image_request_enabled(&self) -> bool {
+        let policy = &self.settings.vendor_multimodal_policy;
+        policy.image_view_prompt.is_some()
+            && policy.image_view_policy != ImageViewPolicy::OverviewOnly
+    }
+
+    fn image_preprocess_profile_from_encoder(&self) -> ImagePreprocessProfile {
         let fallback_norm = ImageNormalization::MeanStd {
             mean: [0.48145466, 0.4578275, 0.40821073],
             std: [0.26862954, 0.261_302_6, 0.2757771],
@@ -2570,7 +2633,6 @@ impl ModelRuntime {
             repeat_last_n: 64,
             max_tokens,
             profiling_mode: false,
-            show_timings: false,
             show_tokens: false,
             debug_mode,
             think_mode: if config.qwen_chat_template_uses_empty_think {
@@ -2695,7 +2757,6 @@ impl ModelRuntime {
             repeat_last_n: 64,
             max_tokens,
             profiling_mode: false,
-            show_timings: false,
             show_tokens: false,
             debug_mode: false,
             think_mode: if config.qwen_chat_template_uses_empty_think {
@@ -2968,7 +3029,6 @@ impl ModelRuntime {
             repeat_last_n: cli.repeat_last_n,
             max_tokens,
             profiling_mode: cli.profiling,
-            show_timings: cli.show_timings,
             show_tokens: cli.show_tokens,
             debug_mode,
             think_mode: effective_think_mode,
@@ -3267,8 +3327,13 @@ impl ModelRuntime {
         }
 
         let prefill_injected_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
-        let output =
-            self.generate_from_prefill(prompt_tokens, prefill_injected_embeddings, None, false)?;
+        let output = self.generate_from_prefill(
+            prompt_tokens,
+            prefill_injected_embeddings,
+            None,
+            Vec::new(),
+            false,
+        )?;
         let request = GenerationRequest {
             system_prompt: system_prompt.to_string(),
             parts: vec![ContentPart::Text(
@@ -3313,10 +3378,6 @@ impl ModelRuntime {
 
     pub(crate) fn set_debug_mode(&mut self, enabled: bool) {
         self.settings.debug_mode = enabled;
-    }
-
-    pub(crate) fn set_show_tokens(&mut self, enabled: bool) {
-        self.settings.show_tokens = enabled;
     }
 
     pub(crate) fn set_temperature(&mut self, temperature: f32) {
@@ -3829,13 +3890,70 @@ impl ModelRuntime {
                 &self.config,
                 &effective_request,
                 self.settings.think_mode,
-            );
+            )?;
             self.validate_encoded_prompt_media_alignment(
                 &encoded_prompt,
                 images.len(),
                 videos.len(),
                 audios.len(),
             )?;
+
+            // Grouped (pan-and-scan) path: plans every view, builds its own vendor
+            // prompt, and encodes each view. It replaces preparation, encoding, and
+            // prompt expansion below, so the single-view path is skipped entirely.
+            let grouped_image_request = if self.grouped_image_request_enabled()
+                && !images.is_empty()
+            {
+                if !videos.is_empty() || !audios.is_empty() {
+                    return Err(
+                        "grouped image views cannot be combined with audio or video".to_string()
+                    );
+                }
+                let settings = {
+                    let encoder = self.vision_encoder.as_ref().ok_or_else(|| {
+                        "grouped image views require an initialized vision encoder".to_string()
+                    })?;
+                    self.grouped_image_request_settings(encoder)?
+                };
+                let policy = self.settings.vendor_multimodal_policy;
+                let planned = PlannedImageRequest::plan(
+                    &mut self.tokenizer,
+                    policy,
+                    &effective_request,
+                    settings,
+                )?;
+                if self.settings.debug_mode {
+                    let resources = planned.resources();
+                    emit_debug_line(
+                        event_callback,
+                        format!(
+                            "Grouped image request: sources={}, views={}, image_tokens={}, prompt_tokens={}",
+                            resources.sources,
+                            resources.views,
+                            resources.image_tokens,
+                            resources.prompt_tokens
+                        ),
+                    );
+                }
+                let encoder = self.vision_encoder.as_ref().ok_or_else(|| {
+                    "grouped image views require an initialized vision encoder".to_string()
+                })?;
+                let prepared = planned.encode(encoder)?;
+                if self.settings.debug_mode {
+                    emit_debug_line(
+                        event_callback,
+                        format!(
+                            "Grouped image views encoded: groups={}, views={}, embedding_bytes={}",
+                            prepared.groups.len(),
+                            prepared.view_order.len(),
+                            prepared.resources.embedding_bytes
+                        ),
+                    );
+                }
+                Some(prepared)
+            } else {
+                None
+            };
             if self.settings.debug_mode {
                 emit_debug_line(
                     event_callback,
@@ -3926,7 +4044,7 @@ impl ModelRuntime {
             let mut prepared_images = Vec::new();
             let mut prepared_audios = Vec::new();
 
-            if !images.is_empty() {
+            if !images.is_empty() && grouped_image_request.is_none() {
                 prepared_images = prepare_images_for_multimodal(&images, image_profile)?;
                 if self.settings.debug_mode {
                     let first = &prepared_images[0];
@@ -4039,6 +4157,7 @@ impl ModelRuntime {
 
             let mut prefill_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
             let mut rope_position_plan = None;
+            let mut image_blocks = Vec::new();
             let mut prompt_tokens = encoded_prompt.token_ids.clone();
             let mut image_embeddings = Vec::new();
 
@@ -4228,6 +4347,14 @@ impl ModelRuntime {
                 prompt_tokens = expanded.token_ids;
                 prefill_embeddings = expanded.embeddings;
                 rope_position_plan = expanded.position_plan;
+                image_blocks = expanded.image_blocks;
+            }
+
+            if let Some(grouped) = grouped_image_request {
+                prompt_tokens = grouped.prompt.token_ids;
+                prefill_embeddings = grouped.prompt.embeddings;
+                rope_position_plan = grouped.prompt.position_plan;
+                image_blocks = grouped.prompt.image_blocks;
             }
 
             if self.settings.debug_mode {
@@ -4275,6 +4402,7 @@ impl ModelRuntime {
                 prompt_tokens,
                 prefill_embeddings,
                 rope_position_plan,
+                image_blocks,
                 effective_stream_stdout,
             )?;
             self.retry_without_think_for_request(
@@ -4298,10 +4426,16 @@ impl ModelRuntime {
         prompt_tokens: Vec<i32>,
         prefill_injected_embeddings: HashMap<usize, Vec<f32>>,
         rope_position_plan: Option<RopePositionPlan>,
+        image_blocks: Vec<MediaAttentionBlock>,
         stream_stdout: bool,
     ) -> Result<String, String> {
         let event_callback = self.settings.runtime_event_callback.clone();
         let hidden_retry_enabled = self.settings.think_mode == ThinkMode::Hidden;
+        let retry_image_blocks = if hidden_retry_enabled {
+            image_blocks.clone()
+        } else {
+            Vec::new()
+        };
         let retry_position_plan = hidden_retry_enabled
             .then(|| rope_position_plan.clone())
             .flatten();
@@ -4337,6 +4471,10 @@ impl ModelRuntime {
             self.kv_cache_format_override,
         )?;
         state.rope_position_plan = rope_position_plan;
+        if self.config.attention_policy.image_mode == ImageAttentionMode::Bidirectional {
+            state.media_attention_plan =
+                MediaAttentionPlan::new(prompt_tokens.len(), image_blocks)?;
+        }
         if debug_mode && !self.kv_cache_format_logged {
             emit_debug_line(
                 event_callback.as_ref(),
@@ -4591,6 +4729,7 @@ impl ModelRuntime {
             || self.config.input_embedding_dim == self.config.dim;
         if crate::engine::switches::use_batch_prefill()
             && crate::engine::runtime::batch_prefill_supported(&self.config)
+            && state.media_attention_plan.blocks.is_empty()
             && embeddings_fit_batch_prefill
             && prompt_tokens.len() > 8
         {
@@ -4650,8 +4789,30 @@ impl ModelRuntime {
             }
 
             let prof_t0 = prof_start();
-            let needs_logits = pos >= prompt_tokens.len().saturating_sub(1);
-            if let Some(embedding) = prefill_injected_embeddings.get(&pos) {
+            let image_block = state.media_attention_plan.block_at(pos);
+            let needs_logits = image_block
+                .map_or(pos >= prompt_tokens.len().saturating_sub(1), |block| {
+                    block.token_start + block.token_len == prompt_tokens.len()
+                });
+            if image_block.is_some() {
+                let end = state
+                    .media_attention_plan
+                    .chunk_end(pos, prompt_tokens.len(), 1)?;
+                let embeddings = (pos..end).map(|position| {
+                    prefill_injected_embeddings.get(&position).map(Vec::as_slice)
+                        .ok_or_else(|| format!("image attention block is missing its embedding at position {position}"))
+                }).collect::<Result<Vec<_>, _>>()?;
+                crate::engine::runtime::transformer_prefill_image_block(
+                    &embeddings,
+                    pos,
+                    needs_logits,
+                    &self.config,
+                    &mut state,
+                    &self.weights,
+                    self.gguf.mapped.as_slice(),
+                )?;
+                pos = end - 1;
+            } else if let Some(embedding) = prefill_injected_embeddings.get(&pos) {
                 if needs_logits {
                     crate::engine::runtime::transformer_with_embedding(
                         embedding,
@@ -5414,6 +5575,7 @@ impl ModelRuntime {
                     retry_prompt_tokens,
                     retry_prefill_embeddings,
                     retry_position_plan,
+                    retry_image_blocks,
                     stream_stdout,
                 );
                 self.settings.think_mode = original_think_mode;
@@ -5577,6 +5739,7 @@ impl ModelRuntime {
             prompt_tokens,
             prefill_injected_embeddings,
             None,
+            Vec::new(),
             stream_stdout,
         )?;
         let request = GenerationRequest {

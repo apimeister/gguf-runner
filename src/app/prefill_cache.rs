@@ -124,8 +124,10 @@ fn bytes_to_f32s(b: &[u8]) -> Result<Vec<f32>, String> {
     if !b.len().is_multiple_of(4) {
         return Err("prefill cache: bad f32 section length".to_string());
     }
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+    Ok(b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 

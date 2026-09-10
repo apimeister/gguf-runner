@@ -1,11 +1,10 @@
-#![allow(dead_code)]
-
 use super::{
     ChatMessage, ChatRole, MmprojFilenameScoreHint, VendorDecodePolicy, VendorMultimodalPolicy,
     VendorRuntimeDebugPolicy, VendorTokenizerPolicy,
 };
 use crate::engine::types::{
-    ContentPart, EncodedPrompt, GenerationRequest, MultimodalBackend, PlaceholderSpan, Tokenizer,
+    ContentPart, EncodedPrompt, GenerationRequest, ImageViewPolicy, MultimodalBackend,
+    PlaceholderSpan, Tokenizer,
 };
 
 static SMOLVLM_STOP_TOKEN_LITERALS: &[&str] = &["<end_of_utterance>"];
@@ -47,6 +46,9 @@ pub(super) fn tokenizer_policy() -> VendorTokenizerPolicy {
 
 pub(super) fn multimodal_policy() -> VendorMultimodalPolicy {
     VendorMultimodalPolicy {
+        image_view_prompt: None,
+        image_view_policy: ImageViewPolicy::OverviewOnly,
+        image_stretch_filter: Default::default(),
         image_prompt_suffix: "",
         detail_crop: Default::default(),
         mmproj_filename_score_hints: SMOLVLM_MMPROJ_SCORE_HINTS,

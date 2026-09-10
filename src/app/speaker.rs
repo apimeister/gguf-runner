@@ -1093,42 +1093,6 @@ impl SpeakerRuntime {
         })
     }
 
-    pub(crate) fn accept_candidates(
-        &self,
-        index_path: &Path,
-        candidate_path: &Path,
-        force: bool,
-    ) -> Result<(usize, usize), String> {
-        let candidates = read_candidates(candidate_path)?;
-        let mut index = self.load_index(index_path)?;
-        let mut accepted = 0usize;
-        let mut skipped = 0usize;
-        for candidate in candidates {
-            if !candidate.accepted {
-                skipped += 1;
-                continue;
-            }
-            validate_candidate(
-                &candidate,
-                self.encoder.fingerprint(),
-                self.encoder.embedding_dim(),
-            )?;
-            index.enroll(
-                &candidate.speaker_id,
-                candidate.vector,
-                candidate.source,
-                candidate.duration_seconds,
-                candidate.quality_score,
-                force,
-            )?;
-            accepted += 1;
-        }
-        if accepted > 0 {
-            index.save_atomic(index_path)?;
-        }
-        Ok((accepted, skipped))
-    }
-
     pub(crate) fn auto_enroll_candidate(
         &self,
         index_path: &Path,

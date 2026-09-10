@@ -1,19 +1,24 @@
+#[path = "gemma3_attention.rs"]
+mod attention;
+#[path = "gemma3_math.rs"]
+mod math;
+
 use crate::engine::io::{
-    find_gguf_tensor, get_gguf_bool_from_map, get_gguf_f32_array_from_map, get_gguf_float_from_map,
-    get_gguf_int_from_map,
+    bf16_to_fp32, find_gguf_tensor, fp32_to_bf16, fp32_to_fp16, get_gguf_bool_from_map,
+    get_gguf_f32_array_from_map, get_gguf_float_from_map, get_gguf_int_from_map,
 };
 use crate::engine::kernels::{
     axpy_inplace, dequantize_tensor, dot_f32_simd, get_block_size, get_type_size,
-    scale_slice_inplace,
+    matmul_quantized_batch_dequantized, scale_slice_inplace,
 };
 use crate::engine::multimodal::injection::MediaEmbeddingSequence;
-use crate::engine::types::{GGUFFile, Gguftensor, QuantizedTensor};
+use crate::engine::types::{GGML_TYPE_BF16, GGML_TYPE_F16, GGUFFile, Gguftensor, QuantizedTensor};
 use crate::engine::vision::PreparedImageTensor;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
-use super::{
-    EncoderAttentionScratch, FloatBatchMatmulScratch, encoder_self_attention, matmul_encoder_batch,
-};
+use super::{FloatBatchMatmulScratch, matmul_encoder_batch};
+
+type StageObserver<'a> = dyn FnMut(&str, &[f32]) -> Result<(), String> + 'a;
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n_elements = 1usize;
@@ -94,110 +99,7 @@ fn load_tensor_quantized(
     })
 }
 
-#[inline]
-fn layer_norm_affine(dst: &mut [f32], src: &[f32], w: &[f32], b: &[f32], eps: f32) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let n = src.len();
-        let x_ptr = src.as_ptr();
-        let w_ptr = w.as_ptr();
-        let b_ptr = b.as_ptr();
-        let y_ptr = dst.as_mut_ptr();
-
-        let mut i = 0usize;
-        let mut acc0 = vdupq_n_f32(0.0);
-        let mut acc1 = vdupq_n_f32(0.0);
-        let mut acc2 = vdupq_n_f32(0.0);
-        let mut acc3 = vdupq_n_f32(0.0);
-        while i + 16 <= n {
-            acc0 = vaddq_f32(acc0, vld1q_f32(x_ptr.add(i)));
-            acc1 = vaddq_f32(acc1, vld1q_f32(x_ptr.add(i + 4)));
-            acc2 = vaddq_f32(acc2, vld1q_f32(x_ptr.add(i + 8)));
-            acc3 = vaddq_f32(acc3, vld1q_f32(x_ptr.add(i + 12)));
-            i += 16;
-        }
-        let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-        while i + 4 <= n {
-            acc = vaddq_f32(acc, vld1q_f32(x_ptr.add(i)));
-            i += 4;
-        }
-        let mut sum = vaddvq_f32(acc);
-        while i < n {
-            sum += *x_ptr.add(i);
-            i += 1;
-        }
-        let mean = sum / n as f32;
-        let meanv = vdupq_n_f32(mean);
-
-        i = 0;
-        acc0 = vdupq_n_f32(0.0);
-        acc1 = vdupq_n_f32(0.0);
-        acc2 = vdupq_n_f32(0.0);
-        acc3 = vdupq_n_f32(0.0);
-        while i + 16 <= n {
-            let d0 = vsubq_f32(vld1q_f32(x_ptr.add(i)), meanv);
-            let d1 = vsubq_f32(vld1q_f32(x_ptr.add(i + 4)), meanv);
-            let d2 = vsubq_f32(vld1q_f32(x_ptr.add(i + 8)), meanv);
-            let d3 = vsubq_f32(vld1q_f32(x_ptr.add(i + 12)), meanv);
-            acc0 = vfmaq_f32(acc0, d0, d0);
-            acc1 = vfmaq_f32(acc1, d1, d1);
-            acc2 = vfmaq_f32(acc2, d2, d2);
-            acc3 = vfmaq_f32(acc3, d3, d3);
-            i += 16;
-        }
-        acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-        while i + 4 <= n {
-            let d = vsubq_f32(vld1q_f32(x_ptr.add(i)), meanv);
-            acc = vfmaq_f32(acc, d, d);
-            i += 4;
-        }
-        let mut var = vaddvq_f32(acc);
-        while i < n {
-            let d = *x_ptr.add(i) - mean;
-            var += d * d;
-            i += 1;
-        }
-        var /= n as f32;
-        let inv = 1.0f32 / (var + eps).sqrt();
-        let invv = vdupq_n_f32(inv);
-
-        i = 0;
-        while i + 4 <= n {
-            let xv = vld1q_f32(x_ptr.add(i));
-            let wv = vld1q_f32(w_ptr.add(i));
-            let bv = vld1q_f32(b_ptr.add(i));
-            let norm = vmulq_f32(vsubq_f32(xv, meanv), invv);
-            let out = vfmaq_f32(bv, norm, wv);
-            vst1q_f32(y_ptr.add(i), out);
-            i += 4;
-        }
-        while i < n {
-            *y_ptr.add(i) = ((*x_ptr.add(i) - mean) * inv) * *w_ptr.add(i) + *b_ptr.add(i);
-            i += 1;
-        }
-        return;
-    }
-    #[allow(unreachable_code)]
-    {
-        let mut mean = 0.0f32;
-        for &v in src {
-            mean += v;
-        }
-        mean /= src.len() as f32;
-
-        let mut var = 0.0f32;
-        for &v in src {
-            let d = v - mean;
-            var += d * d;
-        }
-        var /= src.len() as f32;
-        let inv = 1.0f32 / (var + eps).sqrt();
-        for i in 0..src.len() {
-            dst[i] = ((src[i] - mean) * inv) * w[i] + b[i];
-        }
-    }
-}
+use math::{layer_norm_affine, rms_norm_weight};
 
 #[derive(Clone)]
 struct VisionLayerWeights {
@@ -234,11 +136,14 @@ pub(crate) struct Gemma3VisionEncoder {
     image_std: [f32; 3],
     use_gelu: bool,
     patch_embd_w: Vec<f32>,
+    patch_embd_f16: Option<Vec<u16>>,
     patch_embd_b: Vec<f32>,
     position_embd: Vec<f32>,
     post_ln_w: Vec<f32>,
     post_ln_b: Vec<f32>,
     mm_input_proj_w: Vec<f32>,
+    mm_input_proj_f16: Option<Vec<u16>>,
+    mm_input_proj_bf16: bool,
     mm_input_proj_ne0: usize,
     mm_input_proj_ne1: usize,
     mm_soft_emb_norm_w: Vec<f32>,
@@ -282,6 +187,25 @@ impl Gemma3VisionEncoder {
 
     pub(crate) fn recommended_image_normalization(&self) -> ([f32; 3], [f32; 3]) {
         (self.image_mean, self.image_std)
+    }
+
+    /// Projected token count for one prepared view, known before any encode.
+    /// Patch grid divided by the projector's pooling factor, as `pool_patch_grid`
+    /// computes it; the same alignment `recommended_image_alignment` reports.
+    pub(crate) fn planned_view_tokens(&self, width: usize, height: usize) -> Result<usize, String> {
+        let align = self.recommended_image_alignment();
+        if width == 0
+            || height == 0
+            || !width.is_multiple_of(align)
+            || !height.is_multiple_of(align)
+        {
+            return Err(format!(
+                "gemma3 view {width}x{height} must be a positive multiple of {align}"
+            ));
+        }
+        (width / align)
+            .checked_mul(height / align)
+            .ok_or_else(|| "gemma3 view token count overflow".to_string())
     }
 
     pub(crate) fn new(gguf: GGUFFile, target_dim: usize) -> Result<Self, String> {
@@ -347,6 +271,14 @@ impl Gemma3VisionEncoder {
 
         let patch_embd_w =
             load_tensor_float(&gguf, "v.patch_embd.weight", Some(patch_kernel_elems))?;
+        // ggml_conv_2d uses F16 im2col (including the F32-weight case).
+        // BF16 patch weights are the exception: that graph uses F32 im2col.
+        let patch_embd_f16 = (find_gguf_tensor(&gguf, "v.patch_embd.weight")
+            .expect("patch tensor was loaded")
+            .ttype
+            .0
+            != GGML_TYPE_BF16)
+            .then(|| patch_embd_w.iter().copied().map(fp32_to_fp16).collect());
         let patch_embd_b = load_tensor_float(&gguf, "v.patch_embd.bias", Some(dim))?;
         let position_embd =
             load_tensor_float(&gguf, "v.position_embd.weight", Some(base_pos_tokens * dim))?;
@@ -369,6 +301,16 @@ impl Gemma3VisionEncoder {
         }
         let mm_input_proj_w =
             load_tensor_float(&gguf, "mm.input_projection.weight", Some(target_dim * dim))?;
+        let mm_input_proj_bf16 = mm_input_proj_t.ttype.0 == GGML_TYPE_BF16;
+        let mm_input_proj_f16 = (mm_input_proj_t.ttype.0 == GGML_TYPE_F16).then(|| {
+            // Store the transposed rows once; projected outputs are text-major.
+            (0..target_dim)
+                .flat_map(|out| {
+                    let weights = &mm_input_proj_w;
+                    (0..dim).map(move |inp| fp32_to_fp16(weights[out + target_dim * inp]))
+                })
+                .collect()
+        });
         let mm_soft_emb_norm_w = load_tensor_float(&gguf, "mm.soft_emb_norm.weight", Some(dim))?;
 
         let mut layers = Vec::with_capacity(n_layers);
@@ -447,11 +389,14 @@ impl Gemma3VisionEncoder {
             image_std,
             use_gelu,
             patch_embd_w,
+            patch_embd_f16,
             patch_embd_b,
             position_embd,
             post_ln_w,
             post_ln_b,
             mm_input_proj_w,
+            mm_input_proj_f16,
+            mm_input_proj_bf16,
             mm_input_proj_ne0,
             mm_input_proj_ne1,
             mm_soft_emb_norm_w,
@@ -460,7 +405,7 @@ impl Gemma3VisionEncoder {
     }
 
     fn gelu(x: f32) -> f32 {
-        0.5 * x * (1.0 + (0.7978846 * (x + 0.044715 * x * x * x)).tanh())
+        math::gelu(x)
     }
 
     fn quick_gelu(x: f32) -> f32 {
@@ -473,15 +418,7 @@ impl Gemma3VisionEncoder {
     }
 
     fn rms_norm_mul_weight(&self, dst: &mut [f32], src: &[f32], w: &[f32]) {
-        let mut mean_sq = 0.0f32;
-        for &v in src {
-            mean_sq += v * v;
-        }
-        mean_sq /= src.len() as f32;
-        let inv = 1.0f32 / (mean_sq + self.eps).sqrt();
-        for i in 0..src.len() {
-            dst[i] = src[i] * inv * w[i];
-        }
+        rms_norm_weight(dst, src, w, self.eps);
     }
 
     fn add_bias(v: &mut [f32], b: &[f32]) {
@@ -582,10 +519,11 @@ impl Gemma3VisionEncoder {
         let image_width = image.width;
         let patch_embd_b = &self.patch_embd_b;
         let patch_embd_w = &self.patch_embd_w;
+        let patch_embd_f16 = &self.patch_embd_f16;
 
         tokens.par_chunks_mut(dim).enumerate().for_each_init(
-            || vec![0.0f32; kernel_elems],
-            |patch_buf, (patch_idx, out)| {
+            || (vec![0.0f32; kernel_elems], vec![0u16; kernel_elems]),
+            |(patch_buf, patch_half), (patch_idx, out)| {
                 let py = patch_idx / pw;
                 let px = patch_idx % pw;
                 out.copy_from_slice(patch_embd_b);
@@ -604,10 +542,17 @@ impl Gemma3VisionEncoder {
                     }
                 }
 
-                let mut woff = 0usize;
-                for outv in out.iter_mut().take(dim) {
-                    *outv += dot_f32_simd(patch_buf, &patch_embd_w[woff..woff + kernel_elems]);
-                    woff += kernel_elems;
+                if let Some(weights) = patch_embd_f16 {
+                    for (dst, &src) in patch_half.iter_mut().zip(patch_buf.iter()) {
+                        *dst = fp32_to_fp16(src);
+                    }
+                    for (outv, row) in out.iter_mut().zip(weights.chunks_exact(kernel_elems)) {
+                        *outv += math::dot_f16(patch_half, row);
+                    }
+                } else {
+                    for (outv, row) in out.iter_mut().zip(patch_embd_w.chunks_exact(kernel_elems)) {
+                        *outv += dot_f32_simd(patch_buf, row);
+                    }
                 }
             },
         );
@@ -669,8 +614,44 @@ impl Gemma3VisionEncoder {
         &self,
         image: &PreparedImageTensor,
     ) -> Result<MediaEmbeddingSequence, String> {
+        self.encode_single_image_observed::<false>(image, &[], None)
+    }
+
+    /// Diagnostic hook: the observer borrows one token-major stage at a time.
+    /// Ordinary inference neither retains nor copies intermediate stages.
+    // Diagnostic stage API: called from examples/, which compile the engine separately.
+    #[allow(dead_code)]
+    pub(crate) fn encode_image_with_stages(
+        &self,
+        image: &PreparedImageTensor,
+        detailed_layers: &[usize],
+        f32_activations: bool,
+        observer: &mut StageObserver<'_>,
+    ) -> Result<MediaEmbeddingSequence, String> {
+        if Self::fast_pooling_enabled() {
+            return Err("encoder stage validation requires Gemma fast pooling disabled".into());
+        }
+        if detailed_layers.iter().any(|&layer| layer >= self.n_layers) {
+            return Err("encoder diagnostic layer index is out of range".into());
+        }
+        if f32_activations {
+            self.encode_single_image_observed::<true>(image, detailed_layers, Some(observer))
+        } else {
+            self.encode_single_image_observed::<false>(image, detailed_layers, Some(observer))
+        }
+    }
+
+    fn encode_single_image_observed<const F32_ACTIVATIONS: bool>(
+        &self,
+        image: &PreparedImageTensor,
+        detailed_layers: &[usize],
+        mut observer: Option<&mut StageObserver<'_>>,
+    ) -> Result<MediaEmbeddingSequence, String> {
         let mapped = self.gguf.mapped.as_slice();
         let (mut x, patch_w, patch_h) = self.patch_embed_and_add_position(image)?;
+        if let Some(visit) = observer.as_mut() {
+            visit("patch_embeddings", &x)?;
+        }
         let mut pre_pooled_for_speed = false;
         let mut n_tokens = x.len() / self.dim;
 
@@ -693,42 +674,52 @@ impl Gemma3VisionEncoder {
         let mut ffn_up_batch = vec![0.0f32; n_tokens * ff_dim];
         let mut ffn_down_batch = vec![0.0f32; n_tokens * dim];
         let mut batch_scratch = FloatBatchMatmulScratch::default();
-        let mut attention_scratch = EncoderAttentionScratch::default();
+        let mut bf16_scratch = math::Bf16MatmulScratch::default();
+        let mut f32_scratch = Vec::new();
+        // The F32 control removes activation narrowing to distinguish graph
+        // errors from rounding propagation. Normal inference always uses false.
+        let mut matmul = |dst: &mut [f32], src: &[f32], weight: &QuantizedTensor| {
+            if F32_ACTIVATIONS {
+                matmul_quantized_batch_dequantized(
+                    dst,
+                    src,
+                    weight,
+                    mapped,
+                    n_tokens,
+                    0,
+                    weight.rows,
+                    &mut f32_scratch,
+                )
+            } else if weight.ttype.0 == GGML_TYPE_BF16 {
+                math::matmul_bf16(dst, src, weight, mapped, n_tokens, &mut bf16_scratch)
+            } else {
+                matmul_encoder_batch(dst, src, weight, mapped, n_tokens, &mut batch_scratch)
+            }
+        };
+        let mut attention_scratch = attention::AttentionScratch::default();
         let eps = self.eps;
         let use_gelu = self.use_gelu;
 
         for l in 0..self.n_layers {
             let layer = &self.layers[l];
+            let mut observe_operation = |name: &str, values: &[f32]| -> Result<(), String> {
+                if detailed_layers.contains(&l)
+                    && let Some(visit) = observer.as_mut()
+                {
+                    visit(&format!("layer_{l:02}_{name}"), values)?;
+                }
+                Ok(())
+            };
 
             x_norm.par_chunks_mut(dim).enumerate().for_each(|(t, dst)| {
                 let src = &x[t * dim..(t + 1) * dim];
                 layer_norm_affine(dst, src, &layer.ln1_w, &layer.ln1_b, eps);
             });
+            observe_operation("ln1", &x_norm)?;
 
-            matmul_encoder_batch(
-                &mut q,
-                &x_norm,
-                &layer.attn_q_w,
-                mapped,
-                n_tokens,
-                &mut batch_scratch,
-            )?;
-            matmul_encoder_batch(
-                &mut k,
-                &x_norm,
-                &layer.attn_k_w,
-                mapped,
-                n_tokens,
-                &mut batch_scratch,
-            )?;
-            matmul_encoder_batch(
-                &mut v,
-                &x_norm,
-                &layer.attn_v_w,
-                mapped,
-                n_tokens,
-                &mut batch_scratch,
-            )?;
+            matmul(&mut q, &x_norm, &layer.attn_q_w)?;
+            matmul(&mut k, &x_norm, &layer.attn_k_w)?;
+            matmul(&mut v, &x_norm, &layer.attn_v_w)?;
             q.par_chunks_mut(dim)
                 .zip(k.par_chunks_mut(dim))
                 .zip(v.par_chunks_mut(dim))
@@ -737,47 +728,46 @@ impl Gemma3VisionEncoder {
                     Self::add_bias(k_dst, &layer.attn_k_b);
                     Self::add_bias(v_dst, &layer.attn_v_b);
                 });
+            observe_operation("query", &q)?;
+            observe_operation("key", &k)?;
+            observe_operation("value", &v)?;
 
-            encoder_self_attention(
+            attention::attention(
                 &mut attn_out,
                 &q,
                 &k,
                 &v,
-                1,
                 n_tokens,
                 self.head_count,
                 self.head_dim,
                 &mut attention_scratch,
-            )?;
+            );
+            observe_operation("attention", &attn_out)?;
 
-            matmul_encoder_batch(
-                &mut proj_out,
-                &attn_out,
-                &layer.attn_out_w,
-                mapped,
-                n_tokens,
-                &mut batch_scratch,
-            )?;
+            matmul(&mut proj_out, &attn_out, &layer.attn_out_w)?;
             proj_out
                 .par_chunks_mut(dim)
                 .for_each(|dst| Self::add_bias(dst, &layer.attn_out_b));
+            observe_operation("attention_projected", &proj_out)?;
             for i in 0..x.len() {
                 x[i] += proj_out[i];
             }
+            observe_operation("attention_residual", &x)?;
 
             x_norm.par_chunks_mut(dim).enumerate().for_each(|(t, dst)| {
                 let src = &x[t * dim..(t + 1) * dim];
                 layer_norm_affine(dst, src, &layer.ln2_w, &layer.ln2_b, eps);
             });
+            observe_operation("ln2", &x_norm)?;
 
-            matmul_encoder_batch(
-                &mut ffn_up_batch,
-                &x_norm,
-                &layer.ffn_up_w,
-                mapped,
-                n_tokens,
-                &mut batch_scratch,
-            )?;
+            matmul(&mut ffn_up_batch, &x_norm, &layer.ffn_up_w)?;
+            if detailed_layers.contains(&l) {
+                let mut up_with_bias = ffn_up_batch.clone();
+                up_with_bias
+                    .par_chunks_mut(ff_dim)
+                    .for_each(|values| Self::add_bias(values, &layer.ffn_up_b));
+                observe_operation("ffn_up", &up_with_bias)?;
+            }
             ffn_up_batch.par_chunks_mut(ff_dim).for_each(|values| {
                 Self::add_bias(values, &layer.ffn_up_b);
                 for value in values {
@@ -788,20 +778,18 @@ impl Gemma3VisionEncoder {
                     };
                 }
             });
-            matmul_encoder_batch(
-                &mut ffn_down_batch,
-                &ffn_up_batch,
-                &layer.ffn_down_w,
-                mapped,
-                n_tokens,
-                &mut batch_scratch,
-            )?;
+            observe_operation("ffn_activated", &ffn_up_batch)?;
+            matmul(&mut ffn_down_batch, &ffn_up_batch, &layer.ffn_down_w)?;
             x.par_chunks_mut(dim)
                 .zip(ffn_down_batch.par_chunks_mut(dim))
                 .for_each(|(destination, down)| {
                     Self::add_bias(down, &layer.ffn_down_b);
                     axpy_inplace(destination, 1.0, down);
                 });
+            observe_operation("ffn_down", &ffn_down_batch)?;
+            if let Some(visit) = observer.as_mut() {
+                visit(&format!("layer_{l:02}"), &x)?;
+            }
         }
 
         for t in 0..n_tokens {
@@ -810,6 +798,9 @@ impl Gemma3VisionEncoder {
             self.layer_norm(dst, src, &self.post_ln_w, &self.post_ln_b);
         }
         std::mem::swap(&mut x, &mut x_norm);
+        if let Some(visit) = observer.as_mut() {
+            visit("post_layernorm", &x)?;
+        }
 
         let pooled = if pre_pooled_for_speed {
             x
@@ -817,6 +808,9 @@ impl Gemma3VisionEncoder {
             self.pool_patch_grid(&x, patch_w, patch_h)?
         };
         let n_out = pooled.len() / self.dim;
+        if let Some(visit) = observer.as_mut() {
+            visit("pooled", &pooled)?;
+        }
         let out_dim = self.mm_input_proj_ne0;
         if self.mm_input_proj_ne1 != self.dim {
             return Err(format!(
@@ -826,21 +820,47 @@ impl Gemma3VisionEncoder {
         }
         let mut normed = vec![0.0f32; self.dim];
         let mut projected = vec![0.0f32; out_dim];
+        let mut normed_half = vec![0u16; self.dim];
+
         let mut tokens: Vec<Vec<f32>> = Vec::with_capacity(n_out);
+        let mut normed_stage = observer.as_ref().map(|_| Vec::with_capacity(pooled.len()));
 
         for out_idx in 0..n_out {
             let src = &pooled[out_idx * self.dim..(out_idx + 1) * self.dim];
             self.rms_norm_mul_weight(&mut normed, src, &self.mm_soft_emb_norm_w);
-            // Match llama.cpp gemma3 path:
-            // projected = transpose(mm.input_projection.weight) * normed
-            for (out, dst) in projected.iter_mut().enumerate().take(out_dim) {
-                let mut acc = 0.0f32;
-                for (inp, &v) in normed.iter().enumerate() {
-                    acc += v * self.mm_input_proj_w[out + self.mm_input_proj_ne0 * inp];
+            if let Some(stage) = normed_stage.as_mut() {
+                stage.extend_from_slice(&normed);
+            }
+            // The transposed projector keeps its GGUF storage dtype in GGML.
+            // Apply its activation conversion after observing the F32 RMS output.
+            if let Some(weights) = &self.mm_input_proj_f16 {
+                for (dst, &src) in normed_half.iter_mut().zip(&normed) {
+                    *dst = fp32_to_fp16(src);
                 }
-                *dst = acc;
+                for (dst, row) in projected.iter_mut().zip(weights.chunks_exact(self.dim)) {
+                    *dst = math::dot_f16(row, &normed_half);
+                }
+            } else {
+                if self.mm_input_proj_bf16 {
+                    for value in &mut normed {
+                        *value = bf16_to_fp32(fp32_to_bf16(*value));
+                    }
+                }
+                for (out, dst) in projected.iter_mut().enumerate() {
+                    let mut acc = 0.0f32;
+                    for (inp, &v) in normed.iter().enumerate() {
+                        acc += v * self.mm_input_proj_w[out + out_dim * inp];
+                    }
+                    *dst = acc;
+                }
             }
             tokens.push(projected.clone());
+        }
+
+        if let Some(visit) = observer.as_mut() {
+            visit("normalized", normed_stage.as_deref().unwrap_or_default())?;
+            let projected_stage: Vec<f32> = tokens.iter().flatten().copied().collect();
+            visit("projected", &projected_stage)?;
         }
 
         Ok(MediaEmbeddingSequence { tokens, grid: None })

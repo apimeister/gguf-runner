@@ -233,6 +233,7 @@ fn read_gguf_scalar(r: &mut impl Read, value_type: u32) -> io::Result<GgufValue>
 
 fn read_gguf_integer_array_value(r: &mut impl Read, value_type: u32) -> io::Result<i64> {
     match value_type {
+        GGUF_TYPE_BOOL => Ok(i64::from(read_bool(r)?)),
         GGUF_TYPE_UINT8 => Ok(read_u8(r)? as i64),
         GGUF_TYPE_INT8 => Ok(read_i8(r)? as i64),
         GGUF_TYPE_UINT16 => Ok(read_u16(r)? as i64),
@@ -338,6 +339,7 @@ fn parse_gguf_inner<R: Read + Seek>(
                     | GGUF_TYPE_INT32
                     | GGUF_TYPE_UINT64
                     | GGUF_TYPE_INT64
+                    | GGUF_TYPE_BOOL
             ) {
                 let mut values = Vec::with_capacity(arr_len as usize);
                 for _ in 0..arr_len {
@@ -545,7 +547,29 @@ pub(crate) fn find_gguf_tensor_names_with_any_prefix(
 
 #[cfg(test)]
 mod tests {
-    use super::fp32_to_fp16;
+    use super::{fp32_to_fp16, parse_gguf_from_bytes};
+    use crate::engine::types::{GGUF_MAGIC, GGUF_TYPE_ARRAY, GGUF_TYPE_BOOL, GgufValue};
+
+    #[test]
+    fn gguf_boolean_arrays_retain_per_layer_attention_patterns() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let key = "gemma3.attention.sliding_window_pattern";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
+        bytes.extend_from_slice(&GGUF_TYPE_BOOL.to_le_bytes());
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        bytes.extend_from_slice(&[1, 0, 1, 1]);
+        bytes.resize(bytes.len().div_ceil(32) * 32, 0);
+        let file = parse_gguf_from_bytes(Box::leak(bytes.into_boxed_slice()), false).unwrap();
+        assert!(
+            matches!(file.kv.get(key), Some(GgufValue::I64Array(values)) if values == &[1, 0, 1, 1])
+        );
+    }
 
     #[test]
     fn fp32_to_fp16_matches_ieee_ties_and_subnormal_boundaries() {
