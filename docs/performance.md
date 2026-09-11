@@ -69,6 +69,11 @@ gguf-runner --model ./Qwen3.5-2B-Q4_K_M.gguf --image ./regression/IMG_0138.jpg -
 | 2026-07-11 | Qwen3.5-2B-Q4_K_M.gguf | mac-m5-local | png_to_jpeg_v1 | 28.079 | 7.472 | local release build |
 | 2026-07-11 | Qwen3.5-2B-Q4_K_M.gguf | mac-m5-local | image_v1 | 22.608 | 23.738 | local release build |
 | 2026-03-11 | Qwen3.5-35B-A3B-Q4_K_M.gguf | mac-m4-32g | image_v1 | 7.210 | 103.316 | |
+| 2026-09-10 | MiniCPM-V-4_6-Q4_K_M.gguf | mac-m5-32g | png_to_jpeg_v1 | 56.578 | 3.320 | stops early, see 2026-09-10 notes |
+| 2026-09-10 | MiniCPM-V-4_6-Q4_K_M.gguf | mac-m5-32g | image_v1 | 206.180 | 18.744 | 10 LLaVA-UHD views, 630 image tokens |
+| 2026-09-10 | gemma-3-4b-it-qat-Q4_K_M.gguf | mac-m5-32g | png_to_jpeg_v1 | 9.203 | 25.023 | QAT weights |
+| 2026-09-10 | gemma-3-4b-it-qat-Q4_K_M.gguf | mac-m5-32g | image_v1 | 7.718 | 244.431 | 3 pan-and-scan views, 768 image tokens |
+| 2026-09-10 | Qwen3.5-2B-Q4_K_M.gguf | mac-m5-32g | image_v1 | 27.279 | 33.667 | re-baseline on the same revision |
 
 
 ### Benchmark Runs - Older Models
@@ -95,9 +100,51 @@ gguf-runner --model ./Qwen3.5-2B-Q4_K_M.gguf --image ./regression/IMG_0138.jpg -
 | 2026-03-11 | Qwen3-VL-2B-Instruct-Q4_K_M.gguf | mac-m4-32g | image_v1 | 15.784 | 71.829 | |
 | 2026-03-11 | Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf | mac-m4-32g | image_v1 | 6.952 | 228.771 | |
 
+## Image Benchmarks (2026-09-10, mac-m5-32g)
+
+Run after MiniCPM-V 4.6 support and the Gemma3 image-processing change landed, both with the
+`png_to_jpeg_v1` and `image_v1` commands exactly as defined above. Two trials each, back to back,
+with the faster run recorded and its own tokens/sec taken from that same trial.
+
+### What `achieved tok/s` counts
+
+The runner starts its decode clock once the prompt is consumed, then divides by `pos - 1`, which
+counts the prompt as well as the generated tokens. Throughput therefore rises with prompt length,
+and an `image_v1` row is not comparable to a `png_to_jpeg_v1` row for the same model: MiniCPM-V's
+206 tok/s mostly reflects its 630 image tokens crossing a decode-only clock. `runtime sec` is wall
+time for the whole process, including model load, and is the column to compare.
+
+### Per-model observations
+
+- **MiniCPM-V 4.6 on `png_to_jpeg_v1`** emits a `<tool_call>` stub with a short step list and stops,
+  rather than writing the program. Its 3.3 s is an early stop, not throughput on the workload the
+  other rows measure.
+- **MiniCPM-V 4.6 on `image_v1`** plans 10 views (overview plus a 3x3 LLaVA-UHD grid) for the
+  4032x3024 source, 63 tokens per view.
+- **Gemma3 on `image_v1`** plans 3 pan-and-scan views, 768 image tokens. The older
+  `gemma-3-4b-it-Q4_K_M` row on `mac-m4-32g` used different weights, a different machine, and a
+  different revision, so the two image rows describe different amounts of work.
+- **Gemma 4 E2B** does not load: `tensor token_embd.weight has 402653184 elements, expected
+  1073741824`. It is a separate architecture from Gemma3 and has no vendor support.
+
+### Trial spread
+
+Consecutive trials varied well beyond the differences between adjacent table rows, matching the
+thermal caveat recorded for the audio work:
+
+| model | prompts | trial 1 | trial 2 | spread |
+|---|---|---:|---:|---:|
+| MiniCPM-V-4_6-Q4_K_M | image_v1 | 18.744 s | 19.758 s | 5% |
+| Qwen3.5-2B-Q4_K_M | image_v1 | 33.667 s | 51.524 s | 53% |
+| gemma-3-4b-it-qat-Q4_K_M | image_v1 | 253.962 s | 244.431 s | 4% |
+
+The Qwen3.5-2B spread came from a machine already warm from the preceding runs. Treat single rows
+in this table as order-of-magnitude indicators.
+
 ## Audio Pipeline (2026-08-22, mac-m5-32g)
 
-Host `mac-m5-32g` (Apple M5, 6 performance + 4 efficiency cores). Model: official
+Host `mac-m5-32g` (Apple M5, 4 performance + 6 efficiency cores, per
+`hw.perflevel0/1.physicalcpu`). Model: official
 `Qwen3-ASR-1.7B-Q8_0.gguf` with its `mmproj` sidecar. Speech generated with `say` at 16 kHz mono.
 All model-run figures are min-of-N with the model's page cache pre-warmed.
 
