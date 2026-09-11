@@ -171,7 +171,7 @@ fn erf_f32(value: f32) -> f32 {
 }
 
 #[inline]
-fn gelu_erf(value: f32) -> f32 {
+pub(super) fn gelu_erf(value: f32) -> f32 {
     0.5 * value * (1.0 + erf_f32(value * std::f32::consts::FRAC_1_SQRT_2))
 }
 

@@ -259,6 +259,16 @@ pub(super) fn encode_qwen3_messages_no_forced_think(
     encode_qwen3_messages_with_think_style(tokenizer, messages, system_prompt, think_mode, false)
 }
 
+/// Assistant-turn think seed, matching the chat template's `enable_thinking`
+/// branches.
+pub(super) fn assistant_think_seed(think_mode: ThinkMode) -> &'static str {
+    if think_mode == ThinkMode::No {
+        "<think>\n\n</think>\n\n"
+    } else {
+        "<think>\n"
+    }
+}
+
 fn append_encoded_literal(
     tokenizer: &mut Tokenizer,
     temp: &mut Vec<i32>,

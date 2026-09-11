@@ -1,6 +1,7 @@
 mod gemma3;
 mod idefics3;
 mod injection;
+mod minicpmv;
 mod qwen3_asr;
 mod qwen3vl;
 
@@ -495,6 +496,8 @@ pub(crate) enum VisionEncoder {
     Gemma3(gemma3::Gemma3VisionEncoder),
     Qwen3Vl(qwen3vl::Qwen3VlVisionEncoder),
     Idefics3(idefics3::Idefics3VisionEncoder),
+    // Boxed: this encoder's inline state is several times the other variants'.
+    MiniCpmV(Box<minicpmv::MiniCpmVVisionEncoder>),
 }
 
 impl VisionEncoder {
@@ -503,6 +506,7 @@ impl VisionEncoder {
             VisionEncoder::Gemma3(enc) => enc.recommended_image_size(),
             VisionEncoder::Qwen3Vl(enc) => enc.recommended_image_size(),
             VisionEncoder::Idefics3(enc) => enc.recommended_image_size(),
+            VisionEncoder::MiniCpmV(enc) => enc.recommended_image_size(),
         }
     }
 
@@ -511,6 +515,7 @@ impl VisionEncoder {
             VisionEncoder::Gemma3(enc) => enc.recommended_image_alignment(),
             VisionEncoder::Qwen3Vl(enc) => enc.recommended_image_alignment(),
             VisionEncoder::Idefics3(enc) => enc.recommended_image_alignment(),
+            VisionEncoder::MiniCpmV(enc) => enc.recommended_image_alignment(),
         }
     }
 
@@ -519,6 +524,7 @@ impl VisionEncoder {
             VisionEncoder::Gemma3(enc) => enc.recommended_image_normalization(),
             VisionEncoder::Qwen3Vl(enc) => enc.recommended_image_normalization(),
             VisionEncoder::Idefics3(enc) => enc.recommended_image_normalization(),
+            VisionEncoder::MiniCpmV(enc) => enc.recommended_image_normalization(),
         }
     }
 
@@ -528,6 +534,7 @@ impl VisionEncoder {
     pub(crate) fn planned_view_tokens(&self, width: usize, height: usize) -> Result<usize, String> {
         match self {
             VisionEncoder::Gemma3(enc) => enc.planned_view_tokens(width, height),
+            VisionEncoder::MiniCpmV(enc) => enc.planned_view_tokens(width, height),
             VisionEncoder::Qwen3Vl(_) | VisionEncoder::Idefics3(_) => {
                 Err("vision backend does not support grouped image views".to_string())
             }
@@ -542,15 +549,20 @@ impl VisionEncoder {
             VisionEncoder::Gemma3(enc) => enc.encode_images(images),
             VisionEncoder::Qwen3Vl(enc) => enc.encode_images(images),
             VisionEncoder::Idefics3(enc) => enc.encode_images(images),
+            VisionEncoder::MiniCpmV(enc) => enc.encode_images(images),
         }
     }
 }
 
+/// Build the encoder for the backend the sidecar resolved to, mirroring
+/// llama.cpp's `init_vision()`: the projector type picks the graph, not the text
+/// architecture. `cfg` supplies only text-side geometry.
 pub(crate) fn build_vision_encoder_from_mmproj(
+    backend: MultimodalBackend,
     cfg: &Config,
     mmproj: GGUFFile,
 ) -> Result<Option<VisionEncoder>, String> {
-    match cfg.capabilities.multimodal_backend {
+    match backend {
         MultimodalBackend::Gemma3 => {
             let encoder = gemma3::Gemma3VisionEncoder::new(mmproj, cfg.dim)?;
             Ok(Some(VisionEncoder::Gemma3(encoder)))
@@ -564,7 +576,11 @@ pub(crate) fn build_vision_encoder_from_mmproj(
             let encoder = idefics3::Idefics3VisionEncoder::new(mmproj, cfg.dim)?;
             Ok(Some(VisionEncoder::Idefics3(encoder)))
         }
-        _ => Ok(None),
+        MultimodalBackend::MiniCpmV => {
+            let encoder = minicpmv::MiniCpmVVisionEncoder::new(mmproj, cfg.dim)?;
+            Ok(Some(VisionEncoder::MiniCpmV(Box::new(encoder))))
+        }
+        MultimodalBackend::None => Ok(None),
     }
 }
 

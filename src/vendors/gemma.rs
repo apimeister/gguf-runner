@@ -12,8 +12,8 @@ use super::{
 use crate::engine::types::{
     Config, ContentPart, EncodedPrompt, GEMMA3_BOS_TOKEN, GEMMA3_END_TURN, GEMMA3_START_TURN,
     GenerationRequest, GgufValue, ImageAttentionMode, ImagePromptSource, ImageStretchFilter,
-    ImageViewPolicy, LanguageAttentionPolicy, MultimodalBackend, RopeScalingPolicy, Tokenizer,
-    VendorTokenizerPolicy,
+    ImageViewPolicy, LanguageAttentionPolicy, MultimodalBackend, RopeScalingPolicy, ThinkMode,
+    Tokenizer, VendorTokenizerPolicy,
 };
 use std::collections::HashMap;
 
@@ -191,11 +191,18 @@ pub(super) fn encode_generation_request(
     if count > 0 {
         let sources = (0..count)
             .map(|source_index| ImagePromptSource {
+                grid: None,
                 source_index,
                 view_count: 1,
             })
             .collect::<Vec<_>>();
-        return image_views::encode_request(tokenizer, request, &sources, usize::MAX);
+        return image_views::encode_request(
+            tokenizer,
+            request,
+            &sources,
+            usize::MAX,
+            ThinkMode::No,
+        );
     }
     Ok(encode_text_request(tokenizer, request))
 }

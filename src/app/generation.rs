@@ -1467,6 +1467,9 @@ struct MmprojSidecarProbe {
     path: String,
     has_vision_encoder: bool,
     has_vision_projector: bool,
+    /// Backend the sidecar's `clip.projector_type` resolved to, which is what
+    /// selects the encoder graph. `None` for an audio-only sidecar.
+    vision_backend: Option<MultimodalBackend>,
     audio_backend: Option<AudioEncoderBackend>,
     n_tensors: u64,
 }
@@ -1639,6 +1642,12 @@ impl ModelRuntime {
                     && self.has_vocab_token("<|image_pad|>")
             }
             MultimodalBackend::Idefics3 => self.has_vocab_token("<image>"),
+            MultimodalBackend::MiniCpmV => {
+                self.has_vocab_token("<image>")
+                    && self.has_vocab_token("</image>")
+                    && self.has_vocab_token("<slice>")
+                    && self.has_vocab_token("</slice>")
+            }
             MultimodalBackend::None => false,
         }
     }
@@ -1650,9 +1659,10 @@ impl ModelRuntime {
                     && self.has_vocab_token("<|vision_end|>")
                     && self.has_vocab_token("<|video_pad|>")
             }
-            MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 | MultimodalBackend::None => {
-                false
-            }
+            MultimodalBackend::Gemma3
+            | MultimodalBackend::Idefics3
+            | MultimodalBackend::MiniCpmV
+            | MultimodalBackend::None => false,
         }
     }
 
@@ -1663,9 +1673,10 @@ impl ModelRuntime {
                     && self.has_vocab_token("<|audio_pad|>")
                     && self.has_vocab_token("<|audio_end|>")
             }
-            MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 | MultimodalBackend::None => {
-                false
-            }
+            MultimodalBackend::Gemma3
+            | MultimodalBackend::Idefics3
+            | MultimodalBackend::MiniCpmV
+            | MultimodalBackend::None => false,
         }
     }
 
@@ -1708,16 +1719,31 @@ impl ModelRuntime {
         self.mmproj_candidates = mmproj_candidates;
         self.mmproj_sidecar = mmproj_sidecar;
 
+        // The projector decides the media prompt structure, not just the encoder
+        // graph, so adopt the sidecar's policy once it resolves.
+        if let Some(backend) = self
+            .mmproj_sidecar
+            .as_ref()
+            .and_then(|probe| probe.vision_backend)
+        {
+            self.settings.vendor_multimodal_policy =
+                crate::vendors::multimodal_policy_for_vision(&self.config, backend);
+        }
+
         if let Some(probe) = &self.mmproj_sidecar {
             if debug_mode {
                 emit_debug_line(
                     event_callback,
                     format!(
-                        "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, audio_backend={}",
+                        "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, vision_backend={}, audio_backend={}",
                         probe.path,
                         probe.n_tensors,
                         probe.has_vision_encoder,
                         probe.has_vision_projector,
+                        probe
+                            .vision_backend
+                            .map(MultimodalBackend::as_str)
+                            .unwrap_or("none"),
                         probe
                             .audio_backend
                             .map(AudioEncoderBackend::as_str)
@@ -1736,7 +1762,11 @@ impl ModelRuntime {
                         probe.path
                     )
                 })?;
-                self.vision_encoder = build_vision_encoder_from_mmproj(&self.config, mmproj)?;
+                let vision_backend = probe
+                    .vision_backend
+                    .unwrap_or(self.config.capabilities.multimodal_backend);
+                self.vision_encoder =
+                    build_vision_encoder_from_mmproj(vision_backend, &self.config, mmproj)?;
             }
             if self.audio_encoder.is_none()
                 && audio_requested
@@ -1801,11 +1831,15 @@ impl ModelRuntime {
     fn mmproj_summary(&self) -> String {
         if let Some(probe) = &self.mmproj_sidecar {
             format!(
-                "mmproj(path='{}', n_tensors={}, vision_encoder={}, vision_projector={}, audio_backend={}, audio_encoder_loaded={}, audio_execution_ready={})",
+                "mmproj(path='{}', n_tensors={}, vision_encoder={}, vision_projector={}, vision_backend={}, audio_backend={}, audio_encoder_loaded={}, audio_execution_ready={})",
                 probe.path,
                 probe.n_tensors,
                 probe.has_vision_encoder,
                 probe.has_vision_projector,
+                probe
+                    .vision_backend
+                    .map(MultimodalBackend::as_str)
+                    .unwrap_or("none"),
                 probe
                     .audio_backend
                     .map(AudioEncoderBackend::as_str)
@@ -2080,8 +2114,8 @@ impl ModelRuntime {
                     continue;
                 }
             };
-            let audio_backend = match crate::vendors::validate_mmproj_for_backend(cfg, &sidecar) {
-                Ok(audio_backend) => audio_backend,
+            let backends = match crate::vendors::validate_mmproj_for_backend(cfg, &sidecar) {
+                Ok(backends) => backends,
                 Err(e) => {
                     if debug_mode {
                         eprintln!(
@@ -2093,6 +2127,7 @@ impl ModelRuntime {
                     continue;
                 }
             };
+            let audio_backend = backends.audio;
             if let Err(e) = Self::validate_mmproj_variant_match(checkpoint, &sidecar_path, &sidecar)
             {
                 if debug_mode {
@@ -2118,6 +2153,7 @@ impl ModelRuntime {
                         &sidecar,
                         Self::VISION_PROJECTOR_TENSOR_PREFIXES,
                     ),
+                vision_backend: backends.vision,
                 audio_backend,
                 n_tensors: sidecar.n_tensors,
             };
@@ -2167,6 +2203,13 @@ impl ModelRuntime {
                 MultimodalBackend::Idefics3 => {
                     (false, false, self.has_vocab_token("<image>"), false, false)
                 }
+                MultimodalBackend::MiniCpmV => (
+                    self.has_vocab_token("<image>"),
+                    self.has_vocab_token("</image>"),
+                    false,
+                    false,
+                    false,
+                ),
                 MultimodalBackend::None => (false, false, false, false, false),
             };
         let has_vision_encoder =
@@ -2343,6 +2386,15 @@ impl ModelRuntime {
             && policy.image_view_policy != ImageViewPolicy::OverviewOnly
     }
 
+    /// Backend that actually drives the vision path: the sidecar's resolution when
+    /// one is paired, falling back to the text-derived backend before pairing.
+    fn vision_backend(&self) -> MultimodalBackend {
+        self.mmproj_sidecar
+            .as_ref()
+            .and_then(|probe| probe.vision_backend)
+            .unwrap_or(self.config.capabilities.multimodal_backend)
+    }
+
     fn image_preprocess_profile_from_encoder(&self) -> ImagePreprocessProfile {
         let fallback_norm = ImageNormalization::MeanStd {
             mean: [0.48145466, 0.4578275, 0.40821073],
@@ -2353,7 +2405,7 @@ impl ModelRuntime {
             let clip_norm = ImageNormalization::MeanStd { mean, std };
             let base_size = encoder.recommended_image_size().max(224);
             let align_to = encoder.recommended_image_alignment().max(1);
-            if self.config.capabilities.multimodal_backend == MultimodalBackend::Qwen35 {
+            if self.vision_backend() == MultimodalBackend::Qwen35 {
                 // Scale image resolution with model embedding dim. At dim=2048 (2B) this
                 // yields ~2/3 of the mmproj base_size; at dim=3072 (7B) the full base_size;
                 // beyond that the resolution continues to grow for OCR and fine-detail tasks,
@@ -2375,11 +2427,15 @@ impl ModelRuntime {
                     align_to,
                 );
             }
-            if self.config.capabilities.multimodal_backend == MultimodalBackend::Gemma3
-                || self.config.capabilities.multimodal_backend == MultimodalBackend::Idefics3
-            {
-                // SigLIP-derived encoders (Gemma3, SmolVLM/idefics3) use a direct
-                // bilinear stretch to the encoder's fixed square input size.
+            if matches!(
+                self.vision_backend(),
+                MultimodalBackend::Gemma3
+                    | MultimodalBackend::Idefics3
+                    | MultimodalBackend::MiniCpmV
+            ) {
+                // SigLIP-derived encoders (Gemma3, SmolVLM/idefics3, MiniCPM-V)
+                // stretch straight to their target size. Under a grouped policy
+                // each view carries its own target and this is the nominal one.
                 return ImagePreprocessProfile::new_with_mode(
                     base_size,
                     base_size,
@@ -2409,6 +2465,7 @@ impl ModelRuntime {
                 1,
             ),
             MultimodalBackend::Idefics3 => ImagePreprocessProfile::new(384, 384, fallback_norm),
+            MultimodalBackend::MiniCpmV => ImagePreprocessProfile::new(448, 448, fallback_norm),
             MultimodalBackend::None => {
                 ImagePreprocessProfile::new(448, 448, ImageNormalization::UnitRange)
             }
@@ -2686,8 +2743,9 @@ impl ModelRuntime {
         use crate::engine::io::parse_gguf_from_bytes;
         let mmproj = parse_gguf_from_bytes(data, false)
             .map_err(|e| format!("failed to parse embedded mmproj: {e}"))?;
-        let audio_backend = crate::vendors::validate_mmproj_for_backend(&self.config, &mmproj)
+        let backends = crate::vendors::validate_mmproj_for_backend(&self.config, &mmproj)
             .map_err(|e| format!("embedded mmproj is not compatible with the text model: {e}"))?;
+        let audio_backend = backends.audio;
         let n_tensors = mmproj.n_tensors;
         let has_vision_encoder = audio_backend.is_none()
             && Self::gguf_has_tensor_with_any_prefix(&mmproj, Self::VISION_ENCODER_TENSOR_PREFIXES);
@@ -2703,12 +2761,21 @@ impl ModelRuntime {
                 mmproj,
             )?);
         } else {
-            self.vision_encoder = build_vision_encoder_from_mmproj(&self.config, mmproj)?;
+            let vision_backend = backends
+                .vision
+                .unwrap_or(self.config.capabilities.multimodal_backend);
+            self.vision_encoder =
+                build_vision_encoder_from_mmproj(vision_backend, &self.config, mmproj)?;
+        }
+        if let Some(backend) = backends.vision {
+            self.settings.vendor_multimodal_policy =
+                crate::vendors::multimodal_policy_for_vision(&self.config, backend);
         }
         self.mmproj_sidecar = Some(MmprojSidecarProbe {
             path: "<embedded>".to_string(),
             has_vision_encoder,
             has_vision_projector,
+            vision_backend: backends.vision,
             audio_backend,
             n_tensors,
         });
@@ -2851,17 +2918,29 @@ impl ModelRuntime {
         } else {
             (None, Vec::new())
         };
+        // The projector decides the media prompt structure, not just the encoder
+        // graph, so a resolved sidecar replaces the text family's policy.
+        let vendor_multimodal_policy = mmproj_sidecar
+            .as_ref()
+            .and_then(|probe| probe.vision_backend)
+            .map_or(vendor_multimodal_policy, |backend| {
+                crate::vendors::multimodal_policy_for_vision(&config, backend)
+            });
         if debug_mode
             && media_requested
             && config.capabilities.multimodal_backend != MultimodalBackend::None
         {
             if let Some(probe) = &mmproj_sidecar {
                 eprintln!(
-                    "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, audio_backend={}",
+                    "Detected llama-style mmproj sidecar: path='{}', tensors={}, vision_encoder={}, vision_projector={}, vision_backend={}, audio_backend={}",
                     probe.path,
                     probe.n_tensors,
                     probe.has_vision_encoder,
                     probe.has_vision_projector,
+                    probe
+                        .vision_backend
+                        .map(MultimodalBackend::as_str)
+                        .unwrap_or("none"),
                     probe
                         .audio_backend
                         .map(AudioEncoderBackend::as_str)
@@ -2884,7 +2963,10 @@ impl ModelRuntime {
                             probe.path
                         )
                     })?;
-                    build_vision_encoder_from_mmproj(&config, mmproj)?
+                    let vision_backend = probe
+                        .vision_backend
+                        .unwrap_or(config.capabilities.multimodal_backend);
+                    build_vision_encoder_from_mmproj(vision_backend, &config, mmproj)?
                 } else {
                     None
                 }
@@ -3916,11 +3998,21 @@ impl ModelRuntime {
                     self.grouped_image_request_settings(encoder)?
                 };
                 let policy = self.settings.vendor_multimodal_policy;
+                // Disjoint field borrows: the token closure reads the encoder
+                // while the planner takes the tokenizer mutably.
+                let encoder = self.vision_encoder.as_ref().ok_or_else(|| {
+                    "grouped image views require an initialized vision encoder".to_string()
+                })?;
+                let tokens_for = |width: u32, height: u32| {
+                    encoder.planned_view_tokens(width as usize, height as usize)
+                };
                 let planned = PlannedImageRequest::plan(
                     &mut self.tokenizer,
                     policy,
                     &effective_request,
                     settings,
+                    &tokens_for,
+                    self.settings.think_mode,
                 )?;
                 if self.settings.debug_mode {
                     let resources = planned.resources();

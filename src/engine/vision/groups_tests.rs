@@ -74,6 +74,7 @@ fn grouped_source_contract_validation_rejects_nonfinite_and_overflow() {
             bad,
             ImageOrientationPolicy::ApplyExif,
             limits(),
+            |_, _| Ok(1),
         )
         .unwrap_err();
         assert!(!error.contains("cannot inspect"), "{error}");
@@ -103,6 +104,7 @@ fn grouped_source_contract_validation_rejects_nonfinite_and_overflow() {
             encoding(),
             ImageOrientationPolicy::ApplyExif,
             limits(),
+            |_, _| Ok(1),
         )
         .unwrap_err();
         assert!(error.contains("finite"), "{error}");

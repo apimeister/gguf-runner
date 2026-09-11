@@ -27,7 +27,11 @@ pub(crate) struct ImageViewGroupPlan {
     pub(crate) source_path: String,
     pub(crate) geometry: ImageSourcePlan,
     pub(crate) profile: ImagePreprocessProfile,
+    /// Nominal contract, shared by every view under policies that scale all
+    /// views alike. Per-view extents live on each `ImageViewSpec`.
     pub(crate) encoding: ImageViewEncoding,
+    /// Embeddings each view projects to, in view order.
+    pub(crate) view_tokens: Vec<usize>,
     pub(crate) preparation_bytes: usize,
     pub(crate) embedding_bytes: usize,
 }
@@ -161,7 +165,7 @@ fn oriented_size(size: (u32, u32), orientation: Orientation) -> (u32, u32) {
 
 impl PlannedImageSource {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn open(
+    pub(crate) fn open<F>(
         path: &Path,
         source_index: usize,
         policy: ImageViewPolicy,
@@ -169,7 +173,11 @@ impl PlannedImageSource {
         encoding: ImageViewEncoding,
         orientation_policy: ImageOrientationPolicy,
         limits: ImageSourceLimits,
-    ) -> Result<Self, String> {
+        tokens_for: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(u32, u32) -> Result<usize, String>,
+    {
         validate_contract(profile, encoding, limits)?;
         if !std::fs::metadata(path)
             .map_err(|e| format!("cannot inspect image '{}': {e}", path.display()))?
@@ -233,17 +241,25 @@ impl PlannedImageSource {
             size.0,
             size.1,
             policy,
+            (profile.target_width as u32, profile.target_height as u32),
             ImageViewLimits {
                 max_source_pixels: limits.max_source_pixels,
                 max_views: limits.max_views,
             },
         )
         .map_err(|e| e.to_string())?;
-        let embedding_bytes = geometry
-            .views
-            .len()
-            .checked_mul(encoding.tokens)
-            .and_then(|n| n.checked_mul(encoding.dimension))
+        let mut view_tokens = Vec::new();
+        view_tokens
+            .try_reserve_exact(geometry.views.len())
+            .map_err(|_| "unable to allocate image view token counts".to_string())?;
+        for view in &geometry.views {
+            view_tokens.push(tokens_for(view.target_width, view.target_height)?);
+        }
+        let total_tokens = view_tokens.iter().try_fold(0usize, |sum, &tokens| {
+            sum.checked_add(tokens).ok_or_else(overflow)
+        })?;
+        let embedding_bytes = total_tokens
+            .checked_mul(encoding.dimension)
             .and_then(|n| n.checked_mul(4))
             .ok_or_else(overflow)?;
         if embedding_bytes > limits.max_embedding_bytes {
@@ -261,14 +277,15 @@ impl PlannedImageSource {
                     .max(decoded_bytes.checked_add(rgb_bytes).ok_or_else(overflow)?),
             )
             .ok_or_else(overflow)?;
-        let target_pixels = profile
-            .target_width
-            .checked_mul(profile.target_height)
-            .ok_or_else(overflow)?;
         let mut preparation_bytes = decode_peak;
         for view in &geometry.views {
             let width = (view.rect.right - view.rect.left) as usize;
             let height = (view.rect.bottom - view.rect.top) as usize;
+            let target_width = view.target_width as usize;
+            let target_height = view.target_height as usize;
+            let target_pixels = target_width
+                .checked_mul(target_height)
+                .ok_or_else(overflow)?;
             let crop_bytes = if view.view_index == 0 {
                 0
             } else {
@@ -277,9 +294,8 @@ impl PlannedImageSource {
                     .and_then(|n| n.checked_mul(3))
                     .ok_or_else(overflow)?
             };
-            let resize =
-                bilinear::storage_bound(width, height, profile.target_width, profile.target_height)
-                    .ok_or_else(overflow)?;
+            let resize = bilinear::storage_bound(width, height, target_width, target_height)
+                .ok_or_else(overflow)?;
             let peak = rgb_bytes
                 .checked_add(crop_bytes)
                 .and_then(|n| n.checked_add(resize))
@@ -296,6 +312,7 @@ impl PlannedImageSource {
                 geometry,
                 profile,
                 encoding,
+                view_tokens,
                 preparation_bytes,
                 embedding_bytes,
             },
@@ -385,23 +402,36 @@ impl DecodedImageSource {
             &crop
         };
         let profile = self.plan.profile;
-        let rgb = bilinear::resize_rgb8(source, profile.target_width, profile.target_height)?;
+        let target_width = spec.target_width as usize;
+        let target_height = spec.target_height as usize;
+        let rgb = bilinear::resize_rgb8(source, target_width, target_height)?;
         let data_chw = rgb_u8_to_chw_f32(
             rgb.as_raw(),
-            profile.target_width,
-            profile.target_height,
+            target_width,
+            target_height,
             profile.normalization,
         )?;
         if data_chw.iter().any(|value| !value.is_finite()) {
             return Err("image view contains nonfinite normalized values".to_string());
         }
+        let tokens = *self
+            .plan
+            .view_tokens
+            .get(index)
+            .ok_or_else(|| "image view token count is out of range".to_string())?;
         Ok(PreparedImageView {
             spec,
-            encoding: self.plan.encoding,
+            encoding: ImageViewEncoding {
+                width: spec.target_width,
+                height: spec.target_height,
+                tokens,
+                dimension: self.plan.encoding.dimension,
+                grid: self.plan.encoding.grid,
+            },
             tensor: PreparedImageTensor {
                 path: self.plan.source_path.clone(),
-                width: profile.target_width,
-                height: profile.target_height,
+                width: target_width,
+                height: target_height,
                 data_chw,
             },
         })

@@ -39,8 +39,12 @@ fn run() -> Result<(), String> {
     let model = parse_gguf_file(model, false)?;
     let config = vendors::build_config_from_gguf(&model, false)?;
     let policy = vendors::multimodal_policy(&config);
-    let encoder = build_vision_encoder_from_mmproj(&config, parse_gguf_file(mmproj, false)?)?
-        .ok_or("model has no vision backend")?;
+    let encoder = build_vision_encoder_from_mmproj(
+        config.capabilities.multimodal_backend,
+        &config,
+        parse_gguf_file(mmproj, false)?,
+    )?
+    .ok_or("model has no vision backend")?;
     let size = encoder.recommended_image_size();
     let (mean, std) = encoder.recommended_image_normalization();
     let profile = ImagePreprocessProfile::new_with_mode(

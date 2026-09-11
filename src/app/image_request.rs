@@ -9,7 +9,7 @@ use crate::engine::multimodal::{
 };
 use crate::engine::types::{
     ContentPart, EncodedPrompt, GenerationRequest, ImageOrientationPolicy, ImagePromptSource,
-    ImageSourceLimits, ImageViewEncoding, ImageViewPolicy, ImageViewSpec, Tokenizer,
+    ImageSourceLimits, ImageViewEncoding, ImageViewPolicy, ImageViewSpec, ThinkMode, Tokenizer,
 };
 use crate::engine::vision::ImagePreprocessProfile;
 use crate::engine::vision::groups::{ImageViewGroupPlan, PlannedImageSource, PreparedImageView};
@@ -84,6 +84,8 @@ impl PlannedImageRequest {
         vendor: VendorMultimodalPolicy,
         request: &GenerationRequest,
         settings: ImageRequestSettings,
+        tokens_for: &dyn Fn(u32, u32) -> Result<usize, String>,
+        think_mode: ThinkMode,
     ) -> Result<Self, String> {
         let encode_prompt = vendor
             .image_view_prompt
@@ -157,6 +159,7 @@ impl PlannedImageRequest {
                 settings.encoding,
                 settings.orientation,
                 source_limits,
+                tokens_for,
             )
             .map_err(&context)?;
             let plan = source.plan();
@@ -188,19 +191,23 @@ impl PlannedImageRequest {
             prompt_sources.push(ImagePromptSource {
                 source_index,
                 view_count: plan.geometry.views.len(),
+                grid: plan.geometry.grid,
             });
             view_order.extend_from_slice(&plan.geometry.views);
-            counts.extend(std::iter::repeat_n(
-                plan.encoding.tokens,
-                plan.geometry.views.len(),
-            ));
+            counts.extend_from_slice(&plan.view_tokens);
             sources.push(source);
         }
         resources.image_tokens = counts.iter().try_fold(0usize, |sum, &count| {
             sum.checked_add(count)
                 .ok_or_else(|| "image request token count overflow".to_string())
         })?;
-        let encoded = encode_prompt(tokenizer, request, &prompt_sources, limits.max_prompt_bytes)?;
+        let encoded = encode_prompt(
+            tokenizer,
+            request,
+            &prompt_sources,
+            limits.max_prompt_bytes,
+            think_mode,
+        )?;
         resources.prompt_tokens = preflight_media_context(
             &encoded, &counts, &[], limits.context_tokens, limits.decode_reserve,
         ).map_err(|error| format!(

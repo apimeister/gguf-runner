@@ -111,6 +111,17 @@ pub(crate) enum ImageViewPolicy {
         max_crops: u32,
         min_aspect_ratio: f64,
     },
+    /// LLaVA-UHD: an aspect-preserving overview plus a grid of equal slices, the
+    /// layout MiniCPM-V uses. Each view carries its own target size.
+    UhdGrid {
+        /// Nominal square edge each view is scaled toward.
+        slice_size: u32,
+        /// View extents are rounded to a multiple of this, so an integer number
+        /// of encoder output tokens fits.
+        align: u32,
+        /// Upper bound on slices, excluding the overview.
+        max_slices: u32,
+    },
 }
 
 /// Arithmetic used for fixed-size RGB8 stretching; selected by vendor policy.
@@ -184,6 +195,11 @@ pub(crate) struct ImageViewSpec {
     pub(crate) view_index: usize,
     pub(crate) kind: ImageViewKind,
     pub(crate) rect: ImageRect,
+    /// Size this view is resized to before encoding. Policies that scale every
+    /// view alike repeat the caller's default here; LLaVA-UHD sizes the overview
+    /// and the slices independently.
+    pub(crate) target_width: u32,
+    pub(crate) target_height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,8 +208,12 @@ pub(crate) struct ImageSourcePlan {
     pub(crate) source_index: usize,
     pub(crate) source_width: u32,
     pub(crate) source_height: u32,
-    /// Overview first, followed by crops along the long axis in source order.
+    /// Overview first, followed by crops in source order.
     pub(crate) views: Vec<ImageViewSpec>,
+    /// Slice layout as (columns, rows) when the policy arranges crops in a grid.
+    /// Prompt builders that break rows apart need it; linear policies leave it
+    /// unset.
+    pub(crate) grid: Option<(usize, usize)>,
 }
 
 /// Prompt-facing description of one logical source occurrence. Paths are not
@@ -202,6 +222,8 @@ pub(crate) struct ImageSourcePlan {
 pub(crate) struct ImagePromptSource {
     pub(crate) source_index: usize,
     pub(crate) view_count: usize,
+    /// Slice layout as (columns, rows), when the views form a grid.
+    pub(crate) grid: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -269,6 +291,7 @@ pub(crate) enum MultimodalBackend {
     Qwen3Vl,
     Qwen35,
     Idefics3,
+    MiniCpmV,
 }
 
 impl MultimodalBackend {
@@ -279,6 +302,7 @@ impl MultimodalBackend {
             MultimodalBackend::Qwen3Vl => "qwen3vl",
             MultimodalBackend::Qwen35 => "qwen35",
             MultimodalBackend::Idefics3 => "idefics3",
+            MultimodalBackend::MiniCpmV => "minicpmv",
         }
     }
 }

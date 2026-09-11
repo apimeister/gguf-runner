@@ -4,7 +4,8 @@
 //! until generic embedding injection expands them.
 
 use crate::engine::types::{
-    ContentPart, EncodedPrompt, GenerationRequest, ImagePromptSource, PlaceholderSpan, Tokenizer,
+    ContentPart, EncodedPrompt, GenerationRequest, ImagePromptSource, PlaceholderSpan, ThinkMode,
+    Tokenizer,
 };
 
 const BOS: &str = "<bos>";
@@ -92,6 +93,8 @@ pub(super) fn encode_request(
     request: &GenerationRequest,
     sources: &[ImagePromptSource],
     max_prompt_bytes: usize,
+    // Gemma3 has no think-block contract; its assistant turn is unconditional.
+    _think_mode: ThinkMode,
 ) -> Result<EncodedPrompt, String> {
     let image_count = request
         .parts

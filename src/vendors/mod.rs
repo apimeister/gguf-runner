@@ -4,6 +4,7 @@
 
 mod gemma;
 mod llama;
+mod minicpmv;
 mod qwen2;
 mod qwen3;
 mod qwen35;
@@ -144,6 +145,7 @@ pub(crate) type ImageViewPromptEncoder = fn(
     &GenerationRequest,
     &[crate::engine::types::ImagePromptSource],
     usize,
+    ThinkMode,
 ) -> Result<EncodedPrompt, String>;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -429,13 +431,56 @@ fn validate_qwen3_asr_mmproj_contract(
     Ok(AudioEncoderBackend::Qwen3Asr)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Vision backends a sidecar's `clip.projector_type` can drive.
+///
+/// llama.cpp selects the whole vision path from this one value — encoder graph,
+/// preprocessor, and prompt structure together (`tools/mtmd/mtmd.cpp`,
+/// `init_vision()`). The text model contributes only its embedding width, which
+/// `validate_vision_mmproj_contract` checks below.
+fn vision_backends_for_projector(projector: &str) -> &'static [MultimodalBackend] {
+    match projector {
+        "gemma3" => &[MultimodalBackend::Gemma3],
+        // Qwen3-VL and Qwen3.5 share one projector type; the sidecar family
+        // markers separate them, so both stay eligible here.
+        "qwen3vl_merger" => &[MultimodalBackend::Qwen3Vl, MultimodalBackend::Qwen35],
+        "idefics3" => &[MultimodalBackend::Idefics3],
+        "minicpmv4_6" => &[MultimodalBackend::MiniCpmV],
+        _ => &[],
+    }
+}
+
+/// Resolve the vision backend from the sidecar. The text-derived backend wins
+/// whenever the projector admits it, which keeps every existing pairing on the
+/// exact path it takes today; a projector the text family cannot provide, such
+/// as MiniCPM-V on a `qwen35` language model, selects its own backend.
+fn resolve_vision_backend(
+    text_backend: MultimodalBackend,
+    architecture: &str,
+    projector: &str,
+) -> Result<MultimodalBackend, String> {
+    if architecture != "clip" {
+        return Err(format!(
+            "unsupported mmproj for this runner: general.architecture='{architecture}', expected 'clip'"
+        ));
+    }
+    let candidates = vision_backends_for_projector(projector);
+    let Some(&first) = candidates.first() else {
+        return Err(format!(
+            "unsupported mmproj for this runner: clip.projector_type='{projector}'"
+        ));
+    };
+    if candidates.contains(&text_backend) {
+        Ok(text_backend)
+    } else {
+        Ok(first)
+    }
+}
+
 fn validate_vision_mmproj_contract(
     backend: MultimodalBackend,
     text_embedding_dim: usize,
-    architecture: &str,
-    projector: &str,
     projection_dim: usize,
+    merge_factor: usize,
     has_qwen3vl_marker: bool,
     has_qwen35_marker: bool,
     has_deepstack_tensors: bool,
@@ -454,58 +499,52 @@ fn validate_vision_mmproj_contract(
     }
 
     match backend {
-        MultimodalBackend::Gemma3 => {
-            if architecture != "clip" || projector != "gemma3" {
-                return Err(
-                    "unsupported mmproj for this runner: expected clip.projector_type='gemma3'"
-                        .to_string(),
-                );
+        MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 => Ok(()),
+        MultimodalBackend::Qwen35 => {
+            if has_qwen3vl_marker && !has_qwen35_marker {
+                return Err("incompatible mmproj family for qwen35 backend: sidecar metadata indicates Qwen3-VL; use a Qwen3.5 mmproj from the same checkpoint family".to_string());
+            }
+            if has_deepstack_tensors {
+                return Err("incompatible mmproj family for qwen35 backend: deepstack vision tensors detected (Qwen3-VL style); use a Qwen3.5 mmproj sidecar".to_string());
             }
             Ok(())
         }
-        MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
-            if architecture != "clip" || projector != "qwen3vl_merger" {
-                return Err(
-                    "unsupported mmproj for this runner: expected clip.projector_type='qwen3vl_merger'"
-                        .to_string(),
-                );
-            }
-            match backend {
-                MultimodalBackend::Qwen35 => {
-                    if has_qwen3vl_marker && !has_qwen35_marker {
-                        return Err("incompatible mmproj family for qwen35 backend: sidecar metadata indicates Qwen3-VL; use a Qwen3.5 mmproj from the same checkpoint family".to_string());
-                    }
-                    if has_deepstack_tensors {
-                        return Err("incompatible mmproj family for qwen35 backend: deepstack vision tensors detected (Qwen3-VL style); use a Qwen3.5 mmproj sidecar".to_string());
-                    }
-                }
-                MultimodalBackend::Qwen3Vl if has_qwen35_marker && !has_qwen3vl_marker => {
-                    return Err("incompatible mmproj family for qwen3vl backend: sidecar metadata indicates Qwen3.5; use a Qwen3-VL mmproj from the same checkpoint family".to_string());
-                }
-                _ => {}
+        MultimodalBackend::Qwen3Vl => {
+            if has_qwen35_marker && !has_qwen3vl_marker {
+                return Err("incompatible mmproj family for qwen3vl backend: sidecar metadata indicates Qwen3.5; use a Qwen3-VL mmproj from the same checkpoint family".to_string());
             }
             Ok(())
         }
-        MultimodalBackend::Idefics3 => {
-            if architecture != "clip" || projector != "idefics3" {
-                return Err(
-                    "unsupported mmproj for this runner: expected clip.projector_type='idefics3'"
-                        .to_string(),
-                );
+        MultimodalBackend::MiniCpmV => {
+            // scale_factor 4 inserts a windowed merger mid-tower and merges 2x2
+            // twice; scale_factor 2 runs the tower straight through with a single
+            // merge. This runner implements the first.
+            if merge_factor != 4 {
+                return Err(format!(
+                    "unsupported MiniCPM-V merge factor {merge_factor}: this runner implements clip.vision.projector.scale_factor=4"
+                ));
             }
             Ok(())
         }
-        _ => Err(format!(
+        MultimodalBackend::None => Err(format!(
             "external vision mmproj is unsupported for backend '{}'",
             backend.as_str()
         )),
     }
 }
 
+/// Backends a validated sidecar provides. Exactly one side is populated: a
+/// sidecar carries either vision or audio components, never both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MmprojBackends {
+    pub(crate) vision: Option<MultimodalBackend>,
+    pub(crate) audio: Option<AudioEncoderBackend>,
+}
+
 pub(crate) fn validate_mmproj_for_backend(
     cfg: &Config,
     mmproj: &GGUFFile,
-) -> Result<Option<AudioEncoderBackend>, String> {
+) -> Result<MmprojBackends, String> {
     let audio_metadata = audio_mmproj_metadata(mmproj);
     if audio_metadata.has_audio_encoder || !audio_metadata.projector_type.is_empty() {
         return validate_qwen3_asr_mmproj_contract(
@@ -514,13 +553,20 @@ pub(crate) fn validate_mmproj_for_backend(
             audio_metadata,
             |name| mmproj.tensor_lookup.contains_key(name),
         )
-        .map(Some);
+        .map(|audio| MmprojBackends {
+            vision: None,
+            audio: Some(audio),
+        });
     }
 
     let architecture =
         get_gguf_string_from_map(&mmproj.kv, "general.architecture").unwrap_or_default();
     let projector = get_gguf_string_from_map(&mmproj.kv, "clip.projector_type").unwrap_or_default();
+    let vision =
+        resolve_vision_backend(cfg.capabilities.multimodal_backend, architecture, projector)?;
     let projection_dim = positive_gguf_usize(mmproj, "clip.vision.projection_dim");
+    let merge_factor =
+        get_gguf_int_from_map(&mmproj.kv, "clip.vision.projector.scale_factor", 4).max(0) as usize;
     let (has_qwen3vl_marker, has_qwen35_marker) = qwen_mmproj_family_markers(mmproj);
     let has_deepstack_tensors = mmproj
         .tensors
@@ -528,16 +574,18 @@ pub(crate) fn validate_mmproj_for_backend(
         .any(|tensor| tensor.name.starts_with("v.deepstack."));
 
     validate_vision_mmproj_contract(
-        cfg.capabilities.multimodal_backend,
+        vision,
         cfg.dim,
-        architecture,
-        projector,
         projection_dim,
+        merge_factor,
         has_qwen3vl_marker,
         has_qwen35_marker,
         has_deepstack_tensors,
     )?;
-    Ok(None)
+    Ok(MmprojBackends {
+        vision: Some(vision),
+        audio: None,
+    })
 }
 
 fn detect_model_capabilities(
@@ -580,6 +628,14 @@ fn detect_model_capabilities(
                 && has_vocab_token(gguf, "<|audio_end|>"),
         ),
         MultimodalBackend::Idefics3 => (has_vocab_token(gguf, "<image>"), false, false),
+        MultimodalBackend::MiniCpmV => (
+            has_vocab_token(gguf, "<image>")
+                && has_vocab_token(gguf, "</image>")
+                && has_vocab_token(gguf, "<slice>")
+                && has_vocab_token(gguf, "</slice>"),
+            false,
+            false,
+        ),
         MultimodalBackend::None => (false, false, false),
     };
     let has_vision_tensors = has_tensor_with_any_prefix(gguf, VISION_TENSOR_PREFIXES);
@@ -1159,6 +1215,21 @@ pub(crate) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
     }
 }
 
+/// Prompt and media policy for the backend that actually drives the vision path.
+///
+/// llama.cpp picks the slice template from the projector alongside the encoder
+/// graph, so a sidecar whose projector the text family cannot provide brings its
+/// own prompt contract rather than inheriting the language model's.
+pub(crate) fn multimodal_policy_for_vision(
+    config: &Config,
+    vision_backend: MultimodalBackend,
+) -> VendorMultimodalPolicy {
+    match vision_backend {
+        MultimodalBackend::MiniCpmV => minicpmv::multimodal_policy(),
+        _ => multimodal_policy(config),
+    }
+}
+
 pub(crate) fn runtime_debug_policy(config: &Config) -> VendorRuntimeDebugPolicy {
     if config.is_qwen35 {
         qwen35::runtime_debug_policy()
@@ -1183,7 +1254,7 @@ mod tests {
 
     use super::{
         AudioMmprojMetadata, QWEN3_ASR_FIXED_TENSORS, QWEN3_ASR_LAYER_TENSOR_SUFFIXES,
-        audio_preprocess_config, validate_qwen3_asr_mmproj_contract,
+        audio_preprocess_config, resolve_vision_backend, validate_qwen3_asr_mmproj_contract,
         validate_vision_mmproj_contract,
     };
     use crate::engine::types::{AudioEncoderBackend, MultimodalBackend};
@@ -1318,14 +1389,97 @@ mod tests {
         let result = validate_vision_mmproj_contract(
             MultimodalBackend::Qwen3Vl,
             2_048,
-            "clip",
-            "qwen3vl_merger",
             2_048,
+            4,
             true,
             false,
             true,
         );
 
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn sidecar_projector_keeps_text_backend_when_it_is_admitted() {
+        assert_eq!(
+            resolve_vision_backend(MultimodalBackend::Qwen35, "clip", "qwen3vl_merger"),
+            Ok(MultimodalBackend::Qwen35)
+        );
+        assert_eq!(
+            resolve_vision_backend(MultimodalBackend::Qwen3Vl, "clip", "qwen3vl_merger"),
+            Ok(MultimodalBackend::Qwen3Vl)
+        );
+    }
+
+    #[test]
+    fn sidecar_projector_overrides_a_text_backend_it_does_not_admit() {
+        // MiniCPM-V 4.6 ships a qwen35 language model, so the text architecture
+        // alone cannot tell it apart from Qwen3.5-VL. The projector can.
+        assert_eq!(
+            resolve_vision_backend(MultimodalBackend::Qwen35, "clip", "minicpmv4_6"),
+            Ok(MultimodalBackend::MiniCpmV)
+        );
+    }
+
+    #[test]
+    fn rejects_sidecar_with_unknown_projector_type() {
+        let error = resolve_vision_backend(MultimodalBackend::Qwen35, "clip", "llava").unwrap_err();
+
+        assert!(error.contains("clip.projector_type='llava'"));
+    }
+
+    #[test]
+    fn rejects_sidecar_that_is_not_a_clip_archive() {
+        let error =
+            resolve_vision_backend(MultimodalBackend::Qwen35, "qwen35", "minicpmv4_6").unwrap_err();
+
+        assert!(error.contains("general.architecture='qwen35'"));
+    }
+
+    #[test]
+    fn minicpm_contract_accepts_the_implemented_merge_factor() {
+        let result = validate_vision_mmproj_contract(
+            MultimodalBackend::MiniCpmV,
+            1_024,
+            1_024,
+            4,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn minicpm_contract_rejects_the_unimplemented_merge_factor() {
+        let error = validate_vision_mmproj_contract(
+            MultimodalBackend::MiniCpmV,
+            1_024,
+            1_024,
+            2,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("scale_factor=4"));
+    }
+
+    #[test]
+    fn vision_contract_still_rejects_a_mismatched_embedding_width() {
+        let error = validate_vision_mmproj_contract(
+            MultimodalBackend::MiniCpmV,
+            2_048,
+            1_024,
+            4,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("mmproj/text dim mismatch"));
     }
 }
