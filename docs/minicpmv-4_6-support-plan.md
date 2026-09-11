@@ -361,8 +361,21 @@ which does not apply on this CPU path.
   `slice_size = 448` and `align = 56` are constants in `src/vendors/minicpmv.rs` rather than
   read from the sidecar. A checkpoint that disagrees fails in the encoder's patch-grid check
   instead of slicing incorrectly, but wiring the sidecar's own values through would be better.
-- **Encode time.** Ten views take about 29 s on this machine against roughly 1 s of encode
-  time for the reference. Nothing here is tuned; the tower runs every view independently.
+- **Encode time is bounded by CPU BLAS.** The 1 s figure the reference reports is Metal.
+  Forced onto the CPU with `--no-mmproj-offload`, `llama-mtmd-cli` spends about 5,000 ms per
+  view against this encoder's ~1,400 ms, so the CPU-to-CPU comparison already favours this
+  runner by roughly 3.5x. Closing the remaining gap to Metal means a GPU backend, not a
+  kernel change.
+
+  Three optimisations landed: NEON `FCVTL`/`FCVTN` for F16 conversion in
+  `dequantize_row_f16` and `round_slice_to_f16_precision`, batching views that share a target
+  size through one tower pass, and dropping redundant zero-fills from the matmul scratch
+  buffers. Together they take a ten-view page from 16.15 s to 14.3 s. All three are bit-exact:
+  batched and unbatched runs produce identical output, as do pre- and post-optimisation runs
+  at the same flags.
+
+  `cblas_sgemm` accounts for 6.2 s of what remains, so roughly 43 % of the work is already
+  inside Accelerate.
 - **`n_merge == 2`.** No checkpoint on hand uses it. Rejecting it explicitly costs one line
   and keeps the encoder honest about what it implements.
 - **Position-bucket table size.** Resolved: derived from `v.position_embd.weight` rows and

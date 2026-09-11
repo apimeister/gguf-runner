@@ -34,6 +34,9 @@ const MERGE_WINDOW: usize = 2;
 const MERGE_GROUP: usize = MERGE_WINDOW * MERGE_WINDOW;
 /// The merge factor this encoder implements: two 2x2 stages.
 const SUPPORTED_MERGE_FACTOR: usize = 4;
+/// Upper bound on tokens carried through one batched tower pass, which is what
+/// caps peak activation memory when many views share a shape.
+const MAX_BATCH_TOKENS: usize = 16_384;
 
 fn tensor_n_elements(tensor: &Gguftensor) -> usize {
     let mut n = 1usize;
@@ -506,16 +509,8 @@ impl MiniCpmVVisionEncoder {
         })
     }
 
-    fn patch_embed_and_add_position(
-        &self,
-        image: &PreparedImageTensor,
-    ) -> Result<(Vec<f32>, usize, usize), String> {
-        let (pw, ph) = self.patch_grid(image.width, image.height, &image.path)?;
-        let patch_count = pw
-            .checked_mul(ph)
-            .ok_or_else(|| "patch count overflow".to_string())?;
-
-        let mut tokens = vec![0.0f32; patch_count * self.dim];
+    /// Patch-embed one view into `dst`, which must hold `pw * ph` token rows.
+    fn patch_embed_into(&self, dst: &mut [f32], image: &PreparedImageTensor, pw: usize, ph: usize) {
         let chw = &image.data_chw;
         let image_plane = image.width * image.height;
         let kernel_elems = 3 * self.patch_size * self.patch_size;
@@ -524,8 +519,10 @@ impl MiniCpmVVisionEncoder {
         let image_width = image.width;
         let patch_embd_b = &self.patch_embd_b;
         let patch_embd_w = &self.patch_embd_w;
+        let grid = self.pos_grid;
+        let position_embd = &self.position_embd;
 
-        tokens.par_chunks_mut(dim).enumerate().for_each_init(
+        dst.par_chunks_mut(dim).enumerate().for_each_init(
             || vec![0.0f32; kernel_elems],
             |patch_buf, (patch_idx, out)| {
                 let py = patch_idx / pw;
@@ -540,8 +537,7 @@ impl MiniCpmVVisionEncoder {
                     for ky in 0..patch_size {
                         let src_row = ch_base + (y_base + ky) * image_width + x_base;
                         let src = &chw[src_row..src_row + patch_size];
-                        let dst = &mut patch_buf[patch_off..patch_off + patch_size];
-                        dst.copy_from_slice(src);
+                        patch_buf[patch_off..patch_off + patch_size].copy_from_slice(src);
                         patch_off += patch_size;
                     }
                 }
@@ -551,36 +547,28 @@ impl MiniCpmVVisionEncoder {
                     *outv += dot_f32_simd(patch_buf, &patch_embd_w[woff..woff + kernel_elems]);
                     woff += kernel_elems;
                 }
-            },
-        );
 
-        // Positions are sampled from the square bucket table by nearest bucket,
-        // matching `bucket_coords` upstream. There is no interpolation: two
-        // neighbouring patches can legitimately share a bucket.
-        let grid = self.pos_grid;
-        let position_embd = &self.position_embd;
-        tokens
-            .par_chunks_mut(dim)
-            .enumerate()
-            .for_each(|(token, dst)| {
-                let py = token / pw;
-                let px = token % pw;
+                // Positions are sampled from the square bucket table by nearest
+                // bucket, matching `bucket_coords` upstream. There is no
+                // interpolation: neighbouring patches can share a bucket.
                 let by = (grid * py) / ph;
                 let bx = (grid * px) / pw;
                 let off = (by * grid + bx) * dim;
-                for (d, &v) in dst.iter_mut().zip(&position_embd[off..off + dim]) {
+                for (d, &v) in out.iter_mut().zip(&position_embd[off..off + dim]) {
                     *d += v;
                 }
-            });
-
-        Ok((tokens, pw, ph))
+            },
+        );
     }
 
-    /// Run tower layers `range` over `n_tokens` tokens, in place.
+    /// Run tower layers `range` over a batch of `sequences` views, each holding
+    /// `tokens_per_sequence` tokens. Attention is isolated per view, so batching
+    /// changes only how much work each matmul call carries.
     fn tower_forward(
         &self,
         tokens: &mut [f32],
-        n_tokens: usize,
+        sequences: usize,
+        tokens_per_sequence: usize,
         range: std::ops::Range<usize>,
     ) -> Result<(), String> {
         let mapped = self.gguf.mapped.as_slice();
@@ -588,6 +576,7 @@ impl MiniCpmVVisionEncoder {
         let ff_dim = self.ff_dim;
         let eps = self.eps;
         let use_gelu = self.use_gelu;
+        let n_tokens = sequences * tokens_per_sequence;
 
         let mut x_norm = vec![0.0f32; n_tokens * dim];
         let mut q = vec![0.0f32; n_tokens * dim];
@@ -651,8 +640,8 @@ impl MiniCpmVVisionEncoder {
                 &q,
                 &k,
                 &v,
-                1,
-                n_tokens,
+                sequences,
+                tokens_per_sequence,
                 self.head_count,
                 self.head_dim,
                 &mut attention_scratch,
@@ -669,9 +658,12 @@ impl MiniCpmVVisionEncoder {
             proj_out
                 .par_chunks_mut(dim)
                 .for_each(|dst| add_bias(dst, &layer.attn_out_b));
-            for i in 0..tokens.len() {
-                tokens[i] += proj_out[i];
-            }
+            tokens
+                .par_chunks_mut(dim)
+                .zip(proj_out.par_chunks(dim))
+                .for_each(|(destination, residual)| {
+                    axpy_inplace(destination, 1.0, residual);
+                });
 
             x_norm.par_chunks_mut(dim).enumerate().for_each(|(t, dst)| {
                 layer_norm_affine(
@@ -720,33 +712,44 @@ impl MiniCpmVVisionEncoder {
         Ok(())
     }
 
-    /// Token indices in window-major order: the four tokens of each 2x2 block
-    /// land contiguously, which is what lets `encoder_self_attention` treat every
-    /// block as its own sequence. Upstream reaches the same result with this
-    /// reorder plus an n x n block-diagonal mask; isolating sequences computes the
-    /// identical softmax over the identical four keys without building the mask.
-    fn window_order(ph: usize, pw: usize) -> Vec<usize> {
+    /// Token indices in window-major order across the batch: the four tokens of
+    /// each 2x2 block land contiguously, which is what lets
+    /// `encoder_self_attention` treat every block as its own sequence. Upstream
+    /// reaches the same result with this reorder plus an n x n block-diagonal
+    /// mask; isolating sequences computes the identical softmax over the
+    /// identical four keys without building the mask.
+    fn window_order(views: usize, ph: usize, pw: usize) -> Vec<usize> {
         let half_h = ph / MERGE_WINDOW;
         let half_w = pw / MERGE_WINDOW;
-        let mut order = Vec::with_capacity(half_h * half_w * MERGE_GROUP);
-        for wi in 0..half_h {
-            for wj in 0..half_w {
-                let top = (MERGE_WINDOW * wi) * pw + MERGE_WINDOW * wj;
-                let bottom = (MERGE_WINDOW * wi + 1) * pw + MERGE_WINDOW * wj;
-                order.push(top);
-                order.push(top + 1);
-                order.push(bottom);
-                order.push(bottom + 1);
+        let per_view = ph * pw;
+        let mut order = Vec::with_capacity(views * half_h * half_w * MERGE_GROUP);
+        for view in 0..views {
+            let base = view * per_view;
+            for wi in 0..half_h {
+                for wj in 0..half_w {
+                    let top = base + (MERGE_WINDOW * wi) * pw + MERGE_WINDOW * wj;
+                    let bottom = base + (MERGE_WINDOW * wi + 1) * pw + MERGE_WINDOW * wj;
+                    order.push(top);
+                    order.push(top + 1);
+                    order.push(bottom);
+                    order.push(bottom + 1);
+                }
             }
         }
         order
     }
 
     /// Windowed self-attention over each 2x2 block, added back as a residual.
-    fn merger_attention(&self, tokens: &mut [f32], ph: usize, pw: usize) -> Result<(), String> {
+    fn merger_attention(
+        &self,
+        tokens: &mut [f32],
+        views: usize,
+        ph: usize,
+        pw: usize,
+    ) -> Result<(), String> {
         let mapped = self.gguf.mapped.as_slice();
         let dim = self.dim;
-        let order = Self::window_order(ph, pw);
+        let order = Self::window_order(views, ph, pw);
         let n_windowed = order.len();
         let n_windows = n_windowed / MERGE_GROUP;
         let merger = &self.merger;
@@ -840,11 +843,12 @@ impl MiniCpmVVisionEncoder {
         Ok(())
     }
 
-    /// Gather each 2x2 block into one concatenated row, and return the mean of
-    /// the four source tokens alongside it.
+    /// Gather each 2x2 block into one concatenated row across the batch, and
+    /// return the mean of the four source tokens alongside it.
     fn gather_merge_groups(
         &self,
         tokens: &[f32],
+        views: usize,
         ph: usize,
         pw: usize,
         want_mean: bool,
@@ -853,10 +857,23 @@ impl MiniCpmVVisionEncoder {
         let merged_dim = self.merged_dim;
         let out_h = ph / MERGE_WINDOW;
         let out_w = pw / MERGE_WINDOW;
-        let n_out = out_h * out_w;
+        let per_view_out = out_h * out_w;
+        let per_view_in = ph * pw;
+        let n_out = views * per_view_out;
 
         let mut merged = vec![0.0f32; n_out * merged_dim];
         let mut mean = vec![0.0f32; if want_mean { n_out * dim } else { 0 }];
+
+        let sources = |out_idx: usize| {
+            let view = out_idx / per_view_out;
+            let local = out_idx % per_view_out;
+            let oy = local / out_w;
+            let ox = local % out_w;
+            let base = view * per_view_in;
+            let top = base + (MERGE_WINDOW * oy) * pw + MERGE_WINDOW * ox;
+            let bottom = base + (MERGE_WINDOW * oy + 1) * pw + MERGE_WINDOW * ox;
+            [top, top + 1, bottom, bottom + 1]
+        };
 
         if want_mean {
             merged
@@ -864,12 +881,7 @@ impl MiniCpmVVisionEncoder {
                 .zip(mean.par_chunks_mut(dim))
                 .enumerate()
                 .for_each(|(out_idx, (cat, avg))| {
-                    let oy = out_idx / out_w;
-                    let ox = out_idx % out_w;
-                    let top = (MERGE_WINDOW * oy) * pw + MERGE_WINDOW * ox;
-                    let bottom = (MERGE_WINDOW * oy + 1) * pw + MERGE_WINDOW * ox;
-                    for (slot, token) in [top, top + 1, bottom, bottom + 1].into_iter().enumerate()
-                    {
+                    for (slot, token) in sources(out_idx).into_iter().enumerate() {
                         let src = &tokens[token * dim..(token + 1) * dim];
                         cat[slot * dim..(slot + 1) * dim].copy_from_slice(src);
                         for (a, &s) in avg.iter_mut().zip(src) {
@@ -885,12 +897,7 @@ impl MiniCpmVVisionEncoder {
                 .par_chunks_mut(merged_dim)
                 .enumerate()
                 .for_each(|(out_idx, cat)| {
-                    let oy = out_idx / out_w;
-                    let ox = out_idx % out_w;
-                    let top = (MERGE_WINDOW * oy) * pw + MERGE_WINDOW * ox;
-                    let bottom = (MERGE_WINDOW * oy + 1) * pw + MERGE_WINDOW * ox;
-                    for (slot, token) in [top, top + 1, bottom, bottom + 1].into_iter().enumerate()
-                    {
+                    for (slot, token) in sources(out_idx).into_iter().enumerate() {
                         let src = &tokens[token * dim..(token + 1) * dim];
                         cat[slot * dim..(slot + 1) * dim].copy_from_slice(src);
                     }
@@ -904,6 +911,7 @@ impl MiniCpmVVisionEncoder {
     fn merger_downsample(
         &self,
         tokens: &[f32],
+        views: usize,
         ph: usize,
         pw: usize,
     ) -> Result<(Vec<f32>, usize, usize), String> {
@@ -913,8 +921,8 @@ impl MiniCpmVVisionEncoder {
         let merger = &self.merger;
         let eps = self.eps;
 
-        let (merged, mean, out_h, out_w) = self.gather_merge_groups(tokens, ph, pw, true);
-        let n_out = out_h * out_w;
+        let (merged, mean, out_h, out_w) = self.gather_merge_groups(tokens, views, ph, pw, true);
+        let n_out = views * out_h * out_w;
 
         let mut normed = vec![0.0f32; n_out * merged_dim];
         normed
@@ -971,14 +979,20 @@ impl MiniCpmVVisionEncoder {
     }
 
     /// The final 2x2 merge straight into text embedding width. No residual.
-    fn project(&self, tokens: &[f32], ph: usize, pw: usize) -> Result<Vec<f32>, String> {
+    fn project(
+        &self,
+        tokens: &[f32],
+        views: usize,
+        ph: usize,
+        pw: usize,
+    ) -> Result<Vec<f32>, String> {
         let mapped = self.gguf.mapped.as_slice();
         let merged_dim = self.merged_dim;
         let projector = &self.projector;
         let eps = self.eps;
 
-        let (merged, _, out_h, out_w) = self.gather_merge_groups(tokens, ph, pw, false);
-        let n_out = out_h * out_w;
+        let (merged, _, out_h, out_w) = self.gather_merge_groups(tokens, views, ph, pw, false);
+        let n_out = views * out_h * out_w;
 
         let mut normed = vec![0.0f32; n_out * merged_dim];
         normed
@@ -1004,8 +1018,8 @@ impl MiniCpmVVisionEncoder {
             n_out,
             &mut batch_scratch,
         )?;
-        // `nn.GELU()` upstream, so the erf form rather than the tanh form used by
-        // the tower and the downsample MLP.
+        // `nn.GELU()` upstream, so the erf form rather than the tanh form used
+        // by the tower and the downsample MLP.
         hidden
             .par_chunks_mut(projector.hidden_dim)
             .for_each(|chunk| {
@@ -1030,24 +1044,33 @@ impl MiniCpmVVisionEncoder {
         Ok(out)
     }
 
-    fn encode_single_image(
+    /// Encode views that share a patch grid as one batch.
+    fn encode_batch(
         &self,
-        image: &PreparedImageTensor,
-    ) -> Result<MediaEmbeddingSequence, String> {
-        let (mut tokens, pw, ph) = self.patch_embed_and_add_position(image)?;
-        let n_tokens = pw * ph;
+        images: &[&PreparedImageTensor],
+        pw: usize,
+        ph: usize,
+    ) -> Result<Vec<MediaEmbeddingSequence>, String> {
+        let views = images.len();
+        let per_view = pw * ph;
+        let dim = self.dim;
 
-        self.tower_forward(&mut tokens, n_tokens, 0..self.insert_layer_id + 1)?;
-        self.merger_attention(&mut tokens, ph, pw)?;
-        let (mut tokens, ph, pw) = self.merger_downsample(&tokens, ph, pw)?;
-        let n_tokens = pw * ph;
+        let mut tokens = vec![0.0f32; views * per_view * dim];
+        for (index, image) in images.iter().enumerate() {
+            let start = index * per_view * dim;
+            self.patch_embed_into(&mut tokens[start..start + per_view * dim], image, pw, ph);
+        }
+
+        self.tower_forward(&mut tokens, views, per_view, 0..self.insert_layer_id + 1)?;
+        self.merger_attention(&mut tokens, views, ph, pw)?;
+        let (mut tokens, ph, pw) = self.merger_downsample(&tokens, views, ph, pw)?;
         self.tower_forward(
             &mut tokens,
-            n_tokens,
+            views,
+            ph * pw,
             self.insert_layer_id + 1..self.n_layers,
         )?;
 
-        let dim = self.dim;
         let eps = self.eps;
         let post_ln_w = &self.post_ln_w;
         let post_ln_b = &self.post_ln_b;
@@ -1062,24 +1085,69 @@ impl MiniCpmVVisionEncoder {
             );
         });
 
-        let projected = self.project(&normed, ph, pw)?;
+        let projected = self.project(&normed, views, ph, pw)?;
         let target_dim = self.projector.target_dim;
-        Ok(MediaEmbeddingSequence {
-            grid: None,
-            tokens: projected
-                .chunks_exact(target_dim)
-                .map(<[f32]>::to_vec)
-                .collect(),
-        })
+        let per_view_out = projected.len() / views.max(1) / target_dim;
+        Ok((0..views)
+            .map(|view| {
+                let start = view * per_view_out * target_dim;
+                let end = start + per_view_out * target_dim;
+                MediaEmbeddingSequence {
+                    grid: None,
+                    tokens: projected[start..end]
+                        .chunks_exact(target_dim)
+                        .map(<[f32]>::to_vec)
+                        .collect(),
+                }
+            })
+            .collect())
     }
 
     pub(crate) fn encode_images(
         &self,
         images: &[PreparedImageTensor],
     ) -> Result<Vec<MediaEmbeddingSequence>, String> {
-        images
-            .iter()
-            .map(|image| self.encode_single_image(image))
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Views of one shape encode together. Every matmul dequantises its whole
+        // weight matrix, so one pass over ten views does that work once instead
+        // of ten times, and hands Accelerate a correspondingly larger GEMM.
+        let mut groups: Vec<((usize, usize), Vec<usize>)> = Vec::new();
+        for (index, image) in images.iter().enumerate() {
+            let shape = (image.width, image.height);
+            match groups.iter_mut().find(|(key, _)| *key == shape) {
+                Some((_, members)) => members.push(index),
+                None => groups.push((shape, vec![index])),
+            }
+        }
+
+        let mut encoded: Vec<Option<MediaEmbeddingSequence>> =
+            (0..images.len()).map(|_| None).collect();
+        for (shape, members) in groups {
+            let (pw, ph) = self.patch_grid(shape.0, shape.1, &images[members[0]].path)?;
+            let per_view = pw.checked_mul(ph).filter(|&n| n > 0).ok_or_else(|| {
+                format!(
+                    "image '{}' produced an empty patch grid",
+                    images[members[0]].path
+                )
+            })?;
+            // Bound peak activation memory rather than the view count, so a
+            // larger grid shrinks the batch instead of growing the buffers.
+            let per_batch = (MAX_BATCH_TOKENS / per_view).max(1);
+            for chunk in members.chunks(per_batch) {
+                let batch: Vec<&PreparedImageTensor> =
+                    chunk.iter().map(|&index| &images[index]).collect();
+                for (slot, sequence) in chunk.iter().zip(self.encode_batch(&batch, pw, ph)?) {
+                    encoded[*slot] = Some(sequence);
+                }
+            }
+        }
+
+        encoded
+            .into_iter()
+            .map(|sequence| sequence.ok_or_else(|| "image view was not encoded".to_string()))
             .collect()
     }
 }
@@ -1091,7 +1159,7 @@ mod tests {
     #[test]
     fn window_order_groups_each_2x2_block_contiguously() {
         // A 4x4 patch grid holds four 2x2 windows.
-        let order = MiniCpmVVisionEncoder::window_order(4, 4);
+        let order = MiniCpmVVisionEncoder::window_order(1, 4, 4);
 
         assert_eq!(order.len(), 16);
         // First window: the top-left 2x2 block, row-major inside the block.
@@ -1103,8 +1171,22 @@ mod tests {
     }
 
     #[test]
+    fn window_order_offsets_each_view_in_a_batch() {
+        // Two views of a 4x4 grid: the second view repeats the first view's
+        // pattern shifted by one view's worth of tokens, so batching cannot
+        // leak attention across views.
+        let single = MiniCpmVVisionEncoder::window_order(1, 4, 4);
+        let batched = MiniCpmVVisionEncoder::window_order(2, 4, 4);
+
+        assert_eq!(batched.len(), single.len() * 2);
+        assert_eq!(&batched[..single.len()], &single[..]);
+        let shifted: Vec<usize> = single.iter().map(|index| index + 16).collect();
+        assert_eq!(&batched[single.len()..], &shifted[..]);
+    }
+
+    #[test]
     fn window_order_visits_every_token_exactly_once() {
-        let order = MiniCpmVVisionEncoder::window_order(8, 6);
+        let order = MiniCpmVVisionEncoder::window_order(1, 8, 6);
         let mut seen = order.clone();
         seen.sort_unstable();
         seen.dedup();

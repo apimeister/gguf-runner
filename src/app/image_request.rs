@@ -12,7 +12,8 @@ use crate::engine::types::{
     ImageSourceLimits, ImageViewEncoding, ImageViewPolicy, ImageViewSpec, ThinkMode, Tokenizer,
 };
 use crate::engine::vision::ImagePreprocessProfile;
-use crate::engine::vision::groups::{ImageViewGroupPlan, PlannedImageSource, PreparedImageView};
+use crate::engine::vision::PreparedImageTensor;
+use crate::engine::vision::groups::{ImageViewGroupPlan, PlannedImageSource};
 use crate::vendors::VendorMultimodalPolicy;
 use std::path::Path;
 
@@ -237,12 +238,12 @@ impl PlannedImageRequest {
     }
 
     pub(crate) fn encode(self, encoder: &VisionEncoder) -> Result<PreparedImageRequest, String> {
-        self.encode_with(|view| encoder.encode_images(std::slice::from_ref(&view.tensor)))
+        self.encode_with(|tensors| encoder.encode_images(tensors))
     }
 
     fn encode_with(
         self,
-        mut encode: impl FnMut(&PreparedImageView) -> Result<Vec<MediaEmbeddingSequence>, String>,
+        mut encode: impl FnMut(&[PreparedImageTensor]) -> Result<Vec<MediaEmbeddingSequence>, String>,
     ) -> Result<PreparedImageRequest, String> {
         let mut groups = Vec::new();
         let mut embeddings = Vec::new();

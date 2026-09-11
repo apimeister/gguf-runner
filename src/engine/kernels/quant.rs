@@ -34,7 +34,7 @@ use crate::engine::types::{
 const BIN1_TYPE_SIZE: usize = 18;
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
-    ParallelSliceMut,
+    ParallelSlice, ParallelSliceMut,
 };
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -516,9 +516,67 @@ pub(crate) fn dequantize_row_q6_k(src: &[u8], dst: &mut [f32], k: usize) {
     }
 }
 
+/// Bulk F16 -> F32. AArch64 converts four halves per `FCVTL`, against roughly
+/// twenty scalar operations each; the tail and other targets use the scalar
+/// reference, and `neon_f16_conversion_matches_scalar_reference` pins the two
+/// together over every bit pattern.
+///
+/// The one behavioural difference is that `FCVTL` quiets a signalling NaN where
+/// the scalar path propagates its payload. Both remain NaN, and model weights
+/// carry neither.
 pub(crate) fn dequantize_row_f16(src: &[u8], dst: &mut [f32], k: usize) {
-    for i in 0..k {
+    debug_assert!(src.len() >= k * 2 && dst.len() >= k);
+    let mut start = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::{float16x4_t, vcvt_f32_f16, vst1q_f32};
+
+        while start + 4 <= k {
+            // SAFETY: the loop bound leaves eight readable bytes in `src` and
+            // four writable floats in `dst`. GGUF stores little-endian halves
+            // and AArch64 is little-endian, so the pattern transmutes directly.
+            unsafe {
+                let raw = std::ptr::read_unaligned(src.as_ptr().add(start * 2).cast::<[u16; 4]>());
+                let halves: float16x4_t = std::mem::transmute(raw);
+                vst1q_f32(dst.as_mut_ptr().add(start), vcvt_f32_f16(halves));
+            }
+            start += 4;
+        }
+    }
+
+    for i in start..k {
         dst[i] = fp16_to_fp32(read_u16_le(src, i * 2));
+    }
+}
+
+/// Narrow F32 activations to F16 precision, which is what GGML's matrix dot
+/// type sees. Both directions are single instructions on AArch64, so the round
+/// trip costs one `FCVTN`/`FCVTL` pair per four lanes.
+pub(crate) fn round_slice_to_f16_precision(dst: &mut [f32], src: &[f32]) {
+    let n = dst.len().min(src.len());
+    let mut start = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::{vcvt_f16_f32, vcvt_f32_f16, vld1q_f32, vst1q_f32};
+
+        while start + 4 <= n {
+            // SAFETY: the loop bound leaves four readable floats in `src` and
+            // four writable floats in `dst`.
+            unsafe {
+                let wide = vld1q_f32(src.as_ptr().add(start));
+                vst1q_f32(
+                    dst.as_mut_ptr().add(start),
+                    vcvt_f32_f16(vcvt_f16_f32(wide)),
+                );
+            }
+            start += 4;
+        }
+    }
+
+    for i in start..n {
+        dst[i] = fp16_to_fp32(fp32_to_fp16(src[i]));
     }
 }
 
@@ -9773,20 +9831,28 @@ pub(crate) fn matmul_quantized_batch_float(
     }
 
     if qw.ttype.0 == GGML_TYPE_F16 {
-        scratch.f16_input_f32.resize(inp.len(), 0.0);
-        scratch
-            .f16_input_f32
-            .par_iter_mut()
-            .zip(inp.par_iter())
+        // Grow only. `resize` zero-fills whatever it adds, and every element is
+        // overwritten immediately below, so shrinking between calls of
+        // alternating shapes would pay for that fill again on the next growth.
+        if scratch.f16_input_f32.len() < inp.len() {
+            scratch.f16_input_f32.resize(inp.len(), 0.0);
+        }
+        // Chunked so each worker runs the vector path over a contiguous run
+        // instead of converting one element per iteration.
+        const ROUND_CHUNK: usize = 4096;
+        let rounded = &mut scratch.f16_input_f32[..inp.len()];
+        rounded
+            .par_chunks_mut(ROUND_CHUNK)
+            .zip(inp.par_chunks(ROUND_CHUNK))
             .for_each(|(destination, source)| {
-                *destination = fp16_to_fp32(fp32_to_fp16(*source));
+                round_slice_to_f16_precision(destination, source);
             });
 
         #[cfg(target_os = "macos")]
         if m >= 8 {
             return matmul_quantized_batch_f16_accelerate(
                 out,
-                &scratch.f16_input_f32,
+                &scratch.f16_input_f32[..inp.len()],
                 qw,
                 mapped,
                 m,
@@ -9798,7 +9864,7 @@ pub(crate) fn matmul_quantized_batch_float(
 
         return matmul_quantized_batch_dequantized(
             out,
-            &scratch.f16_input_f32,
+            &scratch.f16_input_f32[..inp.len()],
             qw,
             mapped,
             m,
@@ -9903,8 +9969,13 @@ fn matmul_quantized_batch_f16_accelerate(
     }
     ensure_model_range(data_offset, data_size)?;
 
-    weights_f32.resize(d * n, 0.0);
-    weights_f32
+    // Grow only, for the same reason as the activation buffer above: every
+    // element is rewritten by the dequantisation that follows.
+    let weight_elements = d * n;
+    if weights_f32.len() < weight_elements {
+        weights_f32.resize(weight_elements, 0.0);
+    }
+    weights_f32[..weight_elements]
         .par_chunks_mut(n)
         .enumerate()
         .for_each(|(row, destination)| {
@@ -11316,6 +11387,68 @@ mod qk_mr4_tests {
 
 #[cfg(test)]
 mod batch_exact_tests {
+    #[test]
+    fn neon_f16_conversion_matches_scalar_reference() {
+        use super::{dequantize_row_f16, round_slice_to_f16_precision};
+        use crate::engine::io::{fp16_to_fp32, fp32_to_fp16};
+
+        // Every F16 bit pattern, so subnormals, infinities and NaNs are covered.
+        let mut raw = Vec::with_capacity(65536 * 2);
+        for pattern in 0..=u16::MAX {
+            raw.extend_from_slice(&pattern.to_le_bytes());
+        }
+        let mut widened = vec![0.0f32; 65536];
+        dequantize_row_f16(&raw, &mut widened, 65536);
+        for pattern in 0..=u16::MAX {
+            let expected = fp16_to_fp32(pattern);
+            let actual = widened[pattern as usize];
+            if expected.is_nan() {
+                // FCVTL quiets a signalling NaN, which the scalar path passes
+                // through. Both stay NaN; only the payload differs.
+                assert!(actual.is_nan(), "f16 0x{pattern:04x} widened to {actual}");
+                continue;
+            }
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "f16 0x{pattern:04x} widened to {actual}, scalar gives {expected}"
+            );
+        }
+
+        // Narrowing over normals, subnormals, overflow and the tie cases that
+        // round-to-nearest-even decides.
+        let mut inputs: Vec<f32> = Vec::new();
+        for pattern in 0..=u16::MAX {
+            inputs.push(fp16_to_fp32(pattern));
+        }
+        for step in 0..4096u32 {
+            let scaled = step as f32;
+            inputs.push(scaled * 1.000_061);
+            inputs.push(scaled * -7.629_394_5e-6);
+            inputs.push(65_504.0 + scaled);
+            inputs.push(6.0e-8 * scaled);
+        }
+        inputs.push(f32::INFINITY);
+        inputs.push(f32::NEG_INFINITY);
+        inputs.push(0.0);
+        inputs.push(-0.0);
+        let mut rounded = vec![0.0f32; inputs.len()];
+        round_slice_to_f16_precision(&mut rounded, &inputs);
+        for (index, &value) in inputs.iter().enumerate() {
+            let expected = fp16_to_fp32(fp32_to_fp16(value));
+            if expected.is_nan() {
+                assert!(rounded[index].is_nan(), "rounding {value} lost its NaN");
+                continue;
+            }
+            assert_eq!(
+                rounded[index].to_bits(),
+                expected.to_bits(),
+                "rounding {value} gave {} but scalar gives {expected}",
+                rounded[index]
+            );
+        }
+    }
+
     use super::*;
     use crate::engine::types::{GgmlType, QuantizedTensor};
 
