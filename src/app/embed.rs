@@ -54,6 +54,16 @@ pub trait Tool {
     /// Be specific: what the tool does, what arguments it expects.
     fn description(&self) -> &str;
 
+    /// JSON Schema for this tool's arguments, already serialized.
+    ///
+    /// Listed in the `<tools>` entry so the model is told argument names,
+    /// types and which are required, rather than having to infer them from
+    /// the description. `None` omits the field, which is what a tool taking no
+    /// arguments — or one describing them in prose — wants.
+    fn parameters(&self) -> Option<String> {
+        None
+    }
+
     /// Execute the tool with the arguments the model provided.
     ///
     /// Return a JSON value that will be fed back to the model as the tool
@@ -701,7 +711,7 @@ struct ToolCallRequest {
 #[cfg(test)]
 mod tool_prompt_tests {
     use super::{
-        ToolCallFormat, build_tool_system_prompt_from_specs, detect_tool_call_format,
+        ToolCallFormat, ToolSpec, build_tool_system_prompt_from_specs, detect_tool_call_format,
         extract_tool_call,
     };
 
@@ -730,7 +740,7 @@ mod tool_prompt_tests {
     fn each_format_asks_only_for_its_own_shape() {
         let xml = build_tool_system_prompt_from_specs(
             "BASE",
-            &[("list_users", "List all users.")],
+            &[ToolSpec::new("list_users", "List all users.")],
             ToolCallFormat::XmlFunction,
         );
         assert!(xml.contains("<function=example_function_name>"));
@@ -739,7 +749,7 @@ mod tool_prompt_tests {
 
         let json = build_tool_system_prompt_from_specs(
             "BASE",
-            &[("list_users", "List all users.")],
+            &[ToolSpec::new("list_users", "List all users.")],
             ToolCallFormat::JsonObject,
         );
         assert!(json.contains(r#""arguments": <args-json-object>"#));
@@ -753,7 +763,7 @@ mod tool_prompt_tests {
     fn ordering_matches_each_family_of_template() {
         let xml = build_tool_system_prompt_from_specs(
             "BASE-PROMPT",
-            &[("a", "d")],
+            &[ToolSpec::new("a", "d")],
             ToolCallFormat::XmlFunction,
         );
         assert!(xml.starts_with("# Tools"));
@@ -761,7 +771,7 @@ mod tool_prompt_tests {
 
         let json = build_tool_system_prompt_from_specs(
             "BASE-PROMPT",
-            &[("a", "d")],
+            &[ToolSpec::new("a", "d")],
             ToolCallFormat::JsonObject,
         );
         assert!(json.starts_with("BASE-PROMPT"));
@@ -773,12 +783,50 @@ mod tool_prompt_tests {
         for format in [ToolCallFormat::XmlFunction, ToolCallFormat::JsonObject] {
             let p = build_tool_system_prompt_from_specs(
                 "",
-                &[("list_users", "List all \"users\".")],
+                &[ToolSpec::new("list_users", "List all \"users\".")],
                 format,
             );
             assert!(p.contains(r#"{"name":"list_users","description":"List all \"users\"."}"#));
             assert!(p.contains("<tools>") && p.contains("</tools>"));
         }
+    }
+
+    /// A schema is what tells the model argument names, types and which are
+    /// required; without it the model infers them from prose.
+    #[test]
+    fn parameters_schema_is_listed_when_present() {
+        let schema =
+            r#"{"type":"object","properties":{"login":{"type":"string"}},"required":["login"]}"#;
+        for format in [ToolCallFormat::XmlFunction, ToolCallFormat::JsonObject] {
+            let p = build_tool_system_prompt_from_specs(
+                "",
+                &[ToolSpec::with_parameters(
+                    "delete_user",
+                    "Delete a user.",
+                    schema,
+                )],
+                format,
+            );
+            assert!(p.contains(&format!(r#""parameters":{schema}"#)));
+            // The entry stays one valid JSON object per line inside <tools>.
+            let line = p
+                .lines()
+                .find(|l| l.contains("delete_user"))
+                .expect("tool line");
+            serde_json::from_str::<serde_json::Value>(line).expect("tool entry is valid JSON");
+        }
+    }
+
+    /// Omitted rather than empty: a tool with no schema must not advertise a
+    /// `parameters` key the model might try to satisfy.
+    #[test]
+    fn parameters_key_is_absent_without_a_schema() {
+        let p = build_tool_system_prompt_from_specs(
+            "",
+            &[ToolSpec::new("list_users", "List all users.")],
+            ToolCallFormat::XmlFunction,
+        );
+        assert!(!p.contains("\"parameters\""));
     }
 
     /// The parser accepts both shapes, so whichever format the prompt asked for
@@ -926,13 +974,23 @@ fn strip_xml_block(text: &str, tag: &str) -> String {
 }
 
 fn build_tool_system_prompt(base: &str, tools: &[&mut dyn Tool], format: ToolCallFormat) -> String {
-    let specs: Vec<(String, String)> = tools
+    let specs: Vec<(String, String, Option<String>)> = tools
         .iter()
-        .map(|t| (t.name().to_string(), t.description().to_string()))
+        .map(|t| {
+            (
+                t.name().to_string(),
+                t.description().to_string(),
+                t.parameters(),
+            )
+        })
         .collect();
-    let spec_refs: Vec<(&str, &str)> = specs
+    let spec_refs: Vec<ToolSpec<'_>> = specs
         .iter()
-        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .map(|(n, d, p)| ToolSpec {
+            name: n.as_str(),
+            description: d.as_str(),
+            parameters: p.as_deref(),
+        })
         .collect();
     build_tool_system_prompt_from_specs(base, &spec_refs, format)
 }
@@ -945,7 +1003,7 @@ fn build_tool_system_prompt(base: &str, tools: &[&mut dyn Tool], format: ToolCal
 /// byte-identical or the cached token prefix will not match.
 pub fn build_tool_system_prompt_from_specs(
     base: &str,
-    specs: &[(&str, &str)],
+    specs: &[ToolSpec<'_>],
     format: ToolCallFormat,
 ) -> String {
     // Explicit key order, not `serde_json::json!`: map key order there depends
@@ -955,12 +1013,15 @@ pub fn build_tool_system_prompt_from_specs(
     // individual strings is used only for escaping and is feature-independent.
     let tool_specs: Vec<String> = specs
         .iter()
-        .map(|(name, description)| {
-            format!(
-                "{{\"name\":{},\"description\":{}}}",
-                serde_json::to_string(name).unwrap_or_default(),
-                serde_json::to_string(description).unwrap_or_default(),
-            )
+        .map(|spec| {
+            let name = serde_json::to_string(spec.name).unwrap_or_default();
+            let description = serde_json::to_string(spec.description).unwrap_or_default();
+            match spec.parameters {
+                Some(parameters) => format!(
+                    "{{\"name\":{name},\"description\":{description},\"parameters\":{parameters}}}"
+                ),
+                None => format!("{{\"name\":{name},\"description\":{description}}}"),
+            }
         })
         .collect();
     let tools_json = tool_specs.join("\n");
@@ -1023,6 +1084,38 @@ If the question can be answered from general knowledge without any tool, just an
             } else {
                 format!("{base}\n\n{block}")
             }
+        }
+    }
+}
+
+/// One tool as the model sees it in the `<tools>` block.
+///
+/// `parameters` is a serialized JSON Schema object, embedded verbatim — the
+/// caller owns its validity, which keeps this type free of a schema
+/// representation and lets a const table hold the text.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolSpec<'a> {
+    pub name: &'a str,
+    pub description: &'a str,
+    pub parameters: Option<&'a str>,
+}
+
+impl<'a> ToolSpec<'a> {
+    /// A tool whose arguments are described in prose rather than a schema.
+    pub fn new(name: &'a str, description: &'a str) -> Self {
+        Self {
+            name,
+            description,
+            parameters: None,
+        }
+    }
+
+    /// A tool carrying a serialized JSON Schema for its arguments.
+    pub fn with_parameters(name: &'a str, description: &'a str, parameters: &'a str) -> Self {
+        Self {
+            name,
+            description,
+            parameters: Some(parameters),
         }
     }
 }
