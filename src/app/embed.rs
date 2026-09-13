@@ -72,6 +72,13 @@ pub struct EmbeddedRuntime {
 }
 
 impl EmbeddedRuntime {
+    /// The tool-call shape this model was trained to emit, read from its own
+    /// chat template. Tool prompts are composed from this, so a runner serving
+    /// a different GGUF asks that model for the format it actually knows.
+    pub fn tool_call_format(&self) -> ToolCallFormat {
+        detect_tool_call_format(&self.inner.chat_template())
+    }
+
     /// Load a model from bytes compiled into the binary (e.g. `include_bytes!`).
     ///
     /// Blocks until the model is fully loaded — weights are mapped and
@@ -424,7 +431,8 @@ impl EmbeddedRuntime {
         tools: &mut [&mut dyn Tool],
         max_tool_calls: usize,
     ) -> Result<Receiver<String>, String> {
-        let tool_system_prompt = build_tool_system_prompt(system_prompt, tools);
+        let tool_system_prompt =
+            build_tool_system_prompt(system_prompt, tools, self.tool_call_format());
 
         // Accumulate tool call/result turns as additional history.
         let mut extended_history: Vec<(String, String)> = history.to_vec();
@@ -498,7 +506,8 @@ impl EmbeddedRuntime {
         max_tool_calls: usize,
         on_token: impl FnMut(&str) + Send + 'static,
     ) -> Result<GenerationStats, String> {
-        let tool_system_prompt = build_tool_system_prompt(system_prompt, tools);
+        let tool_system_prompt =
+            build_tool_system_prompt(system_prompt, tools, self.tool_call_format());
 
         let mut extended_history: Vec<(String, String)> = history.to_vec();
         let mut current_input = input.to_string();
@@ -689,6 +698,111 @@ struct ToolCallRequest {
 ///
 /// Tolerates the model emitting extra `<tool_call>` tags before the body
 /// (some small models duplicate the opening tag).
+#[cfg(test)]
+mod tool_prompt_tests {
+    use super::{
+        ToolCallFormat, build_tool_system_prompt_from_specs, detect_tool_call_format,
+        extract_tool_call,
+    };
+
+    /// The shape is read from the model's own template, not assumed. A template
+    /// that demonstrates the nested `<function=…>` block wants XML; anything
+    /// else gets the JSON object.
+    #[test]
+    fn format_follows_the_models_chat_template() {
+        let xml_template = "…<tool_call>\n<function=example_function_name>\n<parameter=a>…";
+        let json_template = "…<tool_call>\n{\"name\": <function-name>, \"arguments\": {}}…";
+        assert_eq!(
+            detect_tool_call_format(xml_template),
+            ToolCallFormat::XmlFunction
+        );
+        assert_eq!(
+            detect_tool_call_format(json_template),
+            ToolCallFormat::JsonObject
+        );
+        // No template at all: the older, more widely understood shape.
+        assert_eq!(detect_tool_call_format(""), ToolCallFormat::JsonObject);
+    }
+
+    /// Each format asks for its own call shape and never advertises the other's
+    /// — a model shown two shapes has no reason to prefer the one it knows.
+    #[test]
+    fn each_format_asks_only_for_its_own_shape() {
+        let xml = build_tool_system_prompt_from_specs(
+            "BASE",
+            &[("list_users", "List all users.")],
+            ToolCallFormat::XmlFunction,
+        );
+        assert!(xml.contains("<function=example_function_name>"));
+        assert!(xml.contains("an inner <function=...></function> block must be nested"));
+        assert!(!xml.contains(r#""arguments": <args-json-object>"#));
+
+        let json = build_tool_system_prompt_from_specs(
+            "BASE",
+            &[("list_users", "List all users.")],
+            ToolCallFormat::JsonObject,
+        );
+        assert!(json.contains(r#""arguments": <args-json-object>"#));
+        assert!(!json.contains("<function="));
+    }
+
+    /// The two families order the system message differently: XML templates
+    /// emit the tools block first and append the caller's prompt, JSON ones do
+    /// the reverse.
+    #[test]
+    fn ordering_matches_each_family_of_template() {
+        let xml = build_tool_system_prompt_from_specs(
+            "BASE-PROMPT",
+            &[("a", "d")],
+            ToolCallFormat::XmlFunction,
+        );
+        assert!(xml.starts_with("# Tools"));
+        assert!(xml.trim_end().ends_with("BASE-PROMPT"));
+
+        let json = build_tool_system_prompt_from_specs(
+            "BASE-PROMPT",
+            &[("a", "d")],
+            ToolCallFormat::JsonObject,
+        );
+        assert!(json.starts_with("BASE-PROMPT"));
+        assert!(json.contains("# Tools"));
+    }
+
+    #[test]
+    fn tool_specs_are_listed_as_json_inside_tools_tags() {
+        for format in [ToolCallFormat::XmlFunction, ToolCallFormat::JsonObject] {
+            let p = build_tool_system_prompt_from_specs(
+                "",
+                &[("list_users", "List all \"users\".")],
+                format,
+            );
+            assert!(p.contains(r#"{"name":"list_users","description":"List all \"users\"."}"#));
+            assert!(p.contains("<tools>") && p.contains("</tools>"));
+        }
+    }
+
+    /// The parser accepts both shapes, so whichever format the prompt asked for
+    /// round-trips.
+    #[test]
+    fn parses_the_call_shape_each_prompt_demonstrates() {
+        let xml = "sure, let me look\n\
+<tool_call>\n\
+<function=grant_user_access>\n\
+<parameter=login>\nalice\n</parameter>\n\
+<parameter=note>\nline one\nline two\n</parameter>\n\
+</function>\n\
+</tool_call>";
+        let call = extract_tool_call(xml).expect("native XML call parses");
+        assert_eq!(call.name, "grant_user_access");
+        assert_eq!(call.arguments["login"], "alice");
+        assert_eq!(call.arguments["note"], "line one\nline two");
+
+        let json = "<tool_call>\n{\"name\": \"list_users\", \"arguments\": {}}\n</tool_call>";
+        let call = extract_tool_call(json).expect("JSON call parses");
+        assert_eq!(call.name, "list_users");
+    }
+}
+
 fn extract_tool_call(text: &str) -> Option<ToolCallRequest> {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
@@ -811,7 +925,7 @@ fn strip_xml_block(text: &str, tag: &str) -> String {
     out.replace(&close, "")
 }
 
-fn build_tool_system_prompt(base: &str, tools: &[&mut dyn Tool]) -> String {
+fn build_tool_system_prompt(base: &str, tools: &[&mut dyn Tool], format: ToolCallFormat) -> String {
     let specs: Vec<(String, String)> = tools
         .iter()
         .map(|t| (t.name().to_string(), t.description().to_string()))
@@ -820,7 +934,7 @@ fn build_tool_system_prompt(base: &str, tools: &[&mut dyn Tool]) -> String {
         .iter()
         .map(|(n, d)| (n.as_str(), d.as_str()))
         .collect();
-    build_tool_system_prompt_from_specs(base, &spec_refs)
+    build_tool_system_prompt_from_specs(base, &spec_refs, format)
 }
 
 /// Compose the tools system prompt from static `(name, description)` pairs.
@@ -829,12 +943,11 @@ fn build_tool_system_prompt(base: &str, tools: &[&mut dyn Tool]) -> String {
 /// text when rendering a prefill cache (see
 /// [`EmbeddedRuntime::render_prefill_cache`]) — both paths must be
 /// byte-identical or the cached token prefix will not match.
-pub fn build_tool_system_prompt_from_specs(base: &str, specs: &[(&str, &str)]) -> String {
-    // Use the Qwen3 official `# Tools` block with <tools><tool>...</tool></tools>
-    // JSON schemas, the format the model was trained on. The instructions tell
-    // the model to use tools only when they're actually relevant to the query,
-    // and to write a plain prose answer otherwise — without this, the model
-    // tends to call tools eagerly for questions that don't need them.
+pub fn build_tool_system_prompt_from_specs(
+    base: &str,
+    specs: &[(&str, &str)],
+    format: ToolCallFormat,
+) -> String {
     // Explicit key order, not `serde_json::json!`: map key order there depends
     // on the crate's `preserve_order` feature, which Cargo unifies per build
     // graph — a build-script render and the runtime binary can disagree,
@@ -850,17 +963,107 @@ pub fn build_tool_system_prompt_from_specs(base: &str, specs: &[(&str, &str)]) -
             )
         })
         .collect();
+    let tools_json = tool_specs.join("\n");
 
-    format!(
-        "{base}\n\n\
-# Tools\n\n\
+    match format {
+        ToolCallFormat::XmlFunction => {
+            // Reproduces the `# Tools` block such a model's own chat template
+            // emits, down to the wording of the reminder: the tools block
+            // first, the caller's system prompt appended inside the same
+            // system message.
+            let block = format!(
+                "# Tools\n\n\
+You have access to the following functions:\n\n\
+<tools>\n{tools_json}\n</tools>\n\n\
+If you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
+<tool_call>\n\
+<function=example_function_name>\n\
+<parameter=example_parameter_1>\n\
+value_1\n\
+</parameter>\n\
+<parameter=example_parameter_2>\n\
+This is the value for the second parameter\n\
+that can span\n\
+multiple lines\n\
+</parameter>\n\
+</function>\n\
+</tool_call>\n\n\
+<IMPORTANT>\n\
+Reminder:\n\
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n\
+- Required parameters MUST be specified\n\
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n\
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n\
+</IMPORTANT>"
+            );
+            let base = base.trim();
+            if base.is_empty() {
+                block
+            } else {
+                format!("{block}\n\n{base}")
+            }
+        }
+        ToolCallFormat::JsonObject => {
+            // The `# Tools` block used by templates that take a JSON object
+            // inside `<tool_call>`. These templates put the caller's system
+            // prompt first and the tools block after it.
+            let block = format!(
+                "# Tools\n\n\
 You have access to the following functions, defined as JSON specs inside <tools></tools>:\n\
-<tools>\n{}\n</tools>\n\n\
+<tools>\n{tools_json}\n</tools>\n\n\
 When a question needs information that one of the above functions provides, call it by emitting:\n\
 <tool_call>\n{{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}}\n</tool_call>\n\n\
-The user (system) will reply with the result wrapped in <tool_response>...</tool_response>. Write your final answer to the user in plain prose using that result. If the question can be answered from general knowledge without any tool, just answer directly.",
-        tool_specs.join("\n")
-    )
+The user (system) will reply with the result wrapped in <tool_response>...</tool_response>. \
+Write your final answer to the user in plain prose using that result. \
+If the question can be answered from general knowledge without any tool, just answer directly."
+            );
+            let base = base.trim();
+            if base.is_empty() {
+                block
+            } else {
+                format!("{base}\n\n{block}")
+            }
+        }
+    }
+}
+
+/// Which tool-call shape a model was trained to emit.
+///
+/// A runner serves whatever GGUF it is handed, so this is read from the
+/// model's own `tokenizer.chat_template` rather than fixed in the library —
+/// see [`detect_tool_call_format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallFormat {
+    /// `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`
+    /// (MiniCPM-V, Qwen3.5).
+    XmlFunction,
+    /// `<tool_call>{"name": …, "arguments": {…}}</tool_call>` (Qwen2, Qwen3).
+    JsonObject,
+}
+
+/// Pick the tool-call shape a chat template prescribes.
+///
+/// Templates that demonstrate the nested `<function=…>` block are asking for
+/// the XML shape; everything else gets the JSON object, which is the older and
+/// more widely understood form.
+pub fn detect_tool_call_format(chat_template: &str) -> ToolCallFormat {
+    if chat_template.contains("<function=") {
+        ToolCallFormat::XmlFunction
+    } else {
+        ToolCallFormat::JsonObject
+    }
+}
+
+/// Read a GGUF's tool-call shape without loading its weights.
+///
+/// For callers that must compose the prompt before a model is resident — a
+/// build script rendering a prefill cache, for instance. Parsing maps the
+/// file rather than reading it, so this costs a header parse, not a load.
+pub fn tool_call_format_for_gguf(path: &str) -> Result<ToolCallFormat, String> {
+    let gguf = crate::engine::io::parse_gguf_file(path, false)?;
+    let template = crate::engine::io::get_gguf_string_from_map(&gguf.kv, "tokenizer.chat_template")
+        .unwrap_or_default();
+    Ok(detect_tool_call_format(template))
 }
 
 // ---------------------------------------------------------------------------

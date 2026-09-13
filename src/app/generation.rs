@@ -1573,6 +1573,16 @@ pub(crate) struct ModelRuntime {
 }
 
 impl ModelRuntime {
+    /// The model's own `tokenizer.chat_template`, or empty when it declares none.
+    ///
+    /// A runner honours per-model conventions rather than assuming one family's,
+    /// so callers derive prompt shapes from this instead of hardcoding them.
+    pub(crate) fn chat_template(&self) -> String {
+        crate::engine::io::get_gguf_string_from_map(&self.gguf.kv, "tokenizer.chat_template")
+            .unwrap_or_default()
+            .to_string()
+    }
+
     const DEFAULT_VIDEO_SAMPLED_FPS: u32 = 1;
     const MAX_VIDEO_DECODED_FRAMES: usize = 3600;
     const VIDEO_CHUNK_SIZE_FRAMES: usize = 32;
