@@ -1633,7 +1633,7 @@ impl ModelRuntime {
         })
     }
 
-    fn has_vocab_token(&self, token: &str) -> bool {
+    pub(crate) fn has_vocab_token(&self, token: &str) -> bool {
         self.gguf.vocab_tokens.iter().any(|entry| entry == token)
     }
 

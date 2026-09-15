@@ -86,7 +86,10 @@ impl EmbeddedRuntime {
     /// chat template. Tool prompts are composed from this, so a runner serving
     /// a different GGUF asks that model for the format it actually knows.
     pub fn tool_call_format(&self) -> ToolCallFormat {
-        detect_tool_call_format(&self.inner.chat_template())
+        let has_xml_tokens = XML_CALL_MARKERS
+            .iter()
+            .all(|marker| self.inner.has_vocab_token(marker));
+        detect_tool_call_format(&self.inner.chat_template(), has_xml_tokens)
     }
 
     /// Load a model from bytes compiled into the binary (e.g. `include_bytes!`).
@@ -723,15 +726,47 @@ mod tool_prompt_tests {
         let xml_template = "…<tool_call>\n<function=example_function_name>\n<parameter=a>…";
         let json_template = "…<tool_call>\n{\"name\": <function-name>, \"arguments\": {}}…";
         assert_eq!(
-            detect_tool_call_format(xml_template),
+            detect_tool_call_format(xml_template, true),
             ToolCallFormat::XmlFunction
         );
         assert_eq!(
-            detect_tool_call_format(json_template),
+            detect_tool_call_format(json_template, true),
             ToolCallFormat::JsonObject
         );
         // No template at all: the older, more widely understood shape.
-        assert_eq!(detect_tool_call_format(""), ToolCallFormat::JsonObject);
+        assert_eq!(
+            detect_tool_call_format("", true),
+            ToolCallFormat::JsonObject
+        );
+    }
+
+    /// The case this rule exists for: a template that documents the XML shape
+    /// on a tokenizer that carries no token for any of its tags. The model
+    /// would have to spell every tag out of subwords, so it is asked for the
+    /// shape it can actually produce instead of the one it was documented with.
+    #[test]
+    fn vocabulary_outvotes_a_template_that_documents_xml() {
+        let xml_template = "…<tool_call>\n<function=example_function_name>\n<parameter=a>…";
+        assert_eq!(
+            detect_tool_call_format(xml_template, false),
+            ToolCallFormat::JsonObject,
+            "no XML tag tokens: ask for JSON even though the template shows XML"
+        );
+        // Agreement still selects XML — the rule narrows, it does not disable.
+        assert_eq!(
+            detect_tool_call_format(xml_template, true),
+            ToolCallFormat::XmlFunction
+        );
+    }
+
+    /// Tokens for the XML tags do not by themselves mean the model uses them;
+    /// the template still has to document the shape.
+    #[test]
+    fn tokens_alone_do_not_select_xml() {
+        assert_eq!(
+            detect_tool_call_format("a template with no call example", true),
+            ToolCallFormat::JsonObject
+        );
     }
 
     /// Each format asks for its own call shape and never advertises the other's
@@ -1134,13 +1169,26 @@ pub enum ToolCallFormat {
     JsonObject,
 }
 
-/// Pick the tool-call shape a chat template prescribes.
+/// Markers the nested-XML call shape is built from. A tokenizer that carries
+/// them emits each as one trained token; a tokenizer that does not forces the
+/// model to spell every tag out of ordinary subwords.
+const XML_CALL_MARKERS: [&str; 2] = ["<function=", "<parameter="];
+
+/// Pick the tool-call shape a model can actually produce.
 ///
-/// Templates that demonstrate the nested `<function=…>` block are asking for
-/// the XML shape; everything else gets the JSON object, which is the older and
-/// more widely understood form.
-pub fn detect_tool_call_format(chat_template: &str) -> ToolCallFormat {
-    if chat_template.contains("<function=") {
+/// Two pieces of evidence, and they can disagree. The chat template says which
+/// shape the model was *documented* with; the tokenizer says which shape it was
+/// *built* for. A template can demonstrate the nested `<function=…>` block while
+/// the vocabulary holds no token for any of its tags — the model then has to
+/// spell roughly forty exact scaffolding tokens per call out of subwords, which
+/// small models do not survive, while JSON needs no special tokens at all and is
+/// the dialect every model is fluent in.
+///
+/// So the XML shape is asked for only when both agree. The vocabulary is the
+/// binding vote because it describes what the weights were trained to emit,
+/// where the template only describes what someone wrote down.
+pub fn detect_tool_call_format(chat_template: &str, has_xml_call_tokens: bool) -> ToolCallFormat {
+    if chat_template.contains("<function=") && has_xml_call_tokens {
         ToolCallFormat::XmlFunction
     } else {
         ToolCallFormat::JsonObject
@@ -1156,7 +1204,10 @@ pub fn tool_call_format_for_gguf(path: &str) -> Result<ToolCallFormat, String> {
     let gguf = crate::engine::io::parse_gguf_file(path, false)?;
     let template = crate::engine::io::get_gguf_string_from_map(&gguf.kv, "tokenizer.chat_template")
         .unwrap_or_default();
-    Ok(detect_tool_call_format(template))
+    let has_xml_tokens = XML_CALL_MARKERS
+        .iter()
+        .all(|marker| gguf.vocab_tokens.iter().any(|entry| entry == marker));
+    Ok(detect_tool_call_format(template, has_xml_tokens))
 }
 
 // ---------------------------------------------------------------------------
