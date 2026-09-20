@@ -5079,8 +5079,15 @@ impl ModelRuntime {
                 || stop_tokens
                     .iter()
                     .any(|(id, literal)| *id == next && *literal == "<|endoftext|>");
+            // "No visible output yet" must include text still parked in the
+            // holdback buffers: a short answer such as `no-text` fits entirely
+            // inside the stop-literal tail, and recovering on it would replace
+            // the model's own end-of-turn with a random continuation.
+            let visible_output_pending = !output.trim().is_empty()
+                || !stop_text_tail.trim().is_empty()
+                || !hidden_visible_tail.trim().is_empty();
             let should_recover_hidden_think_terminal = think_mode == ThinkMode::Hidden
-                && output.trim().is_empty()
+                && !visible_output_pending
                 && !early_terminal_recovery_used
                 && pos >= prompt_tokens.len().saturating_sub(1)
                 && hidden_mode_caps

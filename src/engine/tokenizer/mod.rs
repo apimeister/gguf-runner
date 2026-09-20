@@ -877,6 +877,46 @@ impl Tokenizer {
             return;
         }
 
+        // Added tokens (GGUF token type 4, e.g. `<think>`, `<tool_call>`) are
+        // single vocabulary entries that no BPE merge produces. Match them
+        // atomically so a chat-template seed reaches the model as the token
+        // it was trained on rather than as `<th` `ink` `>` fragments.
+        let mut rest = text;
+        while let Some((start, id, len)) = self.find_user_defined_token(rest) {
+            self.encode_bpe_segment(&rest[..start], tokens);
+            tokens.push(id);
+            rest = &rest[start + len..];
+        }
+        self.encode_bpe_segment(rest, tokens);
+    }
+
+    /// Earliest user-defined token occurrence in `text` as
+    /// `(byte offset, token id, literal length)`. At equal offsets the longest
+    /// literal wins because the list is sorted longest-first.
+    fn find_user_defined_token(&self, text: &str) -> Option<(usize, i32, usize)> {
+        let mut best: Option<(usize, i32, usize)> = None;
+        for &id in &self.user_defined_tokens {
+            let Some(literal) = self.decode_token(id) else {
+                continue;
+            };
+            if literal.is_empty() {
+                continue;
+            }
+            if let Some(idx) = text.find(literal.as_str())
+                && best.is_none_or(|(best_idx, _, _)| idx < best_idx)
+            {
+                best = Some((idx, id, literal.len()));
+            }
+        }
+        best
+    }
+
+    /// Pre-tokenize and BPE-merge one segment that contains no user-defined
+    /// tokens, appending to `tokens`.
+    fn encode_bpe_segment(&self, segment: &str, tokens: &mut Vec<i32>) {
+        if segment.is_empty() {
+            return;
+        }
         let mut encode_piece = |piece: &str| {
             let encoded_text = text_to_tiktoken(piece);
             let mut work: Vec<i32> = Vec::with_capacity(encoded_text.len());
@@ -894,9 +934,9 @@ impl Tokenizer {
             self.merge_bpe_work(&mut work, tokens);
         };
         match self.pre_tokenizer {
-            TokenizerPreType::Qwen2 => for_each_qwen2_piece(text, &mut encode_piece),
-            TokenizerPreType::Qwen35 => for_each_qwen35_piece(text, &mut encode_piece),
-            TokenizerPreType::Gpt2 => for_each_gpt2_piece(text, &mut encode_piece),
+            TokenizerPreType::Qwen2 => for_each_qwen2_piece(segment, &mut encode_piece),
+            TokenizerPreType::Qwen35 => for_each_qwen35_piece(segment, &mut encode_piece),
+            TokenizerPreType::Gpt2 => for_each_gpt2_piece(segment, &mut encode_piece),
         }
     }
 
@@ -986,14 +1026,14 @@ pub(crate) fn init_tokenizer_from_gguf(
         if types.len() != tokenizer.vocab.len() {
             return Err("tokenizer token-type count differs from vocabulary size".to_string());
         }
-        tokenizer.sentencepiece_user_defined = types
+        tokenizer.user_defined_tokens = types
             .iter()
             .enumerate()
             .filter(|(_, token_type)| **token_type == 4)
             .map(|(index, _)| index as i32)
             .collect();
         tokenizer
-            .sentencepiece_user_defined
+            .user_defined_tokens
             .sort_by_key(|&id| std::cmp::Reverse(tokenizer.vocab[id as usize].len()));
     }
     tokenizer.vocab_size = tokenizer.vocab.len();
@@ -1373,7 +1413,7 @@ mod tests {
             pre_tokenizer: TokenizerPreType::Gpt2,
             use_sentencepiece: false,
             sentencepiece_no_space_prefix: false,
-            sentencepiece_user_defined: Vec::new(),
+            user_defined_tokens: Vec::new(),
             token_to_id: HashMap::new(),
             merges: merges
                 .iter()
@@ -1421,13 +1461,58 @@ mod tests {
             pre_tokenizer: TokenizerPreType::Gpt2,
             use_sentencepiece: true,
             sentencepiece_no_space_prefix: false,
-            sentencepiece_user_defined: Vec::new(),
+            user_defined_tokens: Vec::new(),
             token_to_id: HashMap::new(),
             merges: Vec::new(),
             merge_ranks: HashMap::new(),
         };
         tokenizer.prepare_for_encode();
         tokenizer
+    }
+
+    #[test]
+    fn bpe_encode_keeps_user_defined_tokens_atomic() {
+        let corpus = "<think>\nThe image shows balloons. </think>\n\nDone.";
+        let mut tokenizer = build_gpt2_synthetic_tokenizer(corpus);
+        let think_id = tokenizer.vocab.len() as i32;
+        tokenizer.vocab.push("<think>".to_string());
+        tokenizer.vocab_scores.push(0.0);
+        tokenizer.vocab_size += 1;
+        let close_id = tokenizer.vocab.len() as i32;
+        tokenizer.vocab.push("</think>".to_string());
+        tokenizer.vocab_scores.push(0.0);
+        tokenizer.vocab_size += 1;
+
+        // Without registration the literal is shredded by the merges.
+        let mut shredded = Vec::new();
+        tokenizer.encode_prepared("<think>\n", &mut shredded);
+        assert!(!shredded.contains(&think_id));
+
+        tokenizer.user_defined_tokens = vec![close_id, think_id];
+        let mut seed = Vec::new();
+        tokenizer.encode_prepared("<think>\n", &mut seed);
+        let mut newline = Vec::new();
+        tokenizer.encode_prepared("\n", &mut newline);
+        assert_eq!(seed[0], think_id);
+        assert_eq!(&seed[1..], &newline[..]);
+
+        let mut closed = Vec::new();
+        tokenizer.encode_prepared("<think>\n\n</think>\n\nDone.", &mut closed);
+        let mut gap = Vec::new();
+        tokenizer.encode_prepared("\n\n", &mut gap);
+        let mut tail = Vec::new();
+        tokenizer.encode_prepared("\n\nDone.", &mut tail);
+        let mut expected = vec![think_id];
+        expected.extend_from_slice(&gap);
+        expected.push(close_id);
+        expected.extend_from_slice(&tail);
+        assert_eq!(closed, expected);
+
+        // Plain text around the markers is unaffected.
+        let mut plain = Vec::new();
+        tokenizer.encode_prepared("The image shows balloons.", &mut plain);
+        assert!(!plain.contains(&think_id));
+        assert!(!plain.contains(&close_id));
     }
 
     #[test]

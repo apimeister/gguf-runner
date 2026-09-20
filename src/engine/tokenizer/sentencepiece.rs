@@ -16,7 +16,7 @@ pub(super) fn encode_without_prefix(tokenizer: &Tokenizer, text: &str, output: &
     let mut cursor = 0;
     let mut start = 0;
     while cursor < text.len() {
-        let special = tokenizer.sentencepiece_user_defined.iter().find(|&&id| {
+        let special = tokenizer.user_defined_tokens.iter().find(|&&id| {
             let token = &tokenizer.vocab[id as usize];
             !token.is_empty() && text[cursor..].starts_with(token)
         });

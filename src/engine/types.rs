@@ -828,7 +828,7 @@ pub(crate) struct Tokenizer {
     /// Honor the GGUF normalizer's explicit no-prefix contract (e.g. Gemma3).
     /// False preserves the existing default when metadata is absent.
     pub(crate) sentencepiece_no_space_prefix: bool,
-    pub(crate) sentencepiece_user_defined: Vec<i32>,
+    pub(crate) user_defined_tokens: Vec<i32>,
     pub(crate) token_to_id: HashMap<String, i32>,
     pub(crate) merges: Vec<String>,
     pub(crate) merge_ranks: HashMap<String, usize>,
