@@ -255,6 +255,17 @@ src/
   - `RuntimeEvent::Status(RunnerStatus)` for orchestration state such as planning, tool execution, finalizing, and recovery
   - `RuntimeEvent::Progress(RuntimeProgress)` for numeric decode/prefill progress
 
+### `src/app/embed.rs`
+
+- Owns the public `EmbeddedRuntime` facade over `ModelRuntime`.
+- `EmbeddedRuntime::fork` creates another handle on the loaded model for use from another thread.
+  Weights, vision encoder and prefill cache are shared through `Arc`; settings, context size,
+  tokenizer lookups and per-generation state belong to the handle. Each running generation allocates
+  its own KV cache, and parallel kernels use the rayon pool the call runs in, so a caller gives a
+  handle its own pool with `rayon::ThreadPool::install`.
+- `examples/fork_concurrency_test.rs` checks that concurrent generations on forked handles match the
+  same requests run alone.
+
 ### `src/app/generation.rs`
 
 - Model/runtime bootstrap for inference:

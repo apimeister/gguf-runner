@@ -516,11 +516,13 @@ impl Drop for MappedFile {
     }
 }
 
-// SAFETY: The raw pointer points to memory-mapped model weights that are
-// immutable after loading.  mmap ranges are accessible from any thread within
-// the same process.  `EmbeddedRuntime` serialises access via a `Mutex` in
-// `GgufInferenceProvider`, so no concurrent mutation occurs.
+// SAFETY: The raw pointer points to model weights that are immutable after
+// loading: `as_slice` is the only accessor and hands out a shared slice, and
+// the mapping is released only when the last owner drops it. Mapped and
+// embedded ranges are readable from any thread in the process, so one loaded
+// model can serve several threads at once (see `EmbeddedRuntime::fork`).
 unsafe impl Send for MappedFile {}
+unsafe impl Sync for MappedFile {}
 
 pub(crate) fn ensure_model_range(offset: usize, len: usize) -> Result<(), String> {
     let _ = offset;
@@ -812,7 +814,7 @@ pub(crate) enum KvCacheFormat {
     Turbo,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Tokenizer {
     pub(crate) vocab: Vec<String>,
     pub(crate) vocab_scores: Vec<f32>,

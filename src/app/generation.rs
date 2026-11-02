@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sampling parameters embedded in the GGUF file under `general.sampling.*`.
@@ -1422,6 +1423,7 @@ fn process_decoded_with_think(
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct GenerationSettings {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
@@ -1550,15 +1552,15 @@ fn load_rag_components(
 
 pub(crate) struct ModelRuntime {
     checkpoint_path: String,
-    gguf: GGUFFile,
+    gguf: Arc<GGUFFile>,
     config: Config,
     tokenizer: Tokenizer,
-    weights: TransformerWeights,
+    weights: Arc<TransformerWeights>,
     settings: GenerationSettings,
-    multimodal_weights: Option<MultimodalWeights>,
+    multimodal_weights: Option<Arc<MultimodalWeights>>,
     mmproj_sidecar: Option<MmprojSidecarProbe>,
     mmproj_candidates: Vec<String>,
-    vision_encoder: Option<VisionEncoder>,
+    vision_encoder: Option<Arc<VisionEncoder>>,
     preencoded_image_embeddings: HashMap<String, MediaEmbeddingSequence>,
     audio_encoder: Option<AudioEncoder>,
     document_encoder: Option<DocumentEncoder>,
@@ -1568,11 +1570,39 @@ pub(crate) struct ModelRuntime {
     /// Whether the last decode consumed its entire token budget, which means it
     /// stopped at the limit instead of at a stop token.
     last_decode_used_full_token_budget: bool,
-    prefill_cache: Option<crate::app::prefill_cache::PrefixCache>,
+    prefill_cache: Option<Arc<crate::app::prefill_cache::PrefixCache>>,
     prefill_cache_warned: bool,
 }
 
 impl ModelRuntime {
+    /// A second handle on the same loaded model. Weights, vision encoder and
+    /// prefill cache are shared; settings, context size, tokenizer lookups and
+    /// per-generation state belong to the handle. Audio and document encoders
+    /// stay with the original.
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            checkpoint_path: self.checkpoint_path.clone(),
+            gguf: Arc::clone(&self.gguf),
+            config: self.config.clone(),
+            tokenizer: self.tokenizer.clone(),
+            weights: Arc::clone(&self.weights),
+            settings: self.settings.clone(),
+            multimodal_weights: self.multimodal_weights.clone(),
+            mmproj_sidecar: self.mmproj_sidecar.clone(),
+            mmproj_candidates: self.mmproj_candidates.clone(),
+            vision_encoder: self.vision_encoder.clone(),
+            preencoded_image_embeddings: HashMap::new(),
+            audio_encoder: None,
+            document_encoder: None,
+            rag_index: None,
+            kv_cache_format_override: self.kv_cache_format_override,
+            kv_cache_format_logged: false,
+            last_decode_used_full_token_budget: false,
+            prefill_cache: self.prefill_cache.clone(),
+            prefill_cache_warned: false,
+        }
+    }
+
     /// The model's own `tokenizer.chat_template`, or empty when it declares none.
     ///
     /// A runner honours per-model conventions rather than assuming one family's,
@@ -1776,7 +1806,8 @@ impl ModelRuntime {
                     .vision_backend
                     .unwrap_or(self.config.capabilities.multimodal_backend);
                 self.vision_encoder =
-                    build_vision_encoder_from_mmproj(vision_backend, &self.config, mmproj)?;
+                    build_vision_encoder_from_mmproj(vision_backend, &self.config, mmproj)?
+                        .map(Arc::new);
             }
             if self.audio_encoder.is_none()
                 && audio_requested
@@ -2719,12 +2750,12 @@ impl ModelRuntime {
 
         Ok(Self {
             checkpoint_path: checkpoint.to_string(),
-            gguf,
+            gguf: Arc::new(gguf),
             config,
             tokenizer,
-            weights,
+            weights: Arc::new(weights),
             settings,
-            multimodal_weights,
+            multimodal_weights: multimodal_weights.map(Arc::new),
             // mmproj sidecar is probed lazily the first time media is provided.
             mmproj_sidecar: None,
             mmproj_candidates: Vec::new(),
@@ -2775,7 +2806,8 @@ impl ModelRuntime {
                 .vision
                 .unwrap_or(self.config.capabilities.multimodal_backend);
             self.vision_encoder =
-                build_vision_encoder_from_mmproj(vision_backend, &self.config, mmproj)?;
+                build_vision_encoder_from_mmproj(vision_backend, &self.config, mmproj)?
+                    .map(Arc::new);
         }
         if let Some(backend) = backends.vision {
             self.settings.vendor_multimodal_policy =
@@ -2853,12 +2885,12 @@ impl ModelRuntime {
 
         Ok(Self {
             checkpoint_path: "<embedded>".to_string(),
-            gguf,
+            gguf: Arc::new(gguf),
             config,
             tokenizer,
-            weights,
+            weights: Arc::new(weights),
             settings,
-            multimodal_weights,
+            multimodal_weights: multimodal_weights.map(Arc::new),
             mmproj_sidecar: None,
             mmproj_candidates: Vec::new(),
             vision_encoder: None,
@@ -3143,15 +3175,15 @@ impl ModelRuntime {
 
         Ok(Self {
             checkpoint_path: checkpoint.to_string(),
-            gguf,
+            gguf: Arc::new(gguf),
             config,
             tokenizer,
-            weights,
+            weights: Arc::new(weights),
             settings,
-            multimodal_weights,
+            multimodal_weights: multimodal_weights.map(Arc::new),
             mmproj_sidecar,
             mmproj_candidates,
-            vision_encoder,
+            vision_encoder: vision_encoder.map(Arc::new),
             preencoded_image_embeddings: HashMap::new(),
             audio_encoder,
             document_encoder,
@@ -3172,7 +3204,7 @@ impl ModelRuntime {
         if pc.model_len != len || pc.model_head_fnv != fnv {
             return Err("prefill cache: model fingerprint mismatch".to_string());
         }
-        self.prefill_cache = Some(pc);
+        self.prefill_cache = Some(Arc::new(pc));
         Ok(())
     }
 
@@ -5876,6 +5908,18 @@ mod tests {
     use crate::vendors::VendorDecodePolicy;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn forked_model_parts_can_cross_threads() {
+        fn shared<T: Send + Sync>() {}
+        fn owned<T: Send>() {}
+        shared::<crate::engine::types::GGUFFile>();
+        shared::<crate::engine::types::TransformerWeights>();
+        shared::<crate::engine::types::MultimodalWeights>();
+        shared::<crate::engine::multimodal::VisionEncoder>();
+        shared::<crate::app::prefill_cache::PrefixCache>();
+        owned::<ModelRuntime>();
+    }
 
     #[test]
     fn repeated_inline_phrase_lookback_snaps_to_char_boundary() {

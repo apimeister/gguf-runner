@@ -82,6 +82,21 @@ pub struct EmbeddedRuntime {
 }
 
 impl EmbeddedRuntime {
+    /// A second handle on this loaded model, for generating from another thread
+    /// at the same time.
+    ///
+    /// The weights, vision encoder and prefill cache stay in memory once, so a
+    /// fork costs little. Each handle has its own settings and context size, and
+    /// each generation allocates its own KV cache, so memory grows with the
+    /// number of generations running at once. Parallel kernels run on the rayon
+    /// pool the call runs in; wrap calls in [`rayon::ThreadPool::install`] to give
+    /// a handle its own pool. Audio and document encoders stay with the original.
+    pub fn fork(&self) -> Self {
+        Self {
+            inner: self.inner.fork(),
+        }
+    }
+
     /// The tool-call shape this model was trained to emit, read from its own
     /// chat template. Tool prompts are composed from this, so a runner serving
     /// a different GGUF asks that model for the format it actually knows.
