@@ -108,12 +108,19 @@ fn repeated_cycle_period(tokens: &[i32]) -> Option<usize> {
 
 /// Detect inline phrase repetition — works without newlines and tolerates
 /// slight token-level variations (e.g. "The The capital" vs "The capital").
-/// Returns the repeated phrase if a substring of 8–80 bytes appears 4+ times
-/// in the last 1024 bytes of output.
+/// Returns the repeated phrase if the output ends in a substring of 8–80 bytes
+/// that appears 3+ times non-overlapping within the last `SPAN_PHRASES` phrase
+/// lengths of the last 1024 bytes of output.
+///
+/// The span is what tells a loop from a list. A loop repeats its phrase back
+/// to back, so its occurrences sit within a phrase length or so of each other;
+/// list items share fragments such as `** – cr` or `s_create`, but each item
+/// is many times longer than the fragment it shares.
 fn repeated_inline_phrase(output: &str) -> Option<String> {
     const MIN_PHRASE: usize = 8;
     const MAX_PHRASE: usize = 80;
     const MIN_REPS: usize = 3;
+    const SPAN_PHRASES: usize = 4;
     const LOOKBACK: usize = 1024;
 
     let window = if output.len() > LOOKBACK {
@@ -133,7 +140,7 @@ fn repeated_inline_phrase(output: &str) -> Option<String> {
     for phrase_len in (MIN_PHRASE..=MAX_PHRASE.min(n / MIN_REPS)).rev() {
         let suffix = &bytes[n - phrase_len..n];
         let mut count = 0usize;
-        let mut i = 0;
+        let mut i = n.saturating_sub(phrase_len * SPAN_PHRASES);
         while i + phrase_len <= n {
             if &bytes[i..i + phrase_len] == suffix {
                 count += 1;
@@ -5651,11 +5658,13 @@ impl ModelRuntime {
                 decode_tokens: generated_tokens.len(),
                 hidden_thinking: false,
                 hidden_think_tokens: hidden_think_token_count,
-                tokens_per_second: if pos > 1 {
-                    let elapsed_ms = (end - start).max(1) as f64;
-                    Some((pos - 1) as f64 / elapsed_ms * 1000.0)
-                } else {
+                // Generated tokens over the decode clock, as during decode.
+                // `pos` would also count the prompt, which the clock never saw.
+                tokens_per_second: if generated_tokens.is_empty() {
                     None
+                } else {
+                    let elapsed_ms = (end - start).max(1) as f64;
+                    Some(generated_tokens.len() as f64 / elapsed_ms * 1000.0)
                 },
                 context_used: prompt_tokens.len().saturating_add(generated_tokens.len()),
                 context_limit: self.config.seq_len,
@@ -5932,6 +5941,37 @@ mod tests {
         let padding = "ä".repeat(600);
         let repeated = format!("{padding}{}", "Grüße aus Köln! ".repeat(4));
         assert!(repeated_inline_phrase(&repeated).is_some());
+    }
+
+    #[test]
+    fn repeated_inline_phrase_catches_a_loop_with_slight_variations() {
+        // Bonsai's loop from docs/model-investigation-2026-05.md.
+        let looped = "The capital of france. The capital of france. The The capital of \
+                      france. The capital of france. The capital of france.";
+        assert!(repeated_inline_phrase(looped).is_some());
+    }
+
+    #[test]
+    fn repeated_inline_phrase_lets_list_items_share_fragments() {
+        // Two admin-shell answers the guard used to cut off, each at the last
+        // fragment its items share: `** – cr` and `s_create`.
+        let bold_items = "Here are the main things you can do:\n\n\
+            - **Access control** – grant/revise read/write/owner access to any path.\n\
+            - **Users / groups** – create, delete, assign/revoke users/grants.\n\
+            - **Git repositories** – list/clone/retrieve/rename repos.\n\
+            - **File shares & metadata** – create/modify WebDAV shares.\n\
+            - **Calendars / contacts** – schedule events, manage calendars.\n\
+            - **Vaults / OCI registries** – cr";
+        assert_eq!(repeated_inline_phrase(bold_items), None);
+
+        let tool_names = "Here are the main things you can do:\n\n\
+            - Create / Manage Principals\n  \
+              - users_create → create a new user with login/password.\n  \
+              - users_delete → drop that user’s access/grants.\n  \
+              - users_ssh_keys_list, users_ssh_keys_create/delete → manage SSH keys.\n\
+            - Manage Files & Shares\n  \
+              - `files_create";
+        assert_eq!(repeated_inline_phrase(tool_names), None);
     }
 
     #[test]
