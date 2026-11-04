@@ -525,9 +525,15 @@ impl EmbeddedRuntime {
     /// is suppressed, and a partial tag split across streamed fragments is never
     /// emitted. This lets an interactive caller show output immediately instead
     /// of blocking on the whole (possibly multi-turn) tool loop.
+    ///
+    /// `history` is the conversation so far. The call appends each turn it runs
+    /// as it completes: the input with the model's tool call, each tool result
+    /// with the model's next reply, and finally the answer. A follow-up call on
+    /// the same history then sees which tools ran and what they returned, not
+    /// only the prose that was shown.
     pub fn generate_with_tools_streaming(
         &mut self,
-        history: &[(String, String)],
+        history: &mut Vec<(String, String)>,
         input: &str,
         system_prompt: &str,
         tools: &mut [&mut dyn Tool],
@@ -537,7 +543,6 @@ impl EmbeddedRuntime {
         let tool_system_prompt =
             build_tool_system_prompt(system_prompt, tools, self.tool_call_format());
 
-        let mut extended_history: Vec<(String, String)> = history.to_vec();
         let mut current_input = input.to_string();
         let mut call_count = 0usize;
         let mut stats = GenerationStats::default();
@@ -547,7 +552,7 @@ impl EmbeddedRuntime {
         let sink: TokenSink = Arc::new(Mutex::new(Box::new(on_token)));
 
         loop {
-            let messages = build_messages(&extended_history, &current_input);
+            let messages = build_messages(history, &current_input);
             let turn = Arc::new(Mutex::new(TurnStream::new(Arc::clone(&sink))));
 
             let cb_turn = Arc::clone(&turn);
@@ -605,10 +610,13 @@ impl EmbeddedRuntime {
                         "<tool_response>\n{}\n</tool_response>",
                         serde_json::to_string(&result_json).unwrap_or_else(|_| "{}".to_string())
                     );
-                    extended_history.push((current_input.clone(), raw));
+                    history.push((current_input, raw));
                     current_input = tool_result_msg;
                 }
-                None => return Ok(stats),
+                None => {
+                    history.push((current_input, raw));
+                    return Ok(stats);
+                }
             }
         }
     }

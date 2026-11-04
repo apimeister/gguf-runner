@@ -32,9 +32,16 @@ fn text(rt: &mut EmbeddedRuntime, pool: &rayon::ThreadPool) -> String {
     pool.install(|| {
         let mut clock = Clock;
         let mut tools: [&mut dyn Tool; 1] = [&mut clock];
-        rt.generate_with_tools_streaming(&[], TEXT, SYSTEM, &mut tools, 4, move |tok: &str| {
-            sink.lock().unwrap().push_str(tok);
-        })
+        rt.generate_with_tools_streaming(
+            &mut Vec::new(),
+            TEXT,
+            SYSTEM,
+            &mut tools,
+            4,
+            move |tok: &str| {
+                sink.lock().unwrap().push_str(tok);
+            },
+        )
     })
     .expect("text generation");
     collected.lock().unwrap().clone()
