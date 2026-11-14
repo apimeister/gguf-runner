@@ -160,6 +160,19 @@ fn parse_identification_margin(raw: &str) -> Result<f32, String> {
     }
 }
 
+fn parse_face_score_threshold(raw: &str) -> Result<f32, String> {
+    let value = raw
+        .parse::<f32>()
+        .map_err(|error| format!("invalid value '{raw}': {error}"))?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "invalid value '{raw}': expected a finite value in [0, 1]"
+        ))
+    }
+}
+
 fn parse_speaker_learning_mode(raw: &str) -> Result<CliSpeakerLearningMode, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "off" => Ok(CliSpeakerLearningMode::Off),
@@ -202,6 +215,12 @@ pub(crate) enum CliSpeakerAction {
     List,
     RemoveSpeaker(String),
     RemoveObservation(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliFaceAction {
+    Detect,
+    Embed,
 }
 
 #[derive(Clone, Debug)]
@@ -601,7 +620,7 @@ fn normalize_description_text(raw: String) -> Option<String> {
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Run GGUF language and speaker models",
+    about = "Run GGUF language, speaker, and face models",
     long_about = None,
     disable_help_subcommand = true
 )]
@@ -718,6 +737,26 @@ struct Cli {
     /// Admit an enrollment/candidate that fails the profile consistency threshold.
     #[arg(long = "speaker-force-enroll")]
     speaker_force_enroll: bool,
+
+    /// Face detector GGUF, required by every --face-* action.
+    #[arg(long = "face-detector", value_name = "detector.gguf")]
+    face_detector: Option<String>,
+
+    /// Face embedding GGUF, required by --face-embed.
+    #[arg(long = "face-model", value_name = "encoder.gguf")]
+    face_model: Option<String>,
+
+    /// Emit boxes, landmarks, and scores for the faces in each --image.
+    #[arg(long = "face-detect")]
+    face_detect: bool,
+
+    /// Emit one L2-normalized embedding per face in each --image.
+    #[arg(long = "face-embed")]
+    face_embed: bool,
+
+    /// Override the detector's minimum face score.
+    #[arg(long = "face-score-threshold", value_parser = parse_face_score_threshold)]
+    face_score_threshold: Option<f32>,
 
     /// Sampling temperature (default: model hint or 0.9).
     #[arg(long)]
@@ -1039,6 +1078,10 @@ pub(crate) struct CliOptions {
     pub(crate) speaker_threshold: Option<f32>,
     pub(crate) speaker_margin: Option<f32>,
     pub(crate) speaker_force_enroll: bool,
+    pub(crate) face_detector: Option<String>,
+    pub(crate) face_model: Option<String>,
+    pub(crate) face_action: Option<CliFaceAction>,
+    pub(crate) face_score_threshold: Option<f32>,
     pub(crate) temperature: Option<f32>,
     pub(crate) top_k: Option<usize>,
     pub(crate) top_p: Option<f32>,
@@ -1105,6 +1148,7 @@ impl CliOptions {
         let cli = Cli::try_parse().map_err(|e| e.to_string())?;
         let mode = cli.mode;
         let speaker_action = speaker_action_from_cli(&cli)?;
+        let face_action = face_action_from_cli(&cli)?;
         let mut allowed_tools = match cli.allowed_tools.as_deref() {
             Some(raw) => parse_allowed_tools(raw)?,
             None => {
@@ -1127,13 +1171,22 @@ impl CliOptions {
         }
         let requested_tools_enabled = !allowed_tools.is_empty();
         validate_speaker_options(&cli, speaker_action.as_ref(), requested_tools_enabled)?;
-        if !cli.show_features && speaker_action.is_none() && cli.model.trim().is_empty() {
+        validate_face_options(&cli, face_action, requested_tools_enabled)?;
+        if speaker_action.is_some() && face_action.is_some() {
+            return Err("speaker and face actions cannot be combined".to_string());
+        }
+        if !cli.show_features
+            && speaker_action.is_none()
+            && face_action.is_none()
+            && cli.model.trim().is_empty()
+        {
             return Err("`--model <model.gguf>` is required".to_string());
         }
         if !cli.show_features
             && !cli.rag_build
             && cli.render_prefill_cache.is_none()
             && speaker_action.is_none()
+            && face_action.is_none()
             && matches!(mode, CliOperationMode::Oneshot)
             && cli.prompt.trim().is_empty()
             && cli.audios.is_empty()
@@ -1185,6 +1238,10 @@ impl CliOptions {
             speaker_threshold: cli.speaker_threshold,
             speaker_margin: cli.speaker_margin,
             speaker_force_enroll: cli.speaker_force_enroll,
+            face_detector: cli.face_detector,
+            face_model: cli.face_model,
+            face_action,
+            face_score_threshold: cli.face_score_threshold,
             temperature: cli.temperature,
             top_k: cli.top_k,
             top_p: cli.top_p,
@@ -1246,6 +1303,80 @@ impl CliOptions {
             rag_build: cli.rag_build,
         })
     }
+}
+
+fn face_action_from_cli(cli: &Cli) -> Result<Option<CliFaceAction>, String> {
+    match (cli.face_detect, cli.face_embed) {
+        (true, true) => Err(
+            "face actions are mutually exclusive; choose --face-detect or --face-embed".to_string(),
+        ),
+        (true, false) => Ok(Some(CliFaceAction::Detect)),
+        (false, true) => Ok(Some(CliFaceAction::Embed)),
+        (false, false) => Ok(None),
+    }
+}
+
+fn validate_face_options(
+    cli: &Cli,
+    action: Option<CliFaceAction>,
+    requested_tools_enabled: bool,
+) -> Result<(), String> {
+    let Some(action) = action else {
+        if cli.face_detector.is_some()
+            || cli.face_model.is_some()
+            || cli.face_score_threshold.is_some()
+        {
+            return Err("face options require --face-detect or --face-embed".to_string());
+        }
+        return Ok(());
+    };
+    if cli.face_detector.as_deref().is_none_or(str::is_empty) {
+        return Err("face actions require --face-detector <detector.gguf>".to_string());
+    }
+    match action {
+        CliFaceAction::Embed => {
+            if cli.face_model.as_deref().is_none_or(str::is_empty) {
+                return Err("--face-embed requires --face-model <encoder.gguf>".to_string());
+            }
+        }
+        CliFaceAction::Detect => {
+            if cli.face_model.is_some() {
+                return Err("--face-detect does not use --face-model".to_string());
+            }
+        }
+    }
+    if cli.images.is_empty() {
+        return Err("face actions require at least one --image <path>".to_string());
+    }
+    if !cli.model.trim().is_empty() {
+        return Err(
+            "face operations load --face-detector/--face-model directly; do not also pass --model"
+                .to_string(),
+        );
+    }
+    if !matches!(cli.mode, CliOperationMode::Oneshot) {
+        return Err("face operations are supported only in oneshot mode".to_string());
+    }
+    if requested_tools_enabled {
+        return Err("face operations cannot be combined with tools mode".to_string());
+    }
+    if cli.show_features
+        || cli.rag_build
+        || cli.render_prefill_cache.is_some()
+        || cli.prefill_cache.is_some()
+        || cli.audio_batch.is_some()
+        || cli.image_batch.is_some()
+        || !cli.videos.is_empty()
+        || !cli.audios.is_empty()
+        || cli.audio_language.is_some()
+        || !cli.prompt.trim().is_empty()
+    {
+        return Err(
+            "face operations cannot be combined with generation, media-batch, prefill-cache, RAG-build, video/audio, prompt, or audio-language options"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn speaker_action_from_cli(cli: &Cli) -> Result<Option<CliSpeakerAction>, String> {
@@ -1588,6 +1719,78 @@ mod tests {
         .expect("parse batch flags");
         let error = validate_batch_options(&cli, cli.mode, false).expect_err("conflicting prompt");
         assert!(error.contains("each manifest record"));
+    }
+
+    #[test]
+    fn face_embed_requires_detector_encoder_and_image() {
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--face-detector",
+            "detector.gguf",
+            "--face-model",
+            "encoder.gguf",
+            "--face-embed",
+            "--image",
+            "a.jpg",
+            "--image",
+            "b.png",
+        ])
+        .expect("parse face embed flags");
+        let action = face_action_from_cli(&cli).unwrap();
+        assert_eq!(action, Some(CliFaceAction::Embed));
+        assert!(validate_face_options(&cli, action, false).is_ok());
+
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--face-detector",
+            "detector.gguf",
+            "--face-embed",
+            "--image",
+            "a.jpg",
+        ])
+        .expect("parse face embed without encoder");
+        let error =
+            validate_face_options(&cli, face_action_from_cli(&cli).unwrap(), false).unwrap_err();
+        assert!(error.contains("--face-model"));
+
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--face-detector",
+            "detector.gguf",
+            "--face-detect",
+        ])
+        .expect("parse face detect without image");
+        let error =
+            validate_face_options(&cli, face_action_from_cli(&cli).unwrap(), false).unwrap_err();
+        assert!(error.contains("--image"));
+    }
+
+    #[test]
+    fn face_options_reject_missing_action_and_language_model() {
+        let cli = Cli::try_parse_from(["gguf-runner", "--face-detector", "detector.gguf"])
+            .expect("parse stray face option");
+        assert!(validate_face_options(&cli, face_action_from_cli(&cli).unwrap(), false).is_err());
+
+        let cli = Cli::try_parse_from(["gguf-runner", "--face-detect", "--face-embed"])
+            .expect("parse both face actions");
+        assert!(face_action_from_cli(&cli).is_err());
+
+        let cli = Cli::try_parse_from([
+            "gguf-runner",
+            "--model",
+            "model.gguf",
+            "--face-detector",
+            "detector.gguf",
+            "--face-detect",
+            "--image",
+            "a.jpg",
+        ])
+        .expect("parse face detect with language model");
+        let error =
+            validate_face_options(&cli, face_action_from_cli(&cli).unwrap(), false).unwrap_err();
+        assert!(error.contains("do not also pass --model"));
+
+        assert!(Cli::try_parse_from(["gguf-runner", "--face-score-threshold", "1.5"]).is_err());
     }
 
     #[test]

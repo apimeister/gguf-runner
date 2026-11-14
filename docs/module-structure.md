@@ -1,7 +1,8 @@
 # Module Structure Reference
 
 This project provides a binary entrypoint (`src/main.rs`) plus a small library facade (`src/lib.rs`)
-for `EmbeddedRuntime`, `SpeakerRuntime`, and `SpeakerIndexRuntime`; they share the same internal app,
+for `EmbeddedRuntime`, `SpeakerRuntime`, `SpeakerIndexRuntime`, `FaceDetector`, and `FaceEncoder`;
+they share the same internal app,
 vendor, and engine modules.
 
 ## Maintenance Rule
@@ -24,6 +25,7 @@ src/
     image_views.rs
     embed.rs
     events.rs
+    face.rs
     generation.rs
     agent.rs
     repl.rs
@@ -44,6 +46,14 @@ src/
       mod.rs
       decode.rs
       features.rs
+    face/
+      mod.rs
+      align.rs
+      conv.rs
+      decode.rs
+      detect.rs
+      embed.rs
+      graph.rs
     speaker/
       mod.rs
     io/
@@ -81,6 +91,9 @@ src/
     profiling.rs
   vendors/
     mod.rs
+    face_common.rs
+    face_sface.rs
+    face_yunet.rs
     llama.rs
     gemma.rs
     gemma_image_views.rs
@@ -187,6 +200,27 @@ src/
   or encoder errors drop all completed embeddings for that source; no cache is modified.
 - The internal `image_request` executor calls this stage after complete-request preflight.
   Generation/image-batch routing and cache/model identity checks remain open.
+
+### `src/app/face.rs`
+
+- Owns the public face facade exported through `src/lib.rs`: `FaceImage`, `FaceDetector`,
+  `FaceEncoder`, and the result types `DetectedFace`, `FaceBox`, `FaceEmbedding`, `FaceRecord`,
+  and `FaceImageResult`.
+- Loads the detector and encoder GGUFs directly, from a file or from static embedded bytes,
+  obtains each model-family policy from `vendors`, and consumes the generic
+  `engine::face::{FaceDetectorModel, FaceEncoderModel}` without loading the language-model runtime.
+- Keeps detection and embedding as separate calls over one decoded `FaceImage`; `embed_all`
+  combines them for one file. `FaceDetector::locate` re-runs the detector on a caller-supplied box
+  plus margin to obtain landmarks; a face without landmarks is embedded from its plain box crop and
+  reported as not aligned.
+- Outputs vectors only: no index, identifiers, thresholds, or clustering. Provides the 128-byte
+  signed-byte form of a vector, its base64 encoding and decoding, and cosine helpers for float and
+  stored vectors.
+- Embedding use: both models load from `&'static [u8]`, images can come from encoded bytes or RGB8
+  pixels (`embed_image`), no global initialisation is required, and the loaded models are
+  `Send + Sync` so one instance serves several threads. `examples/face_embedded_test.rs` checks
+  this path against file-based loading and across concurrent threads.
+- CLI orchestration (`run_cli`) writes one JSON line per `--image`, including images without faces.
 
 ### `src/app/speaker.rs`
 
@@ -444,6 +478,9 @@ src/
   - `--speaker-model`, `--speaker-index`, conservative `--speaker-learning` modes, candidate output,
     reusable `--speaker-embedding-input` JSONL, calibrated threshold/margin overrides, and explicit
     forced enrollment
+- Includes the mutually exclusive face actions `--face-detect` and `--face-embed` with
+  `--face-detector`, `--face-model`, and `--face-score-threshold`; they take `--image` inputs,
+  require no `--model`, and reject generation/batch/tool combinations before runtime construction.
 - Requires `--speaker-model` only for audio-consuming actions, permits index-free unknown
   diarization, and routes index/exported-vector-only actions without constructing an encoder.
 - Speaker-mode validation prevents accidental text-model loading and rejects generation/batch/tool
@@ -452,7 +489,7 @@ src/
 ### `src/engine/mod.rs`
 
 - Aggregates engine submodules:
-  - `audio`, `io`, `kernels`, `multimodal`, `positions`, `profiling`, `runtime`, `speaker`, `switches`, `tokenizer`,
+  - `audio`, `face`, `io`, `kernels`, `multimodal`, `positions`, `profiling`, `runtime`, `speaker`, `switches`, `tokenizer`,
     `types`, `vision`, `weights`.
 
 ### `src/engine/types.rs`
@@ -601,6 +638,27 @@ src/
 - The official 48-kHz/24-bit speech sample matches miniaudio across 240,820 resampled samples with
   maximum/mean absolute error `1.788139343e-7/3.564497433e-9`; short upsample and downsample impulse
   regressions lock the converter's filter transient and latency semantics.
+
+### `src/engine/face/*`
+
+- Face detection and face embedding from dedicated GGUFs; it has no CLI, app, or vendor-family
+  dependency and never touches the language-model runtime.
+- `mod.rs`: shared policy/domain types consumed from `vendors` (`FaceInputPolicy`,
+  `FaceChannelOrder`, the landmark count) and the model fingerprint.
+- `conv.rs`: dense CHW float kernels: grouped 2D convolution with square kernels and symmetric
+  zero padding (rayon over output channels, row-wise accumulation, a pointwise fast path), ReLU and
+  per-channel PReLU, 2x2 max-pool, nearest 2x upsampling, add, and a linear layer.
+- `graph.rs`: loads a `FaceGraphPolicy` operation list into owned float tensors, validates slot
+  wiring at load time, and executes it, releasing each intermediate map after its last use.
+- `detect.rs`: `FaceDetectorModel`: downscale to the policy's maximum side, pad to the alignment,
+  run the graph, decode every stride into boxes and five landmarks, apply non-maximum suppression,
+  and map coordinates back to the caller's image.
+- `align.rs`: least-squares similarity transform from five landmarks to the encoder's reference
+  points and a bilinear affine warp with a black border.
+- `embed.rs`: `FaceEncoderModel`: aligned or plain-box crop, graph execution, L2 normalization,
+  cosine scoring, and the signed-byte quantized form.
+- `decode.rs`: bounded image decoding that always applies EXIF orientation
+  (`ImageOrientationPolicy::ApplyExif`), unlike the vision-language single-view path.
 
 ### `src/engine/speaker/mod.rs`
 
@@ -820,6 +878,8 @@ src/
   - Detects model family from GGUF metadata.
   - Dispatches dedicated speaker GGUF metadata through `speaker_model_policy(...)`; generic
     app/engine speaker flow contains no architecture string branch.
+  - Dispatches dedicated face GGUF metadata through `face_detector_policy(...)` and
+    `face_encoder_policy(...)`; generic app/engine face flow contains no architecture string branch.
   - Rejects unsupported DeepSeek architectures (`deepseek*`) with a clear config error.
   - Builds `Config` from family-specific key conventions.
   - Detects `qwen35` explicitly and maps it onto the Qwen3Next-style runtime path.
@@ -870,6 +930,18 @@ src/
   - Tokenizer initialization honors `tokenizer.ggml.add_bos_token`; this prevents Qwen3-ASR's
     converted `<|im_end|>` BOS ID from being inserted when its source tokenizer says
     `add_bos_token=false`.
+- `vendors/face_common.rs`:
+  - shared readers for the face contracts: the flat `<prefix>.graph.ops` operation list (bounded
+    record, slot, stride, padding, and group counts; tensor names numbered in operation order) and
+    the input channel-order/mean/scale keys.
+- `vendors/face_yunet.rs`:
+  - recognizes only `general.architecture=face_yunet`
+  - maps strides, per-scale head slots, input size limits, and detection thresholds into
+    `engine::face::FaceDetectorPolicy`.
+- `vendors/face_sface.rs`:
+  - recognizes only `general.architecture=face_sface`
+  - maps crop size, alignment reference points, output slot, embedding dimension, and the published
+    cosine threshold into `engine::face::FaceEncoderPolicy`.
 - `vendors/speaker_xvector.rs`:
   - recognizes only `general.architecture=speaker_xvector`
   - validates required frontend, duration, TDNN context, segment-count, and calibrated-threshold
@@ -881,17 +953,20 @@ src/
 1. `main.rs` invokes `app::run()`.
 2. `app::run()` parses CLI (`CliOptions`).
 3. `app::run()` builds `RuntimeSwitchConfig` and calls `engine::switches::init_runtime_config(...)`.
-4. Speaker actions branch to `app::speaker` and exit before the language-model flow below. Actions
+4. Face actions branch to `app::face` and exit before the language-model flow below: the detector
+   GGUF (and, for `--face-embed`, the encoder GGUF) is parsed, a vendor policy is obtained, and
+   `engine::face` models are constructed and run per `--image`.
+5. Speaker actions branch to `app::speaker` and exit before the language-model flow below. Actions
    that consume audio load `--speaker-model`, obtain a vendor policy, and construct
    `engine::speaker::SpeakerEncoder`; exported-vector and index-only actions instead retain a
    `SpeakerIndexRuntime` and do not parse or fingerprint model weights. Diarization may run with or
    without an index.
-5. GGUF parsed via `engine::io::parse_gguf_file(...)`.
-6. Vendor config built with `vendors::build_config_from_gguf(...)`.
-7. Vendor tokenizer, multimodal, and runtime debug policies are built (`vendors::{tokenizer_policy,multimodal_policy,runtime_debug_policy}(...)`) and tokenizer is initialized (`engine::tokenizer::init_tokenizer_from_gguf(...)`).
-8. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`), with vendor runtime-context debug logging handled in app.
-9. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
-10. Standard mode:
+6. GGUF parsed via `engine::io::parse_gguf_file(...)`.
+7. Vendor config built with `vendors::build_config_from_gguf(...)`.
+8. Vendor tokenizer, multimodal, and runtime debug policies are built (`vendors::{tokenizer_policy,multimodal_policy,runtime_debug_policy}(...)`) and tokenizer is initialized (`engine::tokenizer::init_tokenizer_from_gguf(...)`).
+9. Runtime overrides applied (`engine::runtime::apply_context_size_overrides(...)`), with vendor runtime-context debug logging handled in app.
+10. Weights loaded (`engine::weights::init_weights_from_gguf(...)`).
+11. Standard mode:
   - CLI media inputs are normalized into `engine::types::GenerationRequest` with `ContentPart` items.
   - prompt encoded via `vendors::encode_generation_request(...)`, including placeholder spans for image/video/audio on Qwen multimodal paths and image spans on Gemma multimodal path.
   - runtime validates prompt/media alignment before starting preprocessing.
@@ -902,12 +977,12 @@ src/
   - the internal transcription route obtains its policy from the loaded `AudioEncoderBackend`, keeps
     context as the exact system turn (without RAG augmentation), uses a plain ChatML assistant prefix,
     and parses the raw continuation into `AudioTranscriptionResult` after generation.
-11. Agent mode:
+12. Agent mode:
   - tool transcript prompt encoded per turn
   - model emits JSON `tool_call` / `final`
   - host executes tool call (`tools`) and loops until final response or limit.
   - `shell_exec` calls are restricted to CLI/env-provided allowed commands; model can request missing commands with `shell_request_allowed`.
-12. Profiling/timings printed from `engine::profiling` + `app::run()`.
+13. Profiling/timings printed from `engine::profiling` + `app::run()`.
 
 ## Placement Rules For Future Changes
 

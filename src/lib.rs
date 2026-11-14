@@ -12,6 +12,10 @@ pub use app::embed::{
     AudioTranscriptionResult, EmbeddedRuntime, GenerationStats, Tool, ToolCallFormat, ToolSpec,
     build_tool_system_prompt_from_specs, detect_tool_call_format, tool_call_format_for_gguf,
 };
+pub use app::face::{
+    DetectedFace, FaceBox, FaceDetector, FaceEmbedding, FaceEncoder, FaceImage, FaceImageResult,
+    FaceRecord,
+};
 pub use app::speaker::{
     SpeakerAudioQuality, SpeakerDiarizationResult, SpeakerDiarizationSegment, SpeakerEmbedding,
     SpeakerEnrollmentResult, SpeakerIdentificationResult, SpeakerIndexRuntime, SpeakerMatch,

@@ -137,9 +137,8 @@ pub(crate) enum ImageOrientationPolicy {
     /// Decode the stored pixels as-is. Matches the single-view path, which
     /// applies no EXIF transform.
     EncodedPixels,
-    /// Apply the EXIF orientation before planning views. Implemented and
-    /// exercised by the loader, but no vendor selects it yet.
-    #[allow(dead_code)]
+    /// Apply the EXIF orientation before use. The face path always selects
+    /// this; no vision-language vendor selects it for view planning yet.
     ApplyExif,
 }
 

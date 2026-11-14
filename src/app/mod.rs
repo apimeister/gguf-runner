@@ -8,6 +8,7 @@ mod audio_batch;
 mod batch;
 pub mod embed;
 mod events;
+pub mod face;
 mod generation;
 mod image_batch;
 mod image_request;
@@ -277,6 +278,23 @@ pub fn run() -> Result<(), String> {
         for line in collect_debug_banner_lines(&cli) {
             eprintln!("{line}");
         }
+    }
+
+    if cli.face_action.is_some() {
+        if let Some(thread_count) = cli.threads {
+            crate::engine::runtime::configure_rayon_threads(thread_count, cli.debug);
+        }
+        face::run_cli(&cli)?;
+        if cli.profiling {
+            print_profile_report();
+        }
+        if cli.show_timings {
+            eprintln!(
+                "overall runtime: {:.3}s",
+                run_started.elapsed().as_secs_f64()
+            );
+        }
+        return Ok(());
     }
 
     if cli.speaker_action.is_some() {

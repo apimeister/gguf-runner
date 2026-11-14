@@ -2,6 +2,9 @@
 // in isolation (cargo clippy without --bin) they appear unused because the lib only
 // exports EmbeddedRuntime and does not re-export binary-only code.
 
+mod face_common;
+mod face_sface;
+mod face_yunet;
 mod gemma;
 mod llama;
 mod minicpmv;
@@ -16,6 +19,7 @@ mod smolvlm;
 mod speaker_xvector;
 
 use crate::engine::audio::{AudioDecodeConfig, AudioPreprocessConfig, WhisperLogMelConfig};
+use crate::engine::face::{FaceDetectorPolicy, FaceEncoderPolicy};
 use crate::engine::io::{
     get_gguf_bool_from_map, get_gguf_float_from_map, get_gguf_i64_array_from_map,
     get_gguf_int_from_map, get_gguf_string_from_map,
@@ -120,6 +124,32 @@ pub(crate) fn speaker_model_policy(gguf: &GGUFFile) -> Result<SpeakerModelPolicy
         "speaker_xvector" => speaker_xvector::policy(gguf),
         other => Err(format!(
             "unsupported speaker GGUF architecture '{other}'; supported: speaker_xvector"
+        )),
+    }
+}
+
+pub(crate) fn face_detector_policy(gguf: &GGUFFile) -> Result<FaceDetectorPolicy, String> {
+    let architecture =
+        get_gguf_string_from_map(&gguf.kv, "general.architecture").ok_or_else(|| {
+            "face detector GGUF is missing 'general.architecture' metadata".to_string()
+        })?;
+    match architecture {
+        "face_yunet" => face_yunet::policy(gguf),
+        other => Err(format!(
+            "unsupported face detector GGUF architecture '{other}'; supported: face_yunet"
+        )),
+    }
+}
+
+pub(crate) fn face_encoder_policy(gguf: &GGUFFile) -> Result<FaceEncoderPolicy, String> {
+    let architecture =
+        get_gguf_string_from_map(&gguf.kv, "general.architecture").ok_or_else(|| {
+            "face encoder GGUF is missing 'general.architecture' metadata".to_string()
+        })?;
+    match architecture {
+        "face_sface" => face_sface::policy(gguf),
+        other => Err(format!(
+            "unsupported face encoder GGUF architecture '{other}'; supported: face_sface"
         )),
     }
 }

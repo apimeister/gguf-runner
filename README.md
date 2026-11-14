@@ -446,6 +446,25 @@ Weight quantization also matters more than usual here: prefill batches efficient
 models (Q4_K, Q5_K, Q6_K) but falls back to a per-token path for Q8_0, so a K-quant build of the
 same model prefills noticeably faster. See `docs/performance.md` for measurements.
 
+## Face Detection and Face Embeddings
+
+Two small dedicated GGUFs find the faces in an image and produce one 128-dimensional vector per
+face, without loading a language model. Vectors of the same person are similar across images;
+comparing and grouping them is left to the caller.
+
+```bash
+gguf-runner \
+  --face-detector ./face-yunet-2023mar-f32.gguf \
+  --face-model ./face-sface-2021dec-f32.gguf \
+  --face-embed \
+  --image ./a.jpg --image ./b.png
+```
+
+Output is one JSON line per image with a box, five landmarks, a score, and the vector for every
+face. `--face-detect` returns boxes and landmarks only. See
+[docs/face-recognition.md](docs/face-recognition.md) for the library API, model conversion, and
+limits.
+
 ## Project Scope
 
 - CPU inference only
@@ -459,6 +478,7 @@ same model prefills noticeably faster. See `docs/performance.md` for measurement
 - Tokenizer benchmark flow: `docs/tokenizer-benchmark.md`
 - Module layout: `docs/module-structure.md`
 - Speaker recognition and additive profiles: `docs/speaker-recognition.md`
+- Face detection and face embeddings: `docs/face-recognition.md`
 
 ## GGUF Metadata Dump (No Inference)
 

@@ -4,6 +4,29 @@ Examples:
 - `wget https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf`
 - `wget https://huggingface.co/unsloth/Qwen3-Coder-Next-GGUF/resolve/main/Qwen3-Coder-Next-Q4_K_M.gguf`
 
+## Face detector and face encoder
+
+Face actions use two dedicated GGUFs passed with `--face-detector` and `--face-model`; they do not
+use a language model. The project does not bundle them. Convert the OpenCV model-zoo ONNX files
+(YuNet is MIT-licensed, SFace is Apache-2.0); `uv` installs the converter's dependencies on the fly:
+
+```bash
+wget https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx
+wget https://huggingface.co/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx
+
+uv run scripts/convert-face-onnx.py yunet face_detection_yunet_2023mar.onnx face-yunet-2023mar-f32.gguf
+uv run scripts/convert-face-onnx.py sface face_recognition_sface_2021dec.onnx face-sface-2021dec-f32.gguf
+```
+
+The converted files are about 0.2 MB and 38.5 MB. Weights stay float32. The files used for
+verification had these SHA-256 hashes:
+
+- `face_detection_yunet_2023mar.onnx`: `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`
+- `face_recognition_sface_2021dec.onnx`: `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79`
+
+Renaming an ONNX file to `.gguf` is not sufficient; see [Face Recognition](face-recognition.md) for
+the contracts.
+
 ## Speaker embedding model
 
 Speaker recognition actions that consume audio use a dedicated `speaker_xvector` GGUF passed with

@@ -41,6 +41,22 @@ Currently unsupported:
 
 See `docs/speaker-recognition.md` for usage, privacy guidance, limitations, and the GGUF contract.
 
+## Face Detection and Face Embeddings
+
+- Dedicated `face_yunet` detector and `face_sface` encoder GGUF runtimes; no language model is
+  loaded.
+- Boxes, scores, and five landmarks per face, in upright (EXIF-applied) pixel coordinates.
+- Landmark-aligned 128-dimensional L2-normalized vectors, plus a 128-byte signed-byte form.
+- Separate detect and embed calls over one decoded image, file and embedded-byte loaders, and a
+  landmark lookup for faces known only by a box.
+- JSONL output, one line per image; images without faces are reported with an empty list.
+- Vectors only: no person index, identifiers, clustering, or applied threshold.
+- Matches OpenCV's YuNet/SFace reference on identical inputs to within 0.001 pixels and 2e-6 per
+  vector component.
+- Face association is not authentication or liveness detection.
+
+See `docs/face-recognition.md` for usage, limits, verification numbers, and the GGUF contracts.
+
 ## Quantization / Tensor Type Support
 
 Supported tensor data paths include:
