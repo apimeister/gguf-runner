@@ -6294,6 +6294,7 @@ fn matmul_qk_mr4_chunk_x86_prequant(
         let row_off = data_offset + (base_row + i) * row_size;
         let row = &mapped[row_off..row_off + row_size];
         out[i] = match ttype {
+            GGML_TYPE_Q2_K => vec_dot_q2_k(x, row, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k(x, row, n),
@@ -9680,6 +9681,23 @@ pub(crate) fn matmul_quantized_batch_exact(
         tmp.resize(d * m, 0.0);
     }
 
+    // The sequential x86 MR4 path feeds int8-prequantized activations to the
+    // VNNI kernels; quantize each token once here so the 4-row blocks below
+    // run the very same kernels.
+    #[cfg(target_arch = "x86_64")]
+    let mut preq_scratch: Vec<MatmulActivationScratch> = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    let preqs: Vec<Q8ActivationPrequant<'_>> = if use_mr4 && x86_qk_mr4_uses_prequant(ttype) {
+        preq_scratch.resize_with(m, MatmulActivationScratch::new);
+        preq_scratch
+            .iter_mut()
+            .enumerate()
+            .map(|(b, scratch)| prequantize_activation_q8(&inp[b * n..(b + 1) * n], n, scratch))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Row-major scratch (`tmp[r * m + b]`) so rayon splits it into contiguous
     // per-row-chunk blocks; transposed to token-major `out` at the end.
     let fill = |base_row: usize, block: &mut [f32]| {
@@ -9699,6 +9717,14 @@ pub(crate) fn matmul_quantized_batch_exact(
                 let r3 = &mapped[r3_off..r3_off + row_size];
                 for b in 0..m {
                     let x = &inp[b * n..(b + 1) * n];
+                    #[cfg(target_arch = "x86_64")]
+                    let sums = match preqs.get(b) {
+                        Some(preq) => unsafe {
+                            vec_dot_qk_4rows_x86_prequant(preq, x, r0, r1, r2, r3, n, ttype)
+                        },
+                        None => batch_exact_vec_dot_4rows(ttype, x, r0, r1, r2, r3, n),
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
                     let sums = batch_exact_vec_dot_4rows(ttype, x, r0, r1, r2, r3, n);
                     block[i * m + b] = sums[0];
                     block[(i + 1) * m + b] = sums[1];
@@ -10719,6 +10745,45 @@ mod qk_mr4_tests {
         }
     }
 
+    /// Int8-aware scalar reference for the Q2_K MR4 VNNI prequant kernels:
+    /// activations are quantized per 32-lane block exactly like
+    /// `prequantize_activation_q8`, so kernel and reference differ only in
+    /// float rounding. The float [`vec_dot_q2_k`] is off by the activation
+    /// quantization error alone, which exceeds any useful tolerance.
+    #[cfg(target_arch = "x86_64")]
+    fn q2_k_i8_ref(x: &[f32], w: &[u8], n: usize) -> f32 {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+        let mut sum = 0.0f32;
+        for i in 0..n / QK_K {
+            let off = i * block_sz;
+            let scales = &w[off..off + QK_K / 16];
+            let q = &w[off + QK_K / 16..off + QK_K / 16 + QK_K / 4];
+            let d = fp16_to_fp32(read_u16_le(w, off + QK_K / 16 + QK_K / 4));
+            let dmin = fp16_to_fp32(read_u16_le(w, off + QK_K / 16 + QK_K / 4 + 2));
+            let xb = &x[i * QK_K..(i + 1) * QK_K];
+            // Sixteen-value groups in element order: group `g` covers
+            // elements `g * 16..`, its 2-bit quants sit at shift `2 * j` of
+            // the 16 bytes selected by the 128-element half and `g & 1`.
+            for g in 0..QK_K / 16 {
+                let xg = &xb[g * 16..(g + 1) * 16];
+                let x32 = &xb[(g / 2) * 32..(g / 2 + 1) * 32];
+                let mut xq = [0i8; QK8_0];
+                let x_scale = quantize_f32_block_i8_32(x32, &mut xq);
+                let xq = &xq[(g % 2) * 16..(g % 2) * 16 + 16];
+                let shift = ((g / 2) % 4) * 2;
+                let qg = &q[(g / 8) * 32 + (g % 2) * 16..(g / 8) * 32 + (g % 2) * 16 + 16];
+                let mut dot = 0i32;
+                for l in 0..16 {
+                    dot += ((qg[l] >> shift) & 0x03) as i32 * xq[l] as i32;
+                }
+                let dl = d * (scales[g] & 0x0f) as f32;
+                let ml = dmin * (scales[g] >> 4) as f32;
+                sum += dl * (dot as f32 * x_scale) - ml * xg.iter().copied().sum::<f32>();
+            }
+        }
+        sum
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn q2k_4rows_x86_vnni_prequant_matches_single_row_when_available() {
@@ -10764,7 +10829,7 @@ mod qk_mr4_tests {
                 }
             };
             for r in 0..4 {
-                let want = vec_dot_q2_k(&x, &rows[r], n);
+                let want = q2_k_i8_ref(&x, &rows[r], n);
                 let tol = 5e-4f32 * want.abs().max(1.0);
                 assert!(
                     (got[r] - want).abs() <= tol,
@@ -11793,8 +11858,12 @@ mod batch_exact_tests {
         }
     }
 
+    /// The fast kernel dequantizes weights and keeps activations in f32, so
+    /// it is checked against the scalar float dots. The sequential mirror is
+    /// not a usable reference here: on x86 VNNI it runs int8-activation
+    /// kernels that sit outside this tolerance by design.
     #[test]
-    fn batch_fast_row_window_matches_exact_with_tolerance() {
+    fn batch_fast_row_window_matches_scalar_with_tolerance() {
         let mut st = 0x1234_f00d_cafe_5678u64;
         let n = 2 * QK_K;
         let d_rows = 9usize;
@@ -11810,25 +11879,13 @@ mod batch_exact_tests {
             GGML_TYPE_Q6_K,
         ] {
             let (qw, mapped) = synth(ttype, d_rows, n, &mut st);
+            let row_size = get_row_size(n, qw.ttype);
             let inp: Vec<f32> = (0..m * n)
                 .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
                 .collect();
-            let mut exact = vec![0.0f32; m * n_rows];
             let mut fast = vec![0.0f32; m * n_rows];
-            let mut exact_tmp = Vec::new();
             let mut fast_tmp = Vec::new();
 
-            matmul_quantized_batch_exact(
-                &mut exact,
-                &inp,
-                &qw,
-                &mapped,
-                m,
-                row_start,
-                n_rows,
-                &mut exact_tmp,
-            )
-            .unwrap();
             matmul_quantized_batch_fast(
                 &mut fast,
                 &inp,
@@ -11841,14 +11898,19 @@ mod batch_exact_tests {
             )
             .unwrap();
 
-            for i in 0..m * n_rows {
-                let tol = 5e-4f32 * exact[i].abs().max(1.0);
-                assert!(
-                    (fast[i] - exact[i]).abs() <= tol,
-                    "ttype={ttype} i={i}: fast={}, exact={}, tol={tol}",
-                    fast[i],
-                    exact[i]
-                );
+            for b in 0..m {
+                let x = &inp[b * n..(b + 1) * n];
+                for r in 0..n_rows {
+                    let row_off = (row_start + r) * row_size;
+                    let row = &mapped[row_off..row_off + row_size];
+                    let want = batch_exact_vec_dot(ttype, x, row, n);
+                    let got = fast[b * n_rows + r];
+                    let tol = 5e-4f32 * want.abs().max(1.0);
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "ttype={ttype} token={b} row={r}: fast={got}, scalar={want}, tol={tol}",
+                    );
+                }
             }
         }
     }
