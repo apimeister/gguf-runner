@@ -243,9 +243,10 @@ Changed:
    - Library consumers hand the models over exactly like the other GGUF models:
      `load_from_bytes(data: &'static [u8])` and `load_from_file(path)` on `FaceDetector` and
      `FaceEncoder`, matching `EmbeddedRuntime`, `load_mmproj_from_bytes`, and `SpeakerRuntime`.
-   - The converter script stays in the repo so the files are reproducible. The converted GGUFs are
-     published outside the git repo and linked from `docs/downloading-models.md`, provided the
-     licence check in Phase 0 allows redistribution.
+   - The runner converts the published ONNX files itself (`--face-convert-onnx`,
+     `FaceDetector::gguf_from_onnx`, `FaceEncoder::gguf_from_onnx`), so the GGUFs are reproducible
+     from OpenCV's files and need no hosting. An application that embeds the models converts them
+     in its build.
 
 4. **Weight precision.** float32 for both models, as published upstream (about 38.7 MB for SFace).
    No precision conversion in the first version, so the GGUF weights are bit-identical to the
@@ -290,6 +291,10 @@ Deviations from the phase descriptions above, and why:
 - **Output shape.** One JSON line per image rather than per face (decision 11).
 - **Model fingerprint.** `model_fingerprint()` is exposed next to `model_name()`, as for the
   speaker runtime.
+- **Conversion in the runner.** The converter of Phase 0 is part of the runner
+  (`engine/io/onnx.rs`, `engine/io/gguf_write.rs`, `engine/face/convert.rs`, and `gguf_from_onnx`
+  in the two vendor modules). It writes, byte for byte, the files the Phase 0 script
+  `scripts/convert-face-onnx.py` wrote, and takes that script's place.
 - **Extra entry points.** `FaceImage::from_encoded_bytes`/`from_rgb8`,
   `FaceEncoder::embed_aligned_crop`, `FaceEmbedding::cosine_similarity`, and
   `--face-score-threshold`.
@@ -363,4 +368,5 @@ run; similarity computed from the stored signed bytes stays within 0.011 of the 
 
 ## Open Questions
 
-- Where the converted GGUFs are hosted (decision 3).
+None. The converted GGUFs need no hosting: the runner produces them from OpenCV's files
+(decision 3).

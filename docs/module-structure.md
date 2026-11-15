@@ -54,11 +54,14 @@ src/
       detect.rs
       embed.rs
       graph.rs
+      convert.rs
     speaker/
       mod.rs
     io/
       mod.rs
       gguf.rs
+      gguf_write.rs
+      onnx.rs
     multimodal/
       mod.rs
       gemma3.rs
@@ -221,6 +224,9 @@ src/
   `Send + Sync` so one instance serves several threads. `examples/face_embedded_test.rs` checks
   this path against file-based loading and across concurrent threads.
 - CLI orchestration (`run_cli`) writes one JSON line per `--image`, including images without faces.
+- Conversion: `FaceDetector::gguf_from_onnx` and `FaceEncoder::gguf_from_onnx` turn the OpenCV
+  model-zoo ONNX files into the GGUFs these types load, through the vendor contracts;
+  `--face-convert-onnx` writes the result to the path named by `--face-detector` or `--face-model`.
 
 ### `src/app/speaker.rs`
 
@@ -481,6 +487,8 @@ src/
 - Includes the mutually exclusive face actions `--face-detect` and `--face-embed` with
   `--face-detector`, `--face-model`, and `--face-score-threshold`; they take `--image` inputs,
   require no `--model`, and reject generation/batch/tool combinations before runtime construction.
+  The third face action, `--face-convert-onnx <model.onnx>`, takes exactly one of
+  `--face-detector` and `--face-model` as its output path and no `--image`.
 - Requires `--speaker-model` only for audio-consuming actions, permits index-free unknown
   diarization, and routes index/exported-vector-only actions without constructing an encoder.
 - Speaker-mode validation prevents accidental text-model loading and rejects generation/batch/tool
@@ -550,7 +558,11 @@ src/
 
 ### `src/engine/io/*`
 
-- GGUF parsing and low-level read helpers.
+- GGUF parsing and low-level read helpers, the GGUF writer, and the ONNX reader.
+- `io/gguf_write.rs`: `GgufWriter` writes metadata in insertion order and float32 tensors, in the
+  layout of the reference `gguf` Python package (version 3, 32-byte alignment).
+- `io/onnx.rs`: `OnnxModel` reads the nodes, attributes, and float initializers of an ONNX file
+  straight from the protocol buffer wire format; it is what the face converters consume.
 - `io/gguf.rs`:
   - Parses GGUF metadata/tensors.
   - Preserves boolean metadata arrays as integer 0/1 arrays, including per-layer attention patterns.
@@ -659,6 +671,10 @@ src/
   cosine scoring, and the signed-byte quantized form.
 - `decode.rs`: bounded image decoding that always applies EXIF orientation
   (`ImageOrientationPolicy::ApplyExif`), unlike the vision-language single-view path.
+- `convert.rs`: `lower_face_onnx` lowers an `OnnxModel` to the operation list the graph executor
+  runs: batch normalization folded in float64 into the neighbouring convolution or linear layer,
+  activations joined with their convolution, layout-only nodes dropped. `LoweredFaceGraph::write`
+  emits the operations, the input normalization, and the numbered tensors.
 
 ### `src/engine/speaker/mod.rs`
 
@@ -938,10 +954,14 @@ src/
   - recognizes only `general.architecture=face_yunet`
   - maps strides, per-scale head slots, input size limits, and detection thresholds into
     `engine::face::FaceDetectorPolicy`.
+  - `gguf_from_onnx` writes the contract for the OpenCV model-zoo YuNet file: the lowered graph
+    plus channel order, input limits, head slots, and OpenCV's default thresholds.
 - `vendors/face_sface.rs`:
   - recognizes only `general.architecture=face_sface`
   - maps crop size, alignment reference points, output slot, embedding dimension, and the published
     cosine threshold into `engine::face::FaceEncoderPolicy`.
+  - `gguf_from_onnx` writes the contract for the OpenCV model-zoo SFace file: the lowered graph
+    plus channel order, crop size, alignment reference, and the published cosine threshold.
 - `vendors/speaker_xvector.rs`:
   - recognizes only `general.architecture=speaker_xvector`
   - validates required frontend, duration, TDNN context, segment-count, and calibrated-threshold

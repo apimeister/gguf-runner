@@ -20,6 +20,7 @@ mod speaker_xvector;
 
 use crate::engine::audio::{AudioDecodeConfig, AudioPreprocessConfig, WhisperLogMelConfig};
 use crate::engine::face::{FaceDetectorPolicy, FaceEncoderPolicy};
+use crate::engine::io::OnnxModel;
 use crate::engine::io::{
     get_gguf_bool_from_map, get_gguf_float_from_map, get_gguf_i64_array_from_map,
     get_gguf_int_from_map, get_gguf_string_from_map,
@@ -139,6 +140,16 @@ pub(crate) fn face_detector_policy(gguf: &GGUFFile) -> Result<FaceDetectorPolicy
             "unsupported face detector GGUF architecture '{other}'; supported: face_yunet"
         )),
     }
+}
+
+/// Converts the OpenCV model-zoo YuNet ONNX file to the `face_yunet` GGUF.
+pub(crate) fn face_detector_gguf_from_onnx(onnx: &[u8]) -> Result<Vec<u8>, String> {
+    face_yunet::gguf_from_onnx(&OnnxModel::parse(onnx)?)
+}
+
+/// Converts the OpenCV model-zoo SFace ONNX file to the `face_sface` GGUF.
+pub(crate) fn face_encoder_gguf_from_onnx(onnx: &[u8]) -> Result<Vec<u8>, String> {
+    face_sface::gguf_from_onnx(&OnnxModel::parse(onnx)?)
 }
 
 pub(crate) fn face_encoder_policy(gguf: &GGUFFile) -> Result<FaceEncoderPolicy, String> {

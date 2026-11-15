@@ -3,12 +3,14 @@
 
 mod align;
 mod conv;
+mod convert;
 mod decode;
 mod detect;
 mod embed;
 mod graph;
 
 pub(crate) use conv::FaceActivation;
+pub(crate) use convert::lower_face_onnx;
 pub(crate) use decode::{decode_face_image_bytes, decode_face_image_file};
 pub(crate) use detect::{
     FaceDetectLevelPolicy, FaceDetection, FaceDetectorModel, FaceDetectorPolicy,

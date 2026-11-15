@@ -7,22 +7,27 @@ Examples:
 ## Face detector and face encoder
 
 Face actions use two dedicated GGUFs passed with `--face-detector` and `--face-model`; they do not
-use a language model. The project does not bundle them. Convert the OpenCV model-zoo ONNX files
-(YuNet is MIT-licensed, SFace is Apache-2.0); `uv` installs the converter's dependencies on the fly:
+use a language model. The project does not bundle them. `gguf-runner` converts the OpenCV
+model-zoo ONNX files (YuNet is MIT-licensed, SFace is Apache-2.0):
 
 ```bash
 wget https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx
 wget https://huggingface.co/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx
 
-uv run scripts/convert-face-onnx.py yunet face_detection_yunet_2023mar.onnx face-yunet-2023mar-f32.gguf
-uv run scripts/convert-face-onnx.py sface face_recognition_sface_2021dec.onnx face-sface-2021dec-f32.gguf
+gguf-runner --face-convert-onnx face_detection_yunet_2023mar.onnx --face-detector face-yunet-2023mar-f32.gguf
+gguf-runner --face-convert-onnx face_recognition_sface_2021dec.onnx --face-model face-sface-2021dec-f32.gguf
 ```
 
-The converted files are about 0.2 MB and 38.5 MB. Weights stay float32. The files used for
-verification had these SHA-256 hashes:
+`--face-detector` names the output for a YuNet file and `--face-model` the output for an SFace
+file. The converted files are about 0.2 MB and 38.5 MB, and weights stay float32. The same ONNX
+file gives the same GGUF bytes on every platform:
 
-- `face_detection_yunet_2023mar.onnx`: `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`
-- `face_recognition_sface_2021dec.onnx`: `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79`
+| File | SHA-256 |
+|---|---|
+| `face_detection_yunet_2023mar.onnx` | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` |
+| `face-yunet-2023mar-f32.gguf` | `ae35c173212cfc2bc4dd06753d5fda11d59ca5de43464e20b7d013bff04d44c6` |
+| `face_recognition_sface_2021dec.onnx` | `0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79` |
+| `face-sface-2021dec-f32.gguf` | `54fcf8faf85433ccc3bfda6e159601c2ef495a435be240980f7dae9e37fc7f67` |
 
 Renaming an ONNX file to `.gguf` is not sufficient; see [Face Recognition](face-recognition.md) for
 the contracts.

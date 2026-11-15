@@ -221,6 +221,7 @@ pub(crate) enum CliSpeakerAction {
 pub(crate) enum CliFaceAction {
     Detect,
     Embed,
+    ConvertOnnx,
 }
 
 #[derive(Clone, Debug)]
@@ -738,13 +739,20 @@ struct Cli {
     #[arg(long = "speaker-force-enroll")]
     speaker_force_enroll: bool,
 
-    /// Face detector GGUF, required by every --face-* action.
+    /// Face detector GGUF, required by --face-detect and --face-embed; the file
+    /// --face-convert-onnx writes for a YuNet ONNX file.
     #[arg(long = "face-detector", value_name = "detector.gguf")]
     face_detector: Option<String>,
 
-    /// Face embedding GGUF, required by --face-embed.
+    /// Face embedding GGUF, required by --face-embed; the file --face-convert-onnx writes
+    /// for an SFace ONNX file.
     #[arg(long = "face-model", value_name = "encoder.gguf")]
     face_model: Option<String>,
+
+    /// Convert an OpenCV model-zoo ONNX file to the GGUF named by --face-detector (YuNet)
+    /// or by --face-model (SFace).
+    #[arg(long = "face-convert-onnx", value_name = "model.onnx")]
+    face_convert_onnx: Option<String>,
 
     /// Emit boxes, landmarks, and scores for the faces in each --image.
     #[arg(long = "face-detect")]
@@ -1080,6 +1088,7 @@ pub(crate) struct CliOptions {
     pub(crate) speaker_force_enroll: bool,
     pub(crate) face_detector: Option<String>,
     pub(crate) face_model: Option<String>,
+    pub(crate) face_convert_onnx: Option<String>,
     pub(crate) face_action: Option<CliFaceAction>,
     pub(crate) face_score_threshold: Option<f32>,
     pub(crate) temperature: Option<f32>,
@@ -1240,6 +1249,7 @@ impl CliOptions {
             speaker_force_enroll: cli.speaker_force_enroll,
             face_detector: cli.face_detector,
             face_model: cli.face_model,
+            face_convert_onnx: cli.face_convert_onnx,
             face_action,
             face_score_threshold: cli.face_score_threshold,
             temperature: cli.temperature,
@@ -1306,13 +1316,15 @@ impl CliOptions {
 }
 
 fn face_action_from_cli(cli: &Cli) -> Result<Option<CliFaceAction>, String> {
-    match (cli.face_detect, cli.face_embed) {
-        (true, true) => Err(
-            "face actions are mutually exclusive; choose --face-detect or --face-embed".to_string(),
+    match (cli.face_detect, cli.face_embed, cli.face_convert_onnx.is_some()) {
+        (true, false, false) => Ok(Some(CliFaceAction::Detect)),
+        (false, true, false) => Ok(Some(CliFaceAction::Embed)),
+        (false, false, true) => Ok(Some(CliFaceAction::ConvertOnnx)),
+        (false, false, false) => Ok(None),
+        _ => Err(
+            "face actions are mutually exclusive; choose --face-detect, --face-embed, or --face-convert-onnx"
+                .to_string(),
         ),
-        (true, false) => Ok(Some(CliFaceAction::Detect)),
-        (false, true) => Ok(Some(CliFaceAction::Embed)),
-        (false, false) => Ok(None),
     }
 }
 
@@ -1326,27 +1338,39 @@ fn validate_face_options(
             || cli.face_model.is_some()
             || cli.face_score_threshold.is_some()
         {
-            return Err("face options require --face-detect or --face-embed".to_string());
+            return Err(
+                "face options require --face-detect, --face-embed, or --face-convert-onnx"
+                    .to_string(),
+            );
         }
         return Ok(());
     };
-    if cli.face_detector.as_deref().is_none_or(str::is_empty) {
-        return Err("face actions require --face-detector <detector.gguf>".to_string());
-    }
-    match action {
-        CliFaceAction::Embed => {
-            if cli.face_model.as_deref().is_none_or(str::is_empty) {
-                return Err("--face-embed requires --face-model <encoder.gguf>".to_string());
-            }
+    let named = |path: &Option<String>| path.as_deref().is_some_and(|path| !path.is_empty());
+    if action == CliFaceAction::ConvertOnnx {
+        if named(&cli.face_detector) == named(&cli.face_model) {
+            return Err(
+                "--face-convert-onnx writes one file: name it with --face-detector <detector.gguf> for a YuNet file or with --face-model <encoder.gguf> for an SFace file"
+                    .to_string(),
+            );
         }
-        CliFaceAction::Detect => {
-            if cli.face_model.is_some() {
-                return Err("--face-detect does not use --face-model".to_string());
-            }
+        if !cli.images.is_empty() || cli.face_score_threshold.is_some() {
+            return Err(
+                "--face-convert-onnx does not use --image or --face-score-threshold".to_string(),
+            );
         }
-    }
-    if cli.images.is_empty() {
-        return Err("face actions require at least one --image <path>".to_string());
+    } else {
+        if !named(&cli.face_detector) {
+            return Err("face actions require --face-detector <detector.gguf>".to_string());
+        }
+        if action == CliFaceAction::Embed && !named(&cli.face_model) {
+            return Err("--face-embed requires --face-model <encoder.gguf>".to_string());
+        }
+        if action == CliFaceAction::Detect && cli.face_model.is_some() {
+            return Err("--face-detect does not use --face-model".to_string());
+        }
+        if cli.images.is_empty() {
+            return Err("face actions require at least one --image <path>".to_string());
+        }
     }
     if !cli.model.trim().is_empty() {
         return Err(
@@ -1791,6 +1815,67 @@ mod tests {
         assert!(error.contains("do not also pass --model"));
 
         assert!(Cli::try_parse_from(["gguf-runner", "--face-score-threshold", "1.5"]).is_err());
+    }
+
+    #[test]
+    fn face_convert_onnx_names_exactly_one_output() {
+        let validated = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["gguf-runner"], args].concat())
+                .expect("parse face convert flags");
+            let action = face_action_from_cli(&cli)?;
+            validate_face_options(&cli, action, false).map(|()| action)
+        };
+
+        assert_eq!(
+            validated(&[
+                "--face-convert-onnx",
+                "yunet.onnx",
+                "--face-detector",
+                "detector.gguf"
+            ]),
+            Ok(Some(CliFaceAction::ConvertOnnx))
+        );
+        assert_eq!(
+            validated(&[
+                "--face-convert-onnx",
+                "sface.onnx",
+                "--face-model",
+                "encoder.gguf"
+            ]),
+            Ok(Some(CliFaceAction::ConvertOnnx))
+        );
+
+        let error = validated(&["--face-convert-onnx", "model.onnx"]).unwrap_err();
+        assert!(error.contains("writes one file"), "{error}");
+        let error = validated(&[
+            "--face-convert-onnx",
+            "model.onnx",
+            "--face-detector",
+            "detector.gguf",
+            "--face-model",
+            "encoder.gguf",
+        ])
+        .unwrap_err();
+        assert!(error.contains("writes one file"), "{error}");
+        let error = validated(&[
+            "--face-convert-onnx",
+            "model.onnx",
+            "--face-detector",
+            "detector.gguf",
+            "--image",
+            "a.jpg",
+        ])
+        .unwrap_err();
+        assert!(error.contains("--image"), "{error}");
+        let error = validated(&[
+            "--face-convert-onnx",
+            "model.onnx",
+            "--face-detector",
+            "detector.gguf",
+            "--face-detect",
+        ])
+        .unwrap_err();
+        assert!(error.contains("mutually exclusive"), "{error}");
     }
 
     #[test]

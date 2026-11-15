@@ -5,11 +5,51 @@ use std::collections::HashMap;
 use super::face_common::{
     graph_policy, input_policy, model_name, required_float, required_string, required_usize,
 };
-use crate::engine::face::{FACE_LANDMARK_COUNT, FaceEncoderPolicy};
-use crate::engine::io::get_gguf_f32_array_from_map;
+use crate::engine::face::{FACE_LANDMARK_COUNT, FaceEncoderPolicy, lower_face_onnx};
+use crate::engine::io::{GgufWriter, OnnxModel, get_gguf_f32_array_from_map};
 use crate::engine::types::{GGUFFile, GgufValue};
 
 const PREFIX: &str = "face_sface";
+
+/// The image input and the embedding output of the OpenCV model-zoo ONNX file.
+const ONNX_INPUT: &str = "data";
+const ONNX_OUTPUT: &str = "fc1";
+
+/// OpenCV `FaceRecognizerSF` alignment targets for a 112x112 crop, in detector landmark
+/// order: right eye, left eye, nose tip, right mouth corner, left mouth corner (subject's
+/// view).
+const ALIGN_REFERENCE: [f32; 2 * FACE_LANDMARK_COUNT] = [
+    38.2946, 51.6963, 73.5318, 51.5014, 56.0252, 71.7366, 41.5493, 92.3655, 70.7299, 92.2041,
+];
+
+/// Converts the OpenCV model-zoo file `face_recognition_sface_2021dec.onnx` to a
+/// `face_sface` GGUF. The cosine threshold is the one OpenCV publishes for the model.
+pub(super) fn gguf_from_onnx(model: &OnnxModel) -> Result<Vec<u8>, String> {
+    let graph = lower_face_onnx(model, ONNX_INPUT)?;
+    let output_slot = graph.slot(ONNX_OUTPUT)?;
+    let dimension = graph
+        .last_output_size()
+        .ok_or_else(|| "the ONNX graph does not end in a linear layer".to_string())?;
+
+    let mut writer = GgufWriter::new(PREFIX);
+    writer.add_string("general.name", "SFace 2021dec");
+    writer.add_string("general.license", "Apache-2.0");
+    writer.add_string(
+        "general.source.url",
+        "https://huggingface.co/opencv/face_recognition_sface",
+    );
+    graph.write(&mut writer, PREFIX);
+    writer.add_string(&format!("{PREFIX}.input.channel_order"), "rgb");
+    writer.add_u32(&format!("{PREFIX}.input.size"), 112);
+    writer.add_f32_array(&format!("{PREFIX}.align.reference"), &ALIGN_REFERENCE);
+    writer.add_u32(
+        &format!("{PREFIX}.embedding.output_slot"),
+        output_slot as u32,
+    );
+    writer.add_u32(&format!("{PREFIX}.embedding.dimension"), dimension as u32);
+    writer.add_f32(&format!("{PREFIX}.threshold.cosine"), 0.363);
+    Ok(writer.finish())
+}
 
 pub(super) fn policy(gguf: &GGUFFile) -> Result<FaceEncoderPolicy, String> {
     policy_from_metadata(&gguf.kv)

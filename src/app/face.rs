@@ -201,6 +201,12 @@ pub struct FaceDetector {
 }
 
 impl FaceDetector {
+    /// Converts the OpenCV model-zoo file `face_detection_yunet_2023mar.onnx` to the GGUF
+    /// this detector loads. The same file gives the same bytes on every platform.
+    pub fn gguf_from_onnx(onnx: &[u8]) -> Result<Vec<u8>, String> {
+        vendors::face_detector_gguf_from_onnx(onnx)
+    }
+
     /// Load a face detector GGUF embedded in the binary.
     pub fn load_from_bytes(data: &'static [u8]) -> Result<Self, String> {
         let gguf = parse_gguf_from_bytes(data, false)
@@ -338,6 +344,12 @@ pub struct FaceEncoder {
 }
 
 impl FaceEncoder {
+    /// Converts the OpenCV model-zoo file `face_recognition_sface_2021dec.onnx` to the GGUF
+    /// this encoder loads. The same file gives the same bytes on every platform.
+    pub fn gguf_from_onnx(onnx: &[u8]) -> Result<Vec<u8>, String> {
+        vendors::face_encoder_gguf_from_onnx(onnx)
+    }
+
     /// Load a face encoder GGUF embedded in the binary.
     pub fn load_from_bytes(data: &'static [u8]) -> Result<Self, String> {
         let gguf = parse_gguf_from_bytes(data, false)
@@ -530,13 +542,16 @@ pub(crate) fn run_cli(cli: &CliOptions) -> Result<(), String> {
     let action = cli
         .face_action
         .ok_or_else(|| "internal error: face mode has no action".to_string())?;
+    if action == CliFaceAction::ConvertOnnx {
+        return convert_onnx(cli);
+    }
     let detector_path = cli
         .face_detector
         .as_deref()
         .ok_or_else(|| "face actions require --face-detector <detector.gguf>".to_string())?;
     let detector = FaceDetector::load_from_file_with_debug(Path::new(detector_path), cli.debug)?;
     let encoder = match action {
-        CliFaceAction::Detect => None,
+        CliFaceAction::Detect | CliFaceAction::ConvertOnnx => None,
         CliFaceAction::Embed => {
             let path = cli
                 .face_model
@@ -586,6 +601,30 @@ pub(crate) fn run_cli(cli: &CliOptions) -> Result<(), String> {
         }
         write_stdout_json(&image_result(path, &image, faces))?;
     }
+    Ok(())
+}
+
+/// Runs `--face-convert-onnx`: `--face-detector` names the GGUF of a YuNet file,
+/// `--face-model` the GGUF of an SFace file.
+fn convert_onnx(cli: &CliOptions) -> Result<(), String> {
+    let source = cli
+        .face_convert_onnx
+        .as_deref()
+        .ok_or_else(|| "internal error: no ONNX file to convert".to_string())?;
+    let onnx = std::fs::read(source).map_err(|error| format!("cannot read '{source}': {error}"))?;
+    let (target, gguf) = match (cli.face_detector.as_deref(), cli.face_model.as_deref()) {
+        (Some(target), None) => (target, FaceDetector::gguf_from_onnx(&onnx)),
+        (None, Some(target)) => (target, FaceEncoder::gguf_from_onnx(&onnx)),
+        _ => {
+            return Err(
+                "--face-convert-onnx needs --face-detector or --face-model to name the output"
+                    .to_string(),
+            );
+        }
+    };
+    let gguf = gguf.map_err(|error| format!("cannot convert '{source}': {error}"))?;
+    std::fs::write(target, &gguf).map_err(|error| format!("cannot write '{target}': {error}"))?;
+    eprintln!("wrote {target} ({} bytes)", gguf.len());
     Ok(())
 }
 
@@ -709,5 +748,143 @@ mod tests {
     fn overlap_is_intersection_over_union() {
         assert_eq!(overlap(&[0.0, 0.0, 2.0, 2.0], &[0.0, 0.0, 2.0, 2.0]), 1.0);
         assert_eq!(overlap(&[0.0, 0.0, 2.0, 2.0], &[5.0, 5.0, 2.0, 2.0]), 0.0);
+    }
+
+    /// An encoder shaped like the published SFace file, small enough to compute by hand:
+    /// input normalization, a 1x1 convolution with batch normalization and PReLU, a batch
+    /// normalization in front of the linear layer and one behind it.
+    fn small_sface_onnx() -> Vec<u8> {
+        use crate::engine::io::onnx_test_support::{
+            Message, float_attribute, float_tensor, int_attribute, ints_attribute, model, node,
+        };
+
+        let batch_norm = |input: &str, name: &str| -> Message {
+            let parameter = |suffix: &str| format!("{name}_{suffix}");
+            node(
+                "BatchNormalization",
+                &[
+                    input,
+                    &parameter("gamma"),
+                    &parameter("beta"),
+                    &parameter("mean"),
+                    &parameter("var"),
+                ],
+                &[name],
+            )
+            .message(5, float_attribute("epsilon", 1.0))
+        };
+        let parameters = |name: &str, values: [&[f32]; 4]| -> Vec<Message> {
+            ["gamma", "beta", "mean", "var"]
+                .iter()
+                .zip(values)
+                .map(|(suffix, values)| {
+                    float_tensor(
+                        &format!("{name}_{suffix}"),
+                        &[values.len() as i64],
+                        values,
+                        false,
+                    )
+                })
+                .collect()
+        };
+
+        let inputs = 112 * 112;
+        let mut linear = vec![0.0001f32; inputs];
+        linear.extend(vec![-0.0002f32; inputs]);
+        let mut initializers = vec![
+            float_tensor("scalar_op1", &[1], &[127.5], false),
+            float_tensor("scalar_op2", &[1], &[0.0078125], false),
+            float_tensor("conv_w", &[1, 3, 1, 1], &[1.0, 0.5, 0.25], false),
+            float_tensor("slope", &[1, 1, 1], &[0.5], false),
+            float_tensor("pre_fc1_weight", &[2, inputs as i64], &linear, false),
+            float_tensor("pre_fc1_bias", &[2], &[0.5, 0.25], false),
+        ];
+        // Scale -1 and shift 0; scale 2 and shift 1; scales 0.5 and 1 with shifts 0 and 1.
+        initializers.extend(parameters("conv_bn", [&[-2.0], &[0.0], &[0.0], &[3.0]]));
+        initializers.extend(parameters("bn1", [&[4.0], &[1.0], &[0.0], &[3.0]]));
+        initializers.extend(parameters(
+            "fc1",
+            [&[1.0, 3.0], &[0.0, 1.0], &[0.0, 0.0], &[3.0, 8.0]],
+        ));
+        model(
+            vec![
+                node("Sub", &["data", "scalar_op1"], &["centered"]),
+                node("Mul", &["centered", "scalar_op2"], &["scaled"]),
+                node("Conv", &["scaled", "conv_w"], &["conv"])
+                    .message(5, ints_attribute("dilations", &[1, 1]))
+                    .message(5, int_attribute("group", 1))
+                    .message(5, ints_attribute("kernel_shape", &[1, 1]))
+                    .message(5, ints_attribute("pads", &[0; 4]))
+                    .message(5, ints_attribute("strides", &[1, 1])),
+                batch_norm("conv", "conv_bn"),
+                node("PRelu", &["conv_bn", "slope"], &["relu"]),
+                batch_norm("relu", "bn1"),
+                node("Dropout", &["bn1"], &["dropout"]),
+                node("Flatten", &["dropout"], &["flat"]),
+                node(
+                    "Gemm",
+                    &["flat", "pre_fc1_weight", "pre_fc1_bias"],
+                    &["pre_fc1"],
+                )
+                .message(5, float_attribute("alpha", 1.0))
+                .message(5, float_attribute("beta", 1.0))
+                .message(5, int_attribute("transB", 1)),
+                batch_norm("pre_fc1", "fc1"),
+            ],
+            initializers,
+        )
+    }
+
+    #[test]
+    fn a_converted_encoder_computes_what_the_onnx_graph_describes() {
+        let gguf = FaceEncoder::gguf_from_onnx(&small_sface_onnx()).unwrap();
+        let encoder = FaceEncoder::load_from_bytes(Box::leak(gguf.into_boxed_slice())).unwrap();
+        assert_eq!(encoder.model_name(), "SFace 2021dec");
+        assert_eq!(encoder.model_architecture(), "face_sface");
+        assert_eq!(encoder.embedding_dimension(), 2);
+        assert_eq!(encoder.crop_size(), 112);
+        assert_eq!(encoder.published_match_threshold(), 0.363);
+
+        // A crop of one colour, so every position carries the same value.
+        let (red, green, blue) = (255u8, 191u8, 63u8);
+        let pixels: Vec<u8> = [red, green, blue].repeat(112 * 112);
+        let crop = FaceImage::from_rgb8(112, 112, pixels).unwrap();
+        let embedding = encoder.embed_aligned_crop(&crop).unwrap();
+
+        // The same network node by node, in float64.
+        let input = |sample: u8| (f64::from(sample) - 127.5) * 0.0078125;
+        let conv = input(red) + 0.5 * input(green) + 0.25 * input(blue);
+        let conv_bn = -conv;
+        let relu = if conv_bn < 0.0 {
+            0.5 * conv_bn
+        } else {
+            conv_bn
+        };
+        let bn1 = 2.0 * relu + 1.0;
+        let positions = f64::from(112 * 112);
+        let pre_fc1 = [
+            positions * f64::from(0.0001f32) * bn1 + 0.5,
+            positions * f64::from(-0.0002f32) * bn1 + 0.25,
+        ];
+        let fc1 = [0.5 * pre_fc1[0], pre_fc1[1] + 1.0];
+        let length = (fc1[0] * fc1[0] + fc1[1] * fc1[1]).sqrt();
+
+        assert_eq!(embedding.vector.len(), 2);
+        for (computed, expected) in embedding.vector.iter().zip(fc1) {
+            assert!(
+                (f64::from(*computed) - expected / length).abs() < 1e-4,
+                "{:?} against {:?}",
+                embedding.vector,
+                fc1.map(|value| value / length)
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_no_face_model_is_not_converted() {
+        assert!(FaceDetector::gguf_from_onnx(b"not an onnx file").is_err());
+        // An encoder file has none of the detection heads a detector needs.
+        let error = FaceDetector::gguf_from_onnx(&small_sface_onnx()).unwrap_err();
+        assert!(error.contains("no image input 'input'"), "{error}");
     }
 }

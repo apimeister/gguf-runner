@@ -6,11 +6,61 @@ use super::face_common::{
     graph_policy, input_policy, model_name, required_float, required_string, required_usize,
     required_usize_array,
 };
-use crate::engine::face::{FACE_LANDMARK_COUNT, FaceDetectLevelPolicy, FaceDetectorPolicy};
-use crate::engine::io::get_gguf_i64_array_from_map;
+use crate::engine::face::{
+    FACE_LANDMARK_COUNT, FaceDetectLevelPolicy, FaceDetectorPolicy, lower_face_onnx,
+};
+use crate::engine::io::{GgufWriter, OnnxModel, get_gguf_i64_array_from_map};
 use crate::engine::types::{GGUFFile, GgufValue};
 
 const PREFIX: &str = "face_yunet";
+
+/// The image input of the OpenCV model-zoo ONNX file.
+const ONNX_INPUT: &str = "input";
+/// The detection heads of the ONNX file write `<head>_<stride>` for these strides.
+const ONNX_STRIDES: [i32; 3] = [8, 16, 32];
+
+/// Converts the OpenCV model-zoo file `face_detection_yunet_2023mar.onnx` to a `face_yunet`
+/// GGUF. The thresholds are the defaults of OpenCV's `FaceDetectorYN`.
+pub(super) fn gguf_from_onnx(model: &OnnxModel) -> Result<Vec<u8>, String> {
+    let graph = lower_face_onnx(model, ONNX_INPUT)?;
+    let head_slots = |head: &str| -> Result<Vec<i32>, String> {
+        ONNX_STRIDES
+            .iter()
+            .map(|stride| Ok(graph.slot(&format!("{head}_{stride}"))? as i32))
+            .collect()
+    };
+    let (cls, obj, bbox, kps) = (
+        head_slots("cls")?,
+        head_slots("obj")?,
+        head_slots("bbox")?,
+        head_slots("kps")?,
+    );
+
+    let mut writer = GgufWriter::new(PREFIX);
+    writer.add_string("general.name", "YuNet 2023mar");
+    writer.add_string("general.license", "MIT");
+    writer.add_string(
+        "general.source.url",
+        "https://huggingface.co/opencv/face_detection_yunet",
+    );
+    graph.write(&mut writer, PREFIX);
+    writer.add_string(&format!("{PREFIX}.input.channel_order"), "bgr");
+    writer.add_u32(&format!("{PREFIX}.input.max_side"), 640);
+    writer.add_u32(&format!("{PREFIX}.input.align"), 32);
+    writer.add_i32_array(&format!("{PREFIX}.detect.strides"), &ONNX_STRIDES);
+    writer.add_i32_array(&format!("{PREFIX}.detect.cls_slots"), &cls);
+    writer.add_i32_array(&format!("{PREFIX}.detect.obj_slots"), &obj);
+    writer.add_i32_array(&format!("{PREFIX}.detect.bbox_slots"), &bbox);
+    writer.add_i32_array(&format!("{PREFIX}.detect.kps_slots"), &kps);
+    writer.add_u32(
+        &format!("{PREFIX}.detect.landmark_count"),
+        FACE_LANDMARK_COUNT as u32,
+    );
+    writer.add_f32(&format!("{PREFIX}.detect.score_threshold"), 0.9);
+    writer.add_f32(&format!("{PREFIX}.detect.nms_threshold"), 0.3);
+    writer.add_u32(&format!("{PREFIX}.detect.top_k"), 5000);
+    Ok(writer.finish())
+}
 
 pub(super) fn policy(gguf: &GGUFFile) -> Result<FaceDetectorPolicy, String> {
     policy_from_metadata(&gguf.kv)

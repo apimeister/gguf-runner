@@ -18,8 +18,10 @@ Two dedicated GGUF files, neither of which is a language model:
 - a detector implementing the `face_yunet` contract (boxes, scores, five landmarks);
 - an encoder implementing the `face_sface` contract (aligned 112x112 crop to a 128-dim vector).
 
-Both are produced from the OpenCV model-zoo ONNX files with `scripts/convert-face-onnx.py`; see
-[Downloading models](downloading-models.md). Weights stay float32, as published.
+Both are produced from the OpenCV model-zoo ONNX files by the runner itself
+(`--face-convert-onnx`, or `FaceDetector::gguf_from_onnx` and `FaceEncoder::gguf_from_onnx`); see
+[Converting the published models](#converting-the-published-models). Weights stay float32, as
+published.
 
 Input images are PNG, JPEG, or WebP. EXIF orientation is always applied before detection, and all
 reported coordinates refer to that upright image.
@@ -144,6 +146,34 @@ let similarity = FaceEmbedding::quantized_cosine_similarity(&a, &b)?;
 `examples/face_embedded_test.rs` exercises this path: it loads both models from bytes, checks the
 results against file-based loading, runs four threads with separate pools against one loaded pair
 of models, and checks the stored form against the float vectors.
+
+### Converting the published models
+
+The runner converts the two OpenCV model-zoo files, `face_detection_yunet_2023mar.onnx` and
+`face_recognition_sface_2021dec.onnx`, to the GGUFs it loads:
+
+```bash
+gguf-runner --face-convert-onnx face_detection_yunet_2023mar.onnx --face-detector face-yunet-2023mar-f32.gguf
+gguf-runner --face-convert-onnx face_recognition_sface_2021dec.onnx --face-model face-sface-2021dec-f32.gguf
+```
+
+```rust
+let detector_gguf: Vec<u8> = FaceDetector::gguf_from_onnx(&std::fs::read(yunet_onnx)?)?;
+let encoder_gguf: Vec<u8> = FaceEncoder::gguf_from_onnx(&std::fs::read(sface_onnx)?)?;
+```
+
+- **What it does.** It reads the ONNX graph, folds each batch normalization into the neighbouring
+  convolution or linear layer, joins each activation with its convolution, drops the nodes that
+  only change the layout, and writes the result as the operation list and tensors of the
+  contracts below. The model-specific values (input order, alignment reference, thresholds, name
+  and licence) come from the contract of the model.
+- **Deterministic.** The same ONNX file gives the same GGUF bytes on every platform, so a build
+  script can convert at build time and embed the result. [Downloading models](downloading-models.md)
+  lists the hashes of the published files and of their GGUFs.
+- **No further dependency.** The ONNX reader and the GGUF writer are part of the runner.
+- **Scope.** The operations of these two graphs: convolution, batch normalization, ReLU, PReLU,
+  2x2 max-pool, 2x nearest upsampling, add, a linear layer, and input normalization by one scalar.
+  A graph with another operation is refused with the node that holds it.
 
 ### Faces known only by a box
 
